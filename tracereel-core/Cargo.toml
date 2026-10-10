@@ -1,0 +1,15 @@
+[package]
+name = "tracereel-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Pure-Rust TraceReel core: route/map math and QuickRoute/GPX parse"
+
+[lib]
+name = "tracereel_core"
+path = "src/lib.rs"
+
+[dependencies]
+nalgebra = "0.34"
+roxmltree = "0.20"

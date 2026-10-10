@@ -1,0 +1,44 @@
+# 更新记录
+
+本文件记录每个公开发布版本的变化。版本号与 `Cargo.toml` 的 workspace `version` 一致，
+Git 标签形如 `v0.2.0`。
+
+## v0.2.0 — 首个公开发布
+
+从 `pyorientview`（Python/PyQt 原型）与 OrientView（C++/Qt 原版）重写为 Rust + QML，
+并把 QuickRoute 工程、Gyroflow 防抖和 ffmpeg 编码整合进一个程序。
+
+**视频与预览**
+
+- ffmpeg 解码：软解 + `d3d11va` / QSV 硬解；按 fps 的时间轴驱动播放。
+- 播放/暂停/拖动进度、键盘 seek 多档步长、暂停 seek 立即出帧。
+- 窗口标题实时显示防抖状态（加载中 / 已就绪 / 无运动数据）。
+
+**地图、轨迹与分段**
+
+- QuickRoute `.qrt`（内嵌地图 + 轨迹 + 分段 Handle）与 `.gpx.jpg`、GPX、普通图片底图。
+- 分段取景（`FixedSplit`）、跟随点、尾巴（可切配速色带）、控制点、多地图按时间换图。
+- `.qrt` 内嵌分段可一键导入为分段时刻。
+
+**防抖（Gyroflow）**
+
+- 进程内链接 `gyroflow-core`（子模块 fork），与原生 Gyroflow 1.6.3 使用同一预设时逐帧对齐。
+- 稳定化参数以设置页为唯一真源，不再依赖 `.gyroflow` 文件；预设只用它的镜头标定。
+- 多文件（分段）导出的**接缝预热平滑**：用相邻分段的原始四元数做 3 秒预热，消除接缝处的
+  「稳定化重置」；带 30° 姿态跳变保护。
+
+**导出**
+
+- 分段拼接导出：每段用自己的源音轨，接缝处 30ms 等功率交叉淡化，解决画面跳变与音频断点。
+- H.264/HEVC/AV1，硬件（QSV/NVENC/AMF）与软件编码，可回退。
+- HUD 叠加（用时/分段/配速/距离/心率/海拔/指南针等）、地图与轨迹可单独开关。
+- 导出队列与导出日志；中止后已写出的片段仍可播放。
+
+**票据识别**
+
+- `receipt-ocr`：ONNX Runtime + PP-OCRv4 模型的收据/表格识别，纯 Rust 预处理与后处理。
+
+**工程与许可**
+
+- 工程默认 `.trr`，兼容旧 `.orv`；用户数据写入 `TraceReel` 目录并从 `OrientView` 迁移。
+- 许可定为 GPL-3.0-or-later，详见 [THIRD-PARTY.md](THIRD-PARTY.md)。

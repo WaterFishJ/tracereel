@@ -1,0 +1,65 @@
+[package]
+name = "tracereel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "TraceReel (迹映): map/route overlays, splits, HUD, encoder and Gyroflow motion stabilization"
+
+[lib]
+name = "tracereel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tracereel"
+path = "src/main.rs"
+
+[dependencies]
+receipt-ocr = { path = "../receipt-ocr" }
+tracereel-core = { path = "../tracereel-core" }
+gyroflow-core = { path = "../gyroflow-src/src/core" }
+ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "filter", "format", "software-resampling", "software-scaling"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+nalgebra = "0.34"
+log = "0.4"
+env_logger = "0.11"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+qmetaobject = "0.2"
+cpp = "0.5"
+parking_lot = "0.12.5"
+
+[build-dependencies]
+cpp_build = "0.5"
+
+[[bin]]
+name = "gyrotest"
+path = "src/bin/gyrotest.rs"
+
+[[bin]]
+name = "encodetest"
+path = "src/bin/encodetest.rs"
+
+[[bin]]
+name = "qmltest"
+path = "src/bin/qmltest.rs"
+
+[[bin]]
+name = "qmlprobe"
+path = "src/bin/qmlprobe.rs"
+
+[[bin]]
+name = "tracereel-gui"
+path = "src/bin/gui.rs"
+
+[[bin]]
+name = "guirender"
+path = "src/bin/guirender.rs"
+
+[[bin]]
+name = "encvideos"
+path = "src/bin/encvideos.rs"
+
+[[bin]]
+name = "stabvid"
+path = "src/bin/stabvid.rs"

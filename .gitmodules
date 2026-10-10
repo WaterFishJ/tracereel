@@ -1,0 +1,4 @@
+[submodule "gyroflow-src"]
+	path = gyroflow-src
+	url = https://github.com/WaterFishJ/gyroflow.git
+	branch = tracereel

@@ -1,0 +1,92 @@
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+const logic = {};
+vm.createContext(logic);
+vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/bin/ReceiptImport.js'), 'utf8').replace('.pragma library', ''), logic);
+const row = (code, time, include=true) => ({cells:[code,time],include,mergedInto:-1});
+const build = (rows,relative=false) => logic.build(rows,1,relative,-1,0);
+assert.equal(logic.parseTime('00:22:03.1'), 1323.1);
+assert.equal(logic.normalizeTime('00:22:03.1'), '22:03.1');
+assert.equal(logic.normalizeTime('00:00:07.100'), '0:07.100');
+assert.ok(Number.isNaN(logic.parseTime('00:60:03')));
+assert.ok(Number.isNaN(logic.parseTime('1e3')));
+// OCR cleanup is done in Rust, not in the user-editable import parser.
+// Ambiguous/raw extra digits still require review; valid 1s, decimals, and
+// long mm:ss durations must remain usable after cleanup.
+assert.ok(Number.isNaN(logic.parseTime('00:03:121')));
+assert.ok(Number.isNaN(logic.parseTime('00:03:021')));
+assert.equal(logic.parseTime('00:12:01'), 721);
+assert.equal(logic.parseTime('00:03:02.1'), 182.1);
+assert.equal(logic.parseTime('125:30'), 7530);
+const repairedReceipt = [
+    ['起点','00:00:00','00:00:00'],
+    ['0031','00:03:02','00:03:02'],
+    ['0032','00:09:22','00:06:20'],
+    ['0033','00:21:23','00:12:01'],
+].map(cells => ({cells, include:true}));
+const repairedCumulative = logic.build(repairedReceipt,1,false,-1,0);
+const repairedRelative = logic.build(repairedReceipt,2,true,-1,0);
+assert.equal(repairedCumulative.error, '');
+assert.equal(repairedRelative.error, '');
+assert.equal(repairedCumulative.times.join('|'), '3:02|9:22|21:23');
+assert.equal(repairedRelative.times.join('|'), '3:02|6:20|12:01');
+assert.equal(repairedCumulative.codes.join('|'), '0031|0032|0033');
+assert.equal(repairedRelative.finish, repairedCumulative.finish);
+let rows = [row('50','1:21'),row('120','2:55'),row('50','4:00')];
+assert.equal(build(rows).times.join('|'), '1:21|2:55|4:00');
+assert.equal(build(rows).codes.join('|'), '50|120|50');
+assert.equal(logic.suspects(rows,0).filter(Boolean).length,0);
+assert.equal(logic.mergeRow(rows,0,1,1,false), '');
+assert.equal(rows.length,2);
+assert.equal(rows[0].cells.join('|'),'120|2:55');
+rows = [row('50','00:01:21'),row('50','00:00:02'),row('50','00:00:03'),row('120','00:00:40')];
+assert.equal(logic.suspects(rows,0).filter(Boolean).length,3);
+assert.equal(logic.suspects(rows,-1).filter(Boolean).length,0);
+assert.equal(logic.mergeRow(rows,1,-1,1,true), '');
+assert.equal(rows.length,3);
+assert.equal(rows[0].cells[1],'1:23');
+assert.equal(logic.mergeRow(rows,1,-1,1,true), '');
+assert.equal(rows.length,2);
+assert.equal(rows[0].cells[1],'1:26');
+assert.equal(build(rows,true).times.join('|'), '1:26|0:40');
+assert.equal(build(rows,true).finish,'2:06');
+assert.equal(build(rows,true).relative,true);
+assert.equal(logic.suspects(rows,0).filter(Boolean).length,0);
+rows = [row('50','00:01:21'),row('50','00:00:02'),row('50','00:00:03'),row('120','00:00:40')];
+assert.equal(logic.mergeRow(rows,0,1,1,true), '');
+assert.equal(logic.mergeRow(rows,0,1,1,true), '');
+assert.equal(rows.length,2);
+assert.equal(rows[0].cells[1],'1:26');
+assert.equal(build(rows,true).times.join('|'), '1:26|0:40');
+assert.equal(build(rows,true).finish,'2:06');
+rows = [row('Start','0:00'),row('50','1:21'),row('50','1:23'),row('120','2:06')];
+assert.equal(logic.mergeRow(rows,2,-1,1,false), '');
+assert.equal(rows.length,3);
+assert.equal(rows[1].cells[1],'1:23');
+assert.equal(build(rows).times.join('|'), '1:23|2:06');
+rows = [row('50','1:21'),row('60','1:23'),row('120','2:06')];
+assert.equal(logic.mergeRow(rows,0,1,1,false), '');
+assert.equal(rows[0].cells.join('|'),'60|1:23');
+assert.equal(build(rows).times.join('|'),'1:23|2:06');
+rows = [row('50','1:21'),row('50','1:23',false),row('50','2:06')];
+assert.equal(logic.neighbor(rows,0,1),1);
+assert.equal(logic.suspects(rows,0).filter(Boolean).length,0);
+rows = [row('','0:59.8'),row('','0:00.3')];
+assert.equal(logic.mergeRow(rows,1,-1,1,true),'');
+assert.equal(rows[0].cells[1],'1:00.1');
+assert.equal(logic.formatTime(60.1,'59.8'),'60.1');
+assert.equal(logic.neighbor(rows,0,-1),-1);
+assert.equal(logic.neighbor(rows,0,1),-1);
+rows = [row('50','bad'),row('60','1:23')];
+const snapshot = JSON.stringify(rows);
+assert.ok(logic.mergeRow(rows,0,1,1,true).length);
+assert.equal(JSON.stringify(rows),snapshot);
+assert.ok(logic.mergeRow(rows,0,1,-1,true).length);
+assert.equal(JSON.stringify(rows),snapshot);
+assert.ok(build([row('50','1:23'),row('120','1:21')]).error.length);
+assert.ok(build([row('50','bad')]).error.length);
+assert.equal(build([row('header','time',false),row('Start','0:00'),row('Finish','22:03.1')]).times.join('|'),'22:03.1');
+assert.equal(build([row('','1:21'),row('','2:55')]).codes.join('|'),'|');
+console.log('Receipt import tests passed: time notation, optional point codes, suspect highlighting, up/down chained merges, cumulative/relative finish preservation.');

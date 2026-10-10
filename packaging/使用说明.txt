@@ -1,0 +1,14 @@
+TraceReel — Windows 64 位便携版
+
+1. 将 ZIP 完整解压到一个普通文件夹。
+2. 双击 TraceReel.exe 启动，无需安装 Rust、Qt 或 FFmpeg。
+3. 不要只复制 exe；同级 DLL、qml、camera_presets 和 presets 都需要保留。
+4. 将自己的地图、轨迹、视频和项目文件放在本机；本包不附带任何素材。
+5. 镜头库已包含；presets 目录可放入自己的 .gyroflow 预设（本包不附带预设）。
+6. 建议使用 Windows 10/11 x64。导出速度取决于 CPU、显卡及素材。
+7. 便携版卸载时删除解压的程序目录即可；请先保留自己存入目录的素材。
+
+如果导出时硬件编码不可用，请改用软件编码。
+分享时发送整个 portable.zip 文件。
+
+工程默认保存为 .trr（TraceReel 工程）；加载时也支持旧 .orv 工程。

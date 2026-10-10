@@ -1,0 +1,39 @@
+# 构建产物
+/target
+/dist
+**/target
+*.pdb
+*.ilk
+
+# 需要按文档自行下载的第三方运行时/开发包（不入库）
+# 见 packaging/ffmpeg获取说明.md 与 ocr/README.md
+/tools/ffmpeg/
+/tools/ocr/
+
+# Python 环境
+/.ocr-venv/
+__pycache__/
+*.pyc
+
+# demo 只放脚本：媒体与个人素材一律不入库
+# （demo/example.trr 是显式入库的例外）
+/demo/*.mp4
+/demo/*.mkv
+/demo/*.mov
+/demo/*.jpg
+/demo/*.jpeg
+/demo/*.png
+/demo/*.gpx
+/demo/*.GPX
+/demo/*.qrt
+/demo/*.orv
+/demo/*.json
+*.mp4.tmp
+
+# 预设是个人配置，不入库（见 presets/README.md）
+/presets/*.gyroflow
+
+# 本地环境与临时文件
+.env
+*.log
+/tmp/

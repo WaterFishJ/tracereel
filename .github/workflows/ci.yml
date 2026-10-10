@@ -1,0 +1,28 @@
+name: CI
+
+# 只跑「纯逻辑」crate 的单测：它们不需要 Qt、ffmpeg，也不需要编译 GUI。
+# app（GUI / 编解码 / 防抖）依赖 Qt 6.8、ffmpeg 开发包与 wgpu，在 GitHub 托管机上
+# 准备这些的成本远高于收益，因此不放进 CI；改动那部分时请按 README 在本地构建并说明验证方式。
+#
+# 需要子模块：app 通过路径依赖 gyroflow-src/src/core，cargo 解析工作区时要求该路径存在。
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  logic-tests:
+    name: 纯逻辑单测
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test（tracereel-core / receipt-ocr）
+        run: cargo test -p tracereel-core -p receipt-ocr

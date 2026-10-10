@@ -1,0 +1,19 @@
+# 统一按内容规范化行尾。不写这一段，Windows 上 core.autocrlf=true 的检出会在任何
+# 工具（rustfmt、编辑器、复制粘贴）改写文件后把整棵树变成「已修改」，真实 diff 被淹掉。
+* text=auto eol=lf
+
+# 批处理与 PowerShell：换行用 CRLF。
+# 注意 .ps1 还必须存为 UTF-8 **带 BOM**（本机 PowerShell 5.1 否则按 GBK 解码，
+# 中文注释会变乱码并吃掉引号）；.cmd 不能带 BOM，cmd.exe 会把 BOM 当成命令。
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制资源，永不转换
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.ico     binary
+*.gz      binary
+*.cbor.gz binary
+*.zip     binary
