@@ -109,7 +109,7 @@ jobs:
         run: ./packaging/create-source-archive.ps1 -Version '${{ steps.version.outputs.version }}'
 
       - name: Upload packages and SHA256 files
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: TraceReel-${{ steps.version.outputs.version }}-windows-x64
           path: |
@@ -122,7 +122,7 @@ jobs:
 
       - name: Upload verification logs
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: windows-package-diagnostics
           path: |
@@ -138,7 +138,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v7
         with:
           pattern: TraceReel-*-windows-x64
           path: release-assets
