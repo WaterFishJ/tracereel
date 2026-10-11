@@ -3,9 +3,14 @@
 //! rawvideo; the original audio track is mapped in the same command.
 //!
 //! Key invariants (verified in the previous implementation):
-//! * MP4 output uses `-movflags frag_keyframe+empty_moov -flush_packets 1` so the moov
-//!   index is written up front and every keyframe fragment lands on disk immediately —
+//! * The encode ITSELF writes `-movflags frag_keyframe+empty_moov -flush_packets 1` so the
+//!   moov index is written up front and every keyframe fragment lands on disk immediately —
 //!   an aborted encode still leaves a playable file.
+//! * A SUCCESSFUL mp4 encode is then re-muxed once with `-c copy -movflags +faststart`
+//!   (see [`finalize_mobile_mp4`]): a fragmented file carries `mvhd/tkhd/mdhd duration = 0`
+//!   in its moov, and the phone-side apps people actually deliver to (微信 / 视频号 / 抖音 /
+//!   剪映) read only the moov, so they show 3 秒 / <1 秒 / 不识别. The re-mux is a stream
+//!   copy (lossless, no re-encode) and restores a real duration with moov at the front.
 //! * Never use `-shortest` (deadlocks the final fragment flush on long encodes).
 //! * QSV hwupload path must not force `-pix_fmt`.
 
@@ -561,6 +566,9 @@ impl FfmpegEncoder {
                 format!("编码失败：{last}（详细信息见日志）")
             });
         }
+        // 编码本身写的是分片 MP4（中止也能留下可播放文件），成功后重封装一次，
+        // 得到手机端能正确识别时长的标准 MP4。失败只记日志：文件本身仍然可播。
+        finalize_mobile_mp4(&self.output_path);
         Ok(self.output_path.clone())
     }
 
@@ -596,6 +604,148 @@ impl FfmpegEncoder {
             }
         }
     }
+}
+
+/// 导出收尾：把分片 MP4 重封装成「手机能认时长」的标准 MP4。
+///
+/// 为什么需要它：编码阶段刻意用 `frag_keyframe+empty_moov` 写**分片** MP4，好处是
+/// 每个关键帧片段立刻落盘、中止也留下可播放的文件；代价是 moov 里的
+/// `mvhd/tkhd/mdhd` 时长全是 0（真实时长分散在各 `moof/tfdt` 里，文件尾另有 `mfra`）。
+/// 桌面播放器（PotPlayer/VLC/ffmpeg）会把整个文件扫一遍算出来，所以电脑上一切正常；
+/// 手机上的 App（微信、视频号、抖音、剪映）只读 moov，于是时长认成 0 —— 微信显示
+/// 3 秒、视频号导入时不足 1 秒、抖音直接不识别。这与编码器/画质/码率无关，
+/// 换 h264/hevc/av1、换 CPU/QSV 都一样。
+///
+/// 收尾动作是一次 `-c copy -movflags +faststart` 重封装：只搬运码流、不重新编码，
+/// 画质与「复制原声」的音频完全不变，只是把 moov 补上真实时长并前置。
+/// 先写同目录临时文件再原子替换，因此中途失败也不会留下半截文件；
+/// 重封装失败则保留原分片文件（电脑上依旧能播）并写进日志。
+fn finalize_mobile_mp4(output_path: &str) {
+    let p = Path::new(output_path);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "mp4" | "mov" | "m4v" | "3gp" | "m4a") {
+        return;
+    }
+    if !mp4_has_moof(p) {
+        // 已经是标准（非分片）MP4，或还没写出任何片段（空文件）：无需处理。
+        return;
+    }
+    let tmp = tmp_sibling_path(p);
+    let tmp_s = tmp.to_string_lossy().into_owned();
+    crate::log_info!("编码已完成，正在重封装为标准 MP4（手机端识别时长用）-> {output_path}");
+    let cmd = finalize_remux_command(&find_ffmpeg(), output_path, &tmp_s);
+    let out = background_command(&cmd[0]).args(&cmd[1..]).output();
+    let ok = matches!(&out, Ok(o) if o.status.success());
+    if !ok {
+        let detail = match &out {
+            Ok(o) => {
+                let e = String::from_utf8_lossy(&o.stderr);
+                let last = e
+                    .lines()
+                    .rev()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("无输出");
+                format!("退出码 {:?}：{last}", o.status.code())
+            }
+            Err(e) => e.to_string(),
+        };
+        crate::log_warn!(
+            "导出文件已生成，但重封装为标准 MP4 失败（{detail}）；\
+             保留原分片文件 {output_path}。该文件在电脑上可正常播放，\
+             手机端（微信/视频号/抖音/剪映）可能无法识别时长。"
+        );
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    // 原子替换：同目录 rename，Windows 上会覆盖已存在的目标。
+    if let Err(e) = std::fs::rename(&tmp, p) {
+        crate::log_warn!(
+            "标准 MP4 已写好（临时文件 {tmp_s}），但替换 {output_path} 失败：{e}；\
+             请手工用临时文件替换原文件。"
+        );
+        return;
+    }
+    crate::log_info!("已重封装为标准 MP4（手机兼容，时长写入 moov）-> {output_path}");
+}
+
+/// 重封装命令：搬运码流 + moov 前置。抽成纯函数便于单测。
+fn finalize_remux_command(ffmpeg: &str, input: &str, tmp_out: &str) -> Vec<String> {
+    vec![
+        ffmpeg.to_string(),
+        "-y".into(),
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-i".into(),
+        input.to_string(),
+        "-c".into(),
+        "copy".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+        tmp_out.to_string(),
+    ]
+}
+
+/// 重封装用的同目录临时路径：扩展名必须保留（ffmpeg 靠它选混流器）。
+fn tmp_sibling_path(p: &Path) -> PathBuf {
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp4")
+        .to_string();
+    let stem = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output")
+        .to_string();
+    p.with_file_name(format!("{stem}.mobile.tmp.{ext}"))
+}
+
+/// 判断一个 MP4/MOV 是否为分片格式（顶层出现 `moof` 即为分片）。
+///
+/// 只看顶层盒子头并靠 seek 跳过 mdat，所以哪怕文件几十 GB 也只读几百字节。
+fn mp4_has_moof(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(len) = f.metadata().map(|m| m.len()) else {
+        return false;
+    };
+    let mut off: u64 = 0;
+    while off + 8 <= len {
+        if f.seek(SeekFrom::Start(off)).is_err() {
+            return false;
+        }
+        let mut hdr = [0u8; 16];
+        if f.read_exact(&mut hdr[..8]).is_err() {
+            return false;
+        }
+        if &hdr[4..8] == b"moof" {
+            return true;
+        }
+        let size32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
+        let (size, hdr_len) = match size32 {
+            0 => (len - off, 8u64), // 最后一个盒子：延伸到文件尾
+            1 => {
+                if f.read_exact(&mut hdr[8..16]).is_err() {
+                    return false;
+                }
+                (u64::from_be_bytes(hdr[8..16].try_into().unwrap()), 16u64)
+            }
+            n => (n, 8u64),
+        };
+        if size < hdr_len || size > len - off {
+            return false;
+        }
+        off += size;
+    }
+    false
 }
 
 /// Pre-extract per-segment audio for a stitched multi-file export and join the pieces
@@ -2378,6 +2528,66 @@ mod tests {
         let joined1 = cmd1.join(" ");
         assert!(!joined1.contains("-af"), "{joined1}");
         assert!(joined1.contains("-c:a copy"), "{joined1}");
+    }
+
+    #[test]
+    fn finalize_remux_is_a_stream_copy_with_faststart() {
+        let cmd = finalize_remux_command("ffmpeg.exe", "out.mp4", "out.mobile.tmp.mp4");
+        let joined = cmd.join(" ");
+        assert!(joined.contains("-c copy"), "{joined}");
+        assert!(joined.contains("-movflags +faststart"), "{joined}");
+        assert!(joined.trim_end().ends_with("out.mobile.tmp.mp4"), "{joined}");
+    }
+
+    #[test]
+    fn tmp_path_stays_next_to_the_output_and_keeps_the_extension() {
+        let tmp = tmp_sibling_path(Path::new(r"D:\v\测试导出1x.mp4"));
+        assert_eq!(
+            tmp.file_name().and_then(|s| s.to_str()),
+            Some("测试导出1x.mobile.tmp.mp4")
+        );
+        assert_eq!(tmp.parent().and_then(|p| p.to_str()), Some(r"D:\v"));
+    }
+
+    /// 8 字节头的最小盒子。
+    fn bx(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut v = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(typ);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// 64 位长度头（size==1）的盒子。
+    fn bx64(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut v = 1u32.to_be_bytes().to_vec();
+        v.extend_from_slice(typ);
+        v.extend_from_slice(&((payload.len() + 16) as u64).to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// 分片 MP4（顶层有 moof）必须被认出来；标准 MP4（moov+mdat）不能误判。
+    #[test]
+    fn moof_detection_distinguishes_fragmented_mp4() {
+        let dir = std::env::temp_dir().join(format!("tracereel-moof-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let frag = dir.join("frag.mp4");
+        let mut data = bx(b"ftyp", b"isom\x00\x00\x02\x00");
+        data.extend(bx(b"moov", &vec![0u8; 32]));
+        data.extend(bx(b"moof", &vec![0u8; 16]));
+        data.extend(bx(b"mdat", &vec![0u8; 64]));
+        std::fs::write(&frag, &data).unwrap();
+        assert!(mp4_has_moof(&frag), "分片 MP4 应判为分片");
+
+        let plain = dir.join("plain.mp4");
+        let mut data = bx(b"ftyp", b"isom\x00\x00\x02\x00");
+        data.extend(bx(b"moov", &vec![0u8; 32]));
+        data.extend(bx64(b"mdat", &vec![0u8; 4096]));
+        std::fs::write(&plain, &data).unwrap();
+        assert!(!mp4_has_moof(&plain), "标准 MP4 不应判为分片");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// One stereo s16le frame.

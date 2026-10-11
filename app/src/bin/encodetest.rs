@@ -1,5 +1,6 @@
 //! encodetest — CLI that encodes a source video through the ffmpeg encoder pipeline,
-//! validating the fragmented-mp4 command and audio copy (M6 acceptance D).
+//! validating the mp4 command, the audio copy (M6 acceptance D) and the standard-mp4
+//! finalize step (`finalize_mobile_mp4`, needs a real ffmpeg at runtime).
 //!
 //! Usage: encodetest <src_video> --out <mp4> [--max-frames N]
 
