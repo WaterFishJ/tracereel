@@ -1,200 +1,137 @@
-# TraceReel · 迹映
+<p align="center">
+  <a href="https://github.com/WaterFishJ/tracereel">
+    <img src="assets/branding/tracereel-mark.png" alt="TraceReel 迹映 Logo" height="120">
+  </a>
+</p>
 
-定向越野视频制作与路线回放软件：把实拍视频、定向地图、轨迹（QuickRoute `.qrt` / GPX / GPX 叠加图）
-和运动数据放到同一条时间轴上，并用陀螺数据做防抖，最后导出成片。
+<h1 align="center">TraceReel · 迹映</h1>
 
-**让路线成为影像。**
+<p align="center">
+  <strong>让路线成为影像。</strong>
+  <br>
+  把定向越野实拍、地图轨迹与运动数据，合成一段完整的赛事回放。
+</p>
 
-> TraceReel 是 [OrientView](https://github.com/mikoro/orientview)（C++/Qt）的 Rust 重写，
-> 整合了 [QuickRoute](https://github.com/matstroeng/quickroute) 的工程格式、
-> [Gyroflow](https://github.com/gyroflow/gyroflow) 的防抖核心与 ffmpeg 编码。
-> 许可为 **GPL-3.0-or-later**，来源、第三方组件与 GPL 义务见 [THIRD-PARTY.md](THIRD-PARTY.md)。
+<p align="center">
+  <a href="https://github.com/WaterFishJ/tracereel/releases">📦 下载 Windows 便携版</a> ·
+  <a href="#-快速上手">🚀 快速上手</a> ·
+  <a href="docs/开发与构建.md">🛠️ 开发与构建</a> ·
+  <a href="https://github.com/WaterFishJ/tracereel/issues">💬 问题反馈</a>
+</p>
 
-## 功能
+---
 
-**视频与预览**
+**TraceReel 是一款面向定向越野的 Windows 视频制作与路线回放软件。** 导入运动相机视频、定向地图和 GPS 轨迹，在同一条时间轴上对齐画面、路线与分段成绩，再加入防抖和运动数据 HUD，导出可用于赛事分享、训练复盘的视频。
 
-- ffmpeg 解码，软解 + `d3d11va` / QSV 硬解；播放由按 fps 的时间轴驱动，拖动进度可即时出帧。
-- 键盘 seek 多档步长（可配置），地图/轨迹可平移、旋转、缩放。
-- 窗口标题实时显示防抖状态（加载中 / 已就绪 / 无运动数据）。
+本项目以 Rust 重写 [OrientView](https://github.com/mikoro/orientview)，兼容 [QuickRoute](https://github.com/matstroeng/quickroute) 相关素材，并融合 Gyroflow 防抖与 FFmpeg 导出。
 
-**地图、轨迹与分段**
+## 🎬 效果展示
 
-- 轨迹来源：QuickRoute `.qrt`（内嵌地图 + 轨迹 + 分段）、QuickRoute 导出的 `.gpx.jpg`、GPX、普通图片底图。
-- 分段取景、跟随点、尾巴（可切换成配速色带）、控制点显示、按时间换多张地图。
-- `.qrt` 里带分段时可直接导入为分段时刻。
+### 导出视频
 
-**防抖（Gyroflow）**
+![TraceReel 实际导出效果：地图、轨迹、第一视角视频与运动数据 HUD](assets/showcase/export-preview.gif)
 
-- 进程内链接 `gyroflow-core`（本仓库的 fork 子模块），与原生 Gyroflow 1.6.3 用同一预设时逐帧对齐。
-- 稳定化参数以设置页为唯一真源，不依赖 `.gyroflow` 文件（预设只取其镜头标定）。
-- 多文件（分段）导出带**接缝预热平滑**：用相邻分段的原始四元数做 3 秒预热，消除接缝处的稳定化重置。
+### 软件 GUI
 
-**导出**
+![TraceReel 软件 GUI](assets/showcase/gui.png)
 
-- 分段拼接导出：每段用自己的源音轨，接缝处 30 毫秒等功率交叉淡化，避免画面跳变与音频断点。
-- H.264 / HEVC / AV1，硬件（QSV / NVENC / AMF）与软件编码，可回退。
-- HUD 叠加（用时 / 分段 / 配速 / 距离 / 心率 / 海拔 / 指南针等），地图与轨迹可单独开关。
-- 导出队列与导出日志；中止后已经写出的片段仍可播放。
+*实际软件界面（空白工程）：在同一窗口中管理素材、预览画面、调整地图与防抖，并配置 HUD 和导出。*
 
-**票据识别**
+## ✨ 核心功能
 
-- `receipt-ocr`：ONNX Runtime + PP-OCRv4 模型的收据/表格识别，预处理与后处理都是纯 Rust。
+### 🌀 融合 Gyroflow，让防抖更方便
 
-## 系统要求
+内置 **Gyroflow 防抖核心**，在 TraceReel 内完成防抖参数调整、预览和导出，简化素材处理流程。支持镜头标定与陀螺数据驱动的稳定化，多段视频导出时平滑处理防抖接缝。
 
-- **Windows 10 / 11 x64**。目前只支持 Windows：硬解走 `d3d11va`/QSV，构建脚本用 MSVC 与 `windeployqt`。
-- 便携包开箱即用；从源码构建见下节。
-- 硬件编码需要相应的显卡驱动；没有时自动回退软件编码。
+> 陀螺防抖需要视频包含可用的陀螺 / IMU 数据，并使用匹配的镜头标定；相关说明见 [防抖预设与镜头标定](presets/README.md)。
 
-## 安装
+### ⚡ FFmpeg 导出，编码选择更丰富
 
-### 方式一：便携包（推荐）
+基于 **FFmpeg** 导出，支持 **H.264、HEVC / H.265、AV1** 编码，以及 QSV、NVENC、AMF 硬件编码与软件编码。可按设备和用途选择输出方案，利用硬件加速提升导出效率。
 
-到本仓库的 **Releases** 下载 `TraceReel-<版本>-windows-x64-<时间戳>-portable.zip`，
-**完整解压**到一个普通文件夹后双击 `TraceReel.exe`。不需要安装 Rust、Qt 或 FFmpeg。
-ZIP 旁的 `.sha256` 是校验值。
+支持分段拼接、导出队列与日志；多段视频使用各自音轨，并在接缝处做音频交叉淡化。地图、视频与 HUD 可按需开关。
 
-### 方式二：从源码构建
+### 📊 自带 HUD，让运动数据进入画面
 
-见下节。
+内置运动数据 HUD，可叠加**用时、分段、配速、距离、心率、海拔与指南针**等信息，并调整布局与样式。视频、地图和数据随时间同步，让观众更容易理解路线选择与比赛节奏。
 
-## 从源码构建
+### 📷 成绩单 OCR，减少手动录入
 
-### 0. 前置
+导入成绩单 / 成绩条照片，通过**本地 OCR** 识别分段成绩，核对后导入时间轴。支持分段用时与累计时间，省去逐项输入的繁琐操作。
 
-| 依赖 | 版本 | 说明 |
-|---|---|---|
-| Rust | stable，`x86_64-pc-windows-msvc` | <https://rustup.rs> |
-| Visual Studio 2022 | 含「使用 C++ 的桌面开发」 | 提供 MSVC x64 工具链与 Windows SDK（`rc.exe`） |
-| Qt | 6.8.2 `msvc2022_64` | 需要 Quick / QML 模块 |
-| FFmpeg | 8.1 共享库构建，**必须含软件 AV1 编码器**（`libsvtav1` 或 `libaom-av1`） | 获取步骤见 [packaging/ffmpeg获取说明.md](packaging/ffmpeg获取说明.md) |
-| LLVM / clang | 较新版本即可 | rust-cpp 需要 `libclang.dll` |
-| Python 3 | 可选 | 只有 `demo/*.py` 与 `tools/export_branding.py` 需要 |
+### 🗺️ 地图与轨迹，围绕定向越野设计
 
-### 1. 取源码（含子模块）
-
-```powershell
-git clone --recurse-submodules https://github.com/WaterFishJ/tracereel.git tracereel
-cd tracereel
-# 已经 clone 但没带子模块时：
-git submodule update --init
-```
-
-`gyroflow-src` 是 TraceReel 维护的 Gyroflow fork（GPL-3.0，地址见 [.gitmodules](.gitmodules)；
-基线为上游 gyroflow 提交 `81c9eda`），提供 `gyroflow-core` 和镜头标定数据库
-`profiles.cbor.gz`。改动只有两个源文件（接缝预热平滑），便于日后 rebase 到新的上游版本。
-
-### 2. FFmpeg
-
-按 [packaging/ffmpeg获取说明.md](packaging/ffmpeg获取说明.md) 下载并解压到 `tools/ffmpeg`
-（该目录不入库）。确认 `tools\ffmpeg\bin\ffmpeg.exe -hide_banner -encoders` 的输出里有
-`libsvtav1` 或 `libaom-av1`，否则「CPU + AV1」导出会失败。
-
-### 3. 环境变量
-
-| 变量 | 默认值 | 作用 |
-|---|---|---|
-| `TRACEREEL_QT_ROOT` | `C:\Qt\6.8.2\msvc2022_64` | Qt 目录 |
-| `TRACEREEL_FFMPEG_DIR` | `<仓库>\tools\ffmpeg` | ffmpeg 开发包与 `bin` |
-| `LIBCLANG_PATH` | 自动探测 LLVM / pip 安装的 clang | `libclang.dll` 所在目录 |
-
-### 4. 构建与运行
-
-```powershell
-.\build.ps1 build -p tracereel --bin tracereel-gui   # 只构建 GUI
-.\run.ps1                                            # 编译检查后启动（空白工程）
-.\run.ps1 demo\example.trr                           # 带一个模板工程启动（路径要自己改）
-.\run.ps1 --Release                                  # release 启动
-```
-
-`run.ps1` 每次都交给 cargo 按内容指纹判断是否需要重编译，因此不会启动过期程序；确实想跳过
-检查时用 `--SkipBuild`。首次全量构建要编译 wgpu / gyroflow-core / Qt 绑定，耗时较长。
-
-### 5. OCR 资源（只影响票据识别）
-
-```powershell
-.\ocr\setup.ps1     # 下载 ONNX Runtime 1.22 与 PP-OCRv4 模型到 tools\ocr
-```
-
-不需要 Python；打包脚本会自动调用它。
-
-## 打包便携版
-
-```powershell
-.\package.cmd        # 等价于 .\package.ps1；-SkipBuild 只重新收集依赖并压缩
-```
-
-产物在 `dist\`：`TraceReel-<版本>-windows-x64-<时间戳>-portable.zip` 与同名 `.sha256`。
-可用 [packaging/verify-package.ps1](packaging/verify-package.ps1) 解压校验。
-
-## 工程与用户数据
-
-- 工程文件默认 `.trr`，同时支持打开旧 `.orv`（内容仍是兼容的 INI 格式）。
-- 用户数据写在 `%APPDATA%\TraceReel`（预设、HUD 模板、导出队列）。首次运行时若发现旧的
-  `OrientView` 目录会复制过来，保留原文件且不覆盖已存在的 TraceReel 文件。
-- **本仓库不包含任何 `.gyroflow` 预设**：预设绑定你自己的相机与偏好，请用 Gyroflow 调好后
-  保存到 `presets\`（见 [presets/README.md](presets/README.md)）。
-
-## 仓库结构
-
-| 路径 | 内容 |
+| 能力 | 支持内容 |
 |---|---|
-| `app/` | `tracereel` 主 crate：GUI（QML + qmetaobject）、解码/编码、防抖、HUD、导出 |
-| `tracereel-core/` | 纯逻辑 crate：投影与渲染数学、QuickRoute `.qrt` / GPX 解析、RouteManager、分段 |
-| `receipt-ocr/` | 票据 OCR crate：ONNX Runtime + PP-OCRv4 推理与版式还原 |
-| `gyroflow-src/` | **子模块**：TraceReel 的 Gyroflow fork（GPL-3.0），提供 `gyroflow-core` |
-| `assets/branding/` | 品牌资源（矢量主文件 + PNG/ICO），构建时嵌入可执行文件 |
-| `docs/` | 设计笔记与防回归手册（中文） |
-| `demo/` | 开发用脚本与中性工程模板（不含任何素材） |
-| `ocr/` | OCR 运行时下载脚本与许可文本 |
-| `packaging/` | 打包说明、文件哈希与校验脚本 |
-| `presets/` | 预设目录（仓库内为空，只放说明） |
-| `tools/` | 辅助脚本；`tools/ffmpeg` 与 `tools/ocr` 需自行下载，不入库 |
+| 地图与轨迹导入 | QuickRoute `.qrt`（内嵌地图、轨迹与分段）、QuickRoute 导出的 `.gpx.jpg`、GPX、普通图片底图 |
+| 路线回放 | 分段取景、跟随点、轨迹尾迹、配速色带与控制点显示 |
+| 多地图与分段 | 按时间切换地图；可直接导入 `.qrt` 中的分段时刻 |
+| 时间轴与预览 | 拖动定位、可配置的键盘跳转；地图可平移、旋转与缩放 |
+| 工程保存 | 使用 `.trr` 工程文件，也支持打开旧 `.orv` 工程 |
 
-## 测试
+## 📦 下载与运行
 
-```powershell
-cargo test -p tracereel-core -p receipt-ocr    # 纯逻辑，不需要 Qt / ffmpeg / 子模块
-cargo check --workspace --all-targets          # 编译全部目标（需要 Qt、ffmpeg 与子模块）
-```
+目前支持 **Windows 10 / 11 x64**。
 
-`app` 里有一部分单元测试依赖真实素材（DJI 视频、`.qrt` 地图）。素材不在仓库中，文件缺失时
-这些用例会自动跳过，因此可以用环境变量指定自己的样本：
+1. 前往 [Releases](https://github.com/WaterFishJ/tracereel/releases)，下载 `TraceReel-<版本>-windows-x64-<时间戳>-portable.zip`。
+2. **完整解压**到一个普通文件夹。
+3. 双击 `TraceReel.exe`，即可使用，无需另行安装 Rust、Qt 或 FFmpeg。
 
-```powershell
-$env:TRACEREEL_TEST_DJI_VIDEO   = 'D:\media\DJI_xxx.MP4'
-$env:TRACEREEL_TEST_DJI_0176    = 'D:\media\DJI_0176.MP4'
-$env:TRACEREEL_TEST_QUICKROUTE_JPEG = 'D:\media\route.gpx.jpg'
-```
+ZIP 旁的 `.sha256` 文件可用于校验下载。硬件编码需要相应显卡驱动；不可用时会回退软件编码。
 
-界面与导出的手工/无头验证：`build.ps1`、`run.ps1`、`verify_gui.ps1`，细节见
-[docs/对齐gyroflow-面板与风格.md](docs/对齐gyroflow-面板与风格.md) 与
-[docs/防抖问题与修复总结.md](docs/防抖问题与修复总结.md)。
+## 🚀 快速上手
 
-## 常见问题
+1. **导入素材**：添加实拍视频、定向地图与轨迹；已有 QuickRoute 工程时，可直接导入 `.qrt`。
+2. **对齐时间**：同步视频与路线，导入分段成绩；成绩条照片可用 OCR 识别，核对后导入。
+3. **调整画面**：设置地图取景、轨迹样式和 HUD；有陀螺数据的素材可配置 Gyroflow 防抖。
+4. **预览并导出**：检查同步与布局，选择编码和输出参数，加入导出队列。
 
-- **构建报找不到 Qt / 找不到 libclang / 找不到 ffmpeg**：分别设置 `TRACEREEL_QT_ROOT`、
-  `LIBCLANG_PATH`、`TRACEREEL_FFMPEG_DIR`。
-- **首次构建很慢**：正常，`gyroflow-core` 含 wgpu 与 shader 编译，请耐心等待。
-- **「CPU + AV1」导出失败**：所用 ffmpeg 没有软件 AV1 编码器，换 [packaging/ffmpeg获取说明.md](packaging/ffmpeg获取说明.md) 里的构建。
-- **Windows 提示「未知发布者」**：便携包未做代码签名，选择「更多信息 → 仍要运行」即可，
-  或自行校验 ZIP 的 SHA256。
-- **防抖显示「无运动数据」**：该视频没有陀螺/IMU 数据（例如未开防抖录制的素材），属于正常。
-- **导入分段后地图不显示**：确认地图与轨迹用的是同一个 `.qrt`；渲染取景依赖 `.qrt` 里的
-  Handle 矩阵，只有经纬度而没有配准信息的地图无法取景。
+用户预设、HUD 模板与导出队列保存在 `%APPDATA%\TraceReel`。首次运行时会迁移旧 `OrientView` 用户数据，保留原文件且不覆盖已有 TraceReel 文件。
 
-## 许可与致谢
+## ❓ 常见问题
 
-TraceReel 以 **GPL-3.0-or-later** 发布（见 [LICENSE](LICENSE)）。之所以是这个许可：
-`gyroflow-core` 是链接进同一进程的 GPL 代码，同时本项目移植了 OrientView 与 QuickRoute 的
-GPL 实现，因此整体必须是 GPL。
+**为什么显示“无运动数据”？**
 
-致谢：
+该视频没有可用的陀螺 / IMU 数据，无法进行陀螺防抖。请检查相机录制设置及素材是否保留了运动数据。
 
-- **OrientView** — Mikko Ronkainen（GPL-3.0-or-later）：原程序与界面/渲染设计。
-- **QuickRoute** — Mats Troeng、Jörgen Ohlin（GPL-3.0+）：`.qrt` 工程格式与轨迹语义。
-- **Gyroflow** — Adrian、Elvin Chen 等（GPL-3.0）：防抖核心与镜头标定库。
-- **FFmpeg**、**Qt**、**ONNX Runtime**、**PaddleOCR / RapidOCR**：见 [THIRD-PARTY.md](THIRD-PARTY.md)。
+**导入轨迹后，地图为什么不能正确取景？**
 
-分发本程序的二进制时，请一并提供对应源码（本仓库的同一标签 + `gyroflow-src` 子模块提交）。
+请确认地图与轨迹来自同一个 `.qrt`。只有经纬度、没有地图配准信息时，无法直接完成对应的地图取景。
+
+**OCR 结果不准确怎么办？**
+
+使用清晰的成绩条照片，框选成绩表并调整旋转方向；导入前核对识别结果。
+
+**Windows 提示“未知发布者”？**
+
+便携包尚未进行代码签名。请从本仓库 Releases 下载，并使用附带的 SHA256 校验文件检查完整性。
+
+**想从源码构建或参与开发？**
+
+依赖、环境变量、构建、打包、仓库结构与测试命令统一收录在 [开发与构建](docs/开发与构建.md)。另见 [贡献指南](CONTRIBUTING.md)、[更新记录](CHANGELOG.md) 与 [技术文档](docs/README.md)。
+
+## 🤖 AI 开发说明
+
+**本项目全程由 AI 完成，使用 DeepSeek 与 OpenAI。** 感谢 AI 工具，也感谢为本项目提供基础的开源社区。
+
+## 🤝 致谢与许可
+
+感谢以下开源项目及其作者：
+
+| 项目 | 对 TraceReel 的贡献 |
+|---|---|
+| [OrientView](https://github.com/mikoro/orientview) | 原始程序，以及界面、交互与地图 / 轨迹渲染设计 |
+| [QuickRoute](https://github.com/matstroeng/quickroute) | `.qrt` 工程格式、轨迹 / 分段语义与配速色带算法 |
+| [Gyroflow](https://github.com/gyroflow/gyroflow) · [镜头标定库](https://github.com/gyroflow/lens_profiles) | 陀螺防抖核心与相机镜头标定数据 |
+| [FFmpeg](https://github.com/FFmpeg/FFmpeg) | 视频解码与导出编码 |
+| [Qt](https://github.com/qt) | 桌面 GUI 与图形渲染基础 |
+| [ONNX Runtime](https://github.com/microsoft/onnxruntime) | 本地 OCR 推理运行时 |
+| [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) · [RapidOCR](https://github.com/RapidAI/RapidOCR) | OCR 模型与模型分发 |
+
+TraceReel 以 **GPL-3.0-or-later** 发布，见 [LICENSE](LICENSE)。第三方组件、来源与分发要求见 [THIRD-PARTY.md](THIRD-PARTY.md)。分发二进制时，请一并提供完整对应源码，包括主仓库同一标签及 `gyroflow-src` 子模块对应提交。
+
+## 💬 联系作者
+
+**微信：13302831843**
+
+欢迎交流定向越野视频制作、反馈使用体验或提出改进建议。软件问题也可提交到 [GitHub Issues](https://github.com/WaterFishJ/tracereel/issues)。
