@@ -6,11 +6,16 @@
 //! * The encode ITSELF writes `-movflags frag_keyframe+empty_moov -flush_packets 1` so the
 //!   moov index is written up front and every keyframe fragment lands on disk immediately —
 //!   an aborted encode still leaves a playable file.
-//! * A SUCCESSFUL mp4 encode is then re-muxed once with `-c copy -movflags +faststart`
-//!   (see [`finalize_mobile_mp4`]): a fragmented file carries `mvhd/tkhd/mdhd duration = 0`
-//!   in its moov, and the phone-side apps people actually deliver to (微信 / 视频号 / 抖音 /
-//!   剪映) read only the moov, so they show 3 秒 / <1 秒 / 不识别. The re-mux is a stream
-//!   copy (lossless, no re-encode) and restores a real duration with moov at the front.
+//! * Every mp4 that is KEPT — the finished one (see [`FfmpegEncoder::close`]) and the
+//!   partial one left by a user abort (see [`finalize_mobile_mp4`]) — is then re-muxed once
+//!   with `-c copy -movflags +faststart`: a fragmented file carries `mvhd/tkhd/mdhd duration
+//!   = 0` in its moov, and the phone-side apps people actually deliver to (微信 / 视频号 /
+//!   抖音 / 剪映) read only the moov, so they show 3 秒 / <1 秒 / 不识别. The re-mux is a
+//!   stream copy (lossless, no re-encode) and restores a real duration with moov at the front.
+//!   The partial file is additionally trimmed to the video track's end: at abort time the
+//!   copied audio is usually already complete while the picture stops where the user stopped.
+//!   A *failed* attempt is the one case that is left alone: its residue is thrown away by the
+//!   `-y` retry (or is a few hundred ms of a failed export), so re-muxing it would be wasted IO.
 //! * Never use `-shortest` (deadlocks the final fragment flush on long encodes).
 //! * QSV hwupload path must not force `-pix_fmt`.
 
@@ -568,7 +573,7 @@ impl FfmpegEncoder {
         }
         // 编码本身写的是分片 MP4（中止也能留下可播放文件），成功后重封装一次，
         // 得到手机端能正确识别时长的标准 MP4。失败只记日志：文件本身仍然可播。
-        finalize_mobile_mp4(&self.output_path);
+        let _ = finalize_mobile_mp4(&self.output_path, None);
         Ok(self.output_path.clone())
     }
 
@@ -616,11 +621,22 @@ impl FfmpegEncoder {
 /// 3 秒、视频号导入时不足 1 秒、抖音直接不识别。这与编码器/画质/码率无关，
 /// 换 h264/hevc/av1、换 CPU/QSV 都一样。
 ///
-/// 收尾动作是一次 `-c copy -movflags +faststart` 重封装：只搬运码流、不重新编码，
+/// 调用点有两个，覆盖**所有会被留下的 mp4**：
+/// * [`FfmpegEncoder::close`] —— 完整导出的收尾；
+/// * 用户中止（点「停止」）后 —— 已写入的部分同样要能发到手机上，代价是与已写入
+///   大小成正比的一次搬运（不重编码），所以调用方会先把提示写进 notice，
+///   让编码弹窗说明"正在重封装"，用户不会以为程序卡住。
+/// **导出失败**留下的残片不重封装：它会被 CPU 回退重试的 `-y` 直接截断，搬一遍纯属浪费。
+///
+/// 动作是一次 `-c copy -movflags +faststart` 重封装：只搬运码流、不重新编码，
 /// 画质与「复制原声」的音频完全不变，只是把 moov 补上真实时长并前置。
 /// 先写同目录临时文件再原子替换，因此中途失败也不会留下半截文件；
 /// 重封装失败则保留原分片文件（电脑上依旧能播）并写进日志。
-fn finalize_mobile_mp4(output_path: &str) {
+///
+/// `keep_s`：只保留该时刻之前的内容（容器级裁剪，仍不重新编码）。中止导出时用它按
+/// **视频轨的实际结尾**裁掉多余的音频（见 [`video_track_end_s`]）；完整导出传 `None`。
+/// 返回是否真的做了一次重封装（调用方据此决定要不要对用户说"已封装为标准 MP4"）。
+fn finalize_mobile_mp4(output_path: &str, keep_s: Option<f64>) -> bool {
     let p = Path::new(output_path);
     let ext = p
         .extension()
@@ -628,16 +644,16 @@ fn finalize_mobile_mp4(output_path: &str) {
         .unwrap_or("")
         .to_ascii_lowercase();
     if !matches!(ext.as_str(), "mp4" | "mov" | "m4v" | "3gp" | "m4a") {
-        return;
+        return false;
     }
     if !mp4_has_moof(p) {
         // 已经是标准（非分片）MP4，或还没写出任何片段（空文件）：无需处理。
-        return;
+        return false;
     }
     let tmp = tmp_sibling_path(p);
     let tmp_s = tmp.to_string_lossy().into_owned();
-    crate::log_info!("编码已完成，正在重封装为标准 MP4（手机端识别时长用）-> {output_path}");
-    let cmd = finalize_remux_command(&find_ffmpeg(), output_path, &tmp_s);
+    crate::log_info!("正在重封装为标准 MP4（手机端识别时长用）-> {output_path}");
+    let cmd = finalize_remux_command(&find_ffmpeg(), output_path, &tmp_s, keep_s);
     let out = background_command(&cmd[0]).args(&cmd[1..]).output();
     let ok = matches!(&out, Ok(o) if o.status.success());
     if !ok {
@@ -660,7 +676,7 @@ fn finalize_mobile_mp4(output_path: &str) {
              手机端（微信/视频号/抖音/剪映）可能无法识别时长。"
         );
         let _ = std::fs::remove_file(&tmp);
-        return;
+        return false;
     }
     // 原子替换：同目录 rename，Windows 上会覆盖已存在的目标。
     if let Err(e) = std::fs::rename(&tmp, p) {
@@ -668,14 +684,54 @@ fn finalize_mobile_mp4(output_path: &str) {
             "标准 MP4 已写好（临时文件 {tmp_s}），但替换 {output_path} 失败：{e}；\
              请手工用临时文件替换原文件。"
         );
-        return;
+        return false;
     }
     crate::log_info!("已重封装为标准 MP4（手机兼容，时长写入 moov）-> {output_path}");
+    true
 }
 
-/// 重封装命令：搬运码流 + moov 前置。抽成纯函数便于单测。
-fn finalize_remux_command(ffmpeg: &str, input: &str, tmp_out: &str) -> Vec<String> {
-    vec![
+/// 读出（分片）文件里视频轨的实际结尾时刻（秒），供中止导出裁剪用。
+///
+/// 中止时音频往往已经**全部**混流完（音频是流复制，比逐帧喂入的视频快得多），
+/// 若不裁，手机拿到的是一个"时长 6 分钟、画面只有 30 秒"的文件。
+/// ffprobe 缺失或读不出时长就返回 `None`（不裁，退回原来的行为）。
+fn video_track_end_s(path: &Path) -> Option<f64> {
+    let ffmpeg = find_ffmpeg();
+    let probe = match Path::new(&ffmpeg).parent() {
+        Some(dir) if dir.join("ffprobe.exe").exists() => {
+            dir.join("ffprobe.exe").to_string_lossy().into_owned()
+        }
+        _ => "ffprobe.exe".to_string(),
+    };
+    let out = background_command(&probe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let t: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    (t.is_finite() && t > 0.0).then_some(t)
+}
+
+/// 重封装命令：搬运码流 + moov 前置（可选按 `keep_s` 裁掉尾巴）。抽成纯函数便于单测。
+fn finalize_remux_command(
+    ffmpeg: &str,
+    input: &str,
+    tmp_out: &str,
+    keep_s: Option<f64>,
+) -> Vec<String> {
+    let mut cmd = vec![
         ffmpeg.to_string(),
         "-y".into(),
         "-hide_banner".into(),
@@ -687,8 +743,13 @@ fn finalize_remux_command(ffmpeg: &str, input: &str, tmp_out: &str) -> Vec<Strin
         "copy".into(),
         "-movflags".into(),
         "+faststart".into(),
-        tmp_out.to_string(),
-    ]
+    ];
+    if let Some(t) = keep_s {
+        cmd.push("-t".into());
+        cmd.push(format!("{t:.3}"));
+    }
+    cmd.push(tmp_out.to_string());
+    cmd
 }
 
 /// 重封装用的同目录临时路径：扩展名必须保留（ffmpeg 靠它选混流器）。
@@ -2183,8 +2244,21 @@ fn encode_export_attempt(job: EncodeJob, publish_done: bool) -> Option<String> {
     }
     let aborted = stop.load(Ordering::SeqCst);
     if aborted {
+        // 中止留下的部分文件同样要能发到手机上：先让弹窗说明"正在重封装"（这一步是
+        // 与已写入大小成正比的纯搬运，大文件要等几秒），再重封装，最后才发布结果。
+        handle.set_notice(
+            "已停止：正在把已写入的部分封装成手机兼容的标准 MP4（只搬运码流，不重新编码）…"
+                .into(),
+        );
         enc.abort();
-        return finish(true, "编码已中止（部分文件已保留，可播放）".into());
+        let keep = video_track_end_s(Path::new(&out_path));
+        let packed = finalize_mobile_mp4(&out_path, keep);
+        let msg = if packed {
+            "编码已中止（部分文件已保留，并已封装为标准 MP4，可发手机）"
+        } else {
+            "编码已中止（部分文件已保留，可播放）"
+        };
+        return finish(true, msg.into());
     }
     match enc.close() {
         Ok(_) => {
@@ -2408,8 +2482,22 @@ fn encode_export_map_only_run(job: EncodeJob, mark_done: bool) {
     }
     let aborted = stop.load(Ordering::SeqCst);
     if aborted {
+        // 同 encode_export_attempt：中止的部分文件也要能发到手机上。
+        handle.set_notice(
+            "已停止：正在把已写入的部分封装成手机兼容的标准 MP4（只搬运码流，不重新编码）…"
+                .into(),
+        );
         enc.abort();
-        finish(true, "编码已中止（部分文件已保留，可播放）".into());
+        let keep = video_track_end_s(Path::new(&out_path));
+        let packed = finalize_mobile_mp4(&out_path, keep);
+        finish(
+            true,
+            if packed {
+                "编码已中止（部分文件已保留，并已封装为标准 MP4，可发手机）".into()
+            } else {
+                "编码已中止（部分文件已保留，可播放）".into()
+            },
+        );
     } else {
         match enc.close() {
             Ok(_) => {
@@ -2532,11 +2620,29 @@ mod tests {
 
     #[test]
     fn finalize_remux_is_a_stream_copy_with_faststart() {
-        let cmd = finalize_remux_command("ffmpeg.exe", "out.mp4", "out.mobile.tmp.mp4");
+        let cmd = finalize_remux_command("ffmpeg.exe", "out.mp4", "out.mobile.tmp.mp4", None);
         let joined = cmd.join(" ");
         assert!(joined.contains("-c copy"), "{joined}");
         assert!(joined.contains("-movflags +faststart"), "{joined}");
         assert!(joined.trim_end().ends_with("out.mobile.tmp.mp4"), "{joined}");
+        // 完整导出不裁剪。
+        assert!(!joined.contains("-t "), "{joined}");
+    }
+
+    /// 中止导出：按视频轨结尾裁剪，`-t` 必须是**输出**选项（在输出路径之前）。
+    #[test]
+    fn finalize_remux_trims_to_the_video_end_when_asked() {
+        let cmd = finalize_remux_command(
+            "ffmpeg.exe",
+            "out.mp4",
+            "out.mobile.tmp.mp4",
+            Some(3.0666),
+        );
+        let joined = cmd.join(" ");
+        assert!(joined.contains("-t 3.067"), "{joined}");
+        let t_at = cmd.iter().position(|a| a == "-t").unwrap();
+        let out_at = cmd.len() - 1;
+        assert!(t_at < out_at, "{joined}");
     }
 
     #[test]
