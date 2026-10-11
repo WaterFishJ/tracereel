@@ -44,7 +44,7 @@ cargo about generate about.hbs > RUST-DEPS.md
 
 分发本程序的二进制（含便携包）时，必须同时提供**完整对应的源码**。本仓库即对应源码：
 
-- 主仓库：本仓库的 `v0.2.0` 标签；
+- 主仓库：本仓库的 `v0.2.1` 标签；
 - 防抖核心：`gyroflow-src` 子模块指向的 fork 提交（含 TraceReel 的改动），地址
   <https://github.com/WaterFishJ/gyroflow>（分支 `tracereel`）；基线为上游 gyroflow 的提交
   `81c9eda`（"Allow exporting IMU samples in one sample per frame mode"），差异只有

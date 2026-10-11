@@ -3,6 +3,13 @@
 本文件记录每个公开发布版本的变化。版本号与 `Cargo.toml` 的 workspace `version` 一致，
 Git 标签形如 `v0.2.0`。
 
+## v0.2.1 — 导出兼容性与自动发布
+
+- 导出完成或中止后，将已生成的视频重封装为标准 MP4，修复手机端将时长识别为 0 的问题。
+- 按视频轨结尾裁剪多余音频，避免导出文件的音视频时长不一致。
+- 新增 GitHub Actions 自动构建、便携包验证与版本标签发布，提供便携包、含 Gyroflow 子模块的源码包和 SHA256 校验文件。
+- 更新 README 品牌展示、功能介绍与真实导出 GIF。
+
 ## v0.2.0 — 首个公开发布
 
 从 `pyorientview`（Python/PyQt 原型）与 OrientView（C++/Qt 原版）重写为 Rust + QML，
