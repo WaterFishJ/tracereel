@@ -463,10 +463,10 @@ pub struct TraceReelItem {
             // The preview keeps running untouched: the export is a fully self-contained
             // background pipeline (decode + stabilize + composite + ffmpeg all on its own
             // thread). Editing/exporting never disturbs the preview.
-            // Decode + stabilize at the same source-AR size the preview stabilizer was
-            // initialised on (cap 720h). draw_scene scales this AR-preserved frame into the
-            // chosen output panel, so no stretch and the stabilizer dims always match.
-            let (dec_w, dec_h) = processing_size(info.width, info.height, 720);
+            // 导出解码 + 防抖尺寸：按输出画布里面板实际需要的像素算（上限=源尺寸），
+            // 见 `encode::export_decode_size`。比预览那套（限高 720）大时，导出会自己
+            // 按这个尺寸重新加载一套稳定化器（`encode.rs` 里做，在编码线程上跑）。
+            let (dec_w, dec_h) = crate::encode::export_decode_size(&settings, info.width, info.height);
             if seg_batch {
                 let mut jobs = Vec::new();
                 for i in 0..seg_count {
@@ -709,6 +709,8 @@ pub struct TraceReelItem {
             // loads only when the user checks "启用防抖" or changes the video while it is on.
             self.settings = None;
             self.video_info = None;
+            self.source_size = QString::default();
+            self.source_size_changed();
             self.maps.clear();
             self.video_image = None;
             self.gyro = None;
@@ -746,6 +748,8 @@ pub struct TraceReelItem {
             }
             self.settings = None;
             self.video_info = None;
+            self.source_size = QString::default();
+            self.source_size_changed();
             self.maps.clear();
             self.video_image = None;
             self.gpx = None;
@@ -965,6 +969,11 @@ pub struct TraceReelItem {
     preview_request_id: u64,
     fps: f64,
     duration_ms: qt_property!(f64),
+    /// 源视频尺寸「宽x高」（探测到的原生尺寸）；未知时为空串。分辨率选「与原始视频一致」
+    /// （`encode_resolution = "source"`）时，QML 用它算预览画布的宽高比 —— 导出的画布尺寸
+    /// 就是源尺寸，预览必须同比例，否则地图/HUD 面板比例对不上。
+    source_size: qt_property!(QString; NOTIFY source_size_changed),
+    source_size_changed: qt_signal!(),
     /// 已落地到画面的预览帧数（只增不减）。自动化回归（`qmlprobe`）用它断言"改设置后
     /// 画面还在更新"——「黑屏」症状的本质就是这个数不再增长。
     debug_frames: qt_property!(f64),
@@ -1221,6 +1230,9 @@ impl TraceReelItem {
         self.segs = res.segs.clone();
         self.fps = res.info.fps;
         self.duration_ms = res.info.duration_ms;
+        // 源尺寸：预览在「与原始视频一致」时按它排版（见字段注释）。
+        self.source_size = QString::from(format!("{}x{}", res.info.width, res.info.height).as_str());
+        self.source_size_changed();
         self.gpx = res.gpx;
         self.processing = res.processing;
         self.gyro_has_motion = res.info.has_motion_data;
@@ -2260,6 +2272,20 @@ pub fn hard_gyro_sig(s: &Settings) -> String {
     )
 }
 
+/// 有没有配置任何地图/轨迹图片（主图或额外地图）。`draw_scene` 用它决定左侧地图带：
+/// 没配地图时视频铺满整帧。判断依据是 SETTINGS 而非已加载的图，这样「配置了地图但还在
+/// 加载」时布局不会跳动。导出解码尺寸（`encode::export_decode_size`）必须用同一个判据，
+/// 否则算出来的视频面板和实际绘制的不一致。
+pub fn map_configured(settings: &Settings) -> bool {
+    !settings.map.image_file_path.trim().is_empty()
+        || !settings.route.quick_route_jpeg_file_path.trim().is_empty()
+        || settings
+            .map
+            .extra_map_files
+            .iter()
+            .any(|p| !p.trim().is_empty())
+}
+
 pub fn draw_scene(
     p: &mut QPainter,
     rm: &RouteManager,
@@ -2273,14 +2299,7 @@ pub fn draw_scene(
     gpx: Option<&GpxTrack>,
 ) {
     // 没有配置任何地图/轨迹图片时（只做防抖 + HUD 的项目）左侧不留空带：视频铺满整帧。
-    // 判断依据是 SETTINGS 而非已加载的图，这样「配置了地图但还在加载」时布局不会跳动。
-    let map_configured = !settings.map.image_file_path.trim().is_empty()
-        || !settings.route.quick_route_jpeg_file_path.trim().is_empty()
-        || settings
-            .map
-            .extra_map_files
-            .iter()
-            .any(|p| !p.trim().is_empty());
+    let map_configured = map_configured(settings);
     let rel_w = if map_configured {
         settings.map.relative_width
     } else {
@@ -2446,6 +2465,10 @@ pub fn render_composite_to_png(
     };
     rm.update(t_ms / 1000.0, ft);
 
+    // HUD 轨迹：与实时预览/导出同一条解析路径（工程里的 GPX → 视频同名 .gpx →
+    // 轨迹文件自带的时间轴）。
+    let gpx = resolve_hud_track(&settings.hud.gpx_file_path, &video, Some(&rm));
+
     let mut decoder =
         SoftDecoder::open(&video, info.width, info.height).map_err(|e| format!("decoder: {e}"))?;
     let mut rgba = vec![0u8; info.width * info.height * 4];
@@ -2470,7 +2493,7 @@ pub fn render_composite_to_png(
         out_h as f64,
         t_ms,
         0.0,
-        None,
+        gpx.as_ref(),
     );
     drop(p);
     if qtwrap::qimage_save(&img, out_path) {
@@ -2520,17 +2543,8 @@ pub fn encode_composite(
         settings.map.relative_width,
     )?;
 
-    // GPX (for HUD in the export).
-    let gpx_path = if !settings.hud.gpx_file_path.is_empty() {
-        settings.hud.gpx_file_path.clone()
-    } else {
-        tracereel_core::gpx::find_gpx_for_video(&video)
-    };
-    let gpx = if !gpx_path.is_empty() {
-        tracereel_core::gpx::parse_gpx(&gpx_path).ok()
-    } else {
-        None
-    };
+    // HUD 轨迹（导出用）：工程里的 GPX → 视频同名 .gpx → 轨迹文件自带的时间轴。
+    let gpx = resolve_hud_track(&settings.hud.gpx_file_path, &video, Some(&rm));
 
     // Decoder at processing resolution.
     let (pw, ph) = processing_size(info.width, info.height, 1440);
@@ -3461,6 +3475,33 @@ pub(crate) fn init_route_manager(
     Ok(())
 }
 
+/// HUD 轨迹的解析：工程里指定的 GPX → 视频同名 `.gpx` → **退回轨迹文件自带的时间轴**。
+///
+/// 第三档服务「只导入了 .qrt / 轨迹图」的工程：QuickRoute 工程里本来就存着整条轨迹和
+/// 逐秒时间，没有它 HUD 上的配速/距离/航向一律显示「--」，看起来像程序没算出来。
+/// 两条来源的时间轴同一套约定（轨迹第一个样本 = 0 秒），采样偏移统一由
+/// [`crate::hud::hud_track_offset`] 按「出发时刻」换算。海拔/心率仍然只有 GPX 才有。
+pub fn resolve_hud_track(
+    gpx_path: &str,
+    video_path: &str,
+    rm: Option<&RouteManager>,
+) -> Option<GpxTrack> {
+    let path = if gpx_path.trim().is_empty() {
+        tracereel_core::gpx::find_gpx_for_video(video_path)
+    } else {
+        gpx_path.to_string()
+    };
+    if !path.is_empty() {
+        match tracereel_core::gpx::parse_gpx(&path) {
+            Ok(track) => return Some(track),
+            // 指了 GPX 却读不出来：退回轨迹自带的时间轴，同时把原因打出来，别悄悄空着。
+            Err(e) => eprintln!("[hud] GPX 读取失败（改用轨迹文件自带的时间轴）：{path}：{e}"),
+        }
+    }
+    let route = rm?.routes.first()?;
+    GpxTrack::from_route_points(&route.route_points)
+}
+
 /// 路线和尾巴分别按各自的自适应开关更新色带端点（慢端 P90 / 快端 P10）。
 /// 轨迹没有逐点配速（「地图 + 线路」工程）时保持原设定不变。
 pub(crate) fn apply_adaptive_pace(rm: &mut RouteManager) {
@@ -3669,16 +3710,13 @@ fn compute_apply(path: &str) -> PendingApply {
         }
     }
 
-    let gpx_path = if !settings.hud.gpx_file_path.is_empty() {
-        settings.hud.gpx_file_path.clone()
-    } else {
-        tracereel_core::gpx::find_gpx_for_video(&video)
-    };
-    let gpx = if !gpx_path.is_empty() {
-        tracereel_core::gpx::parse_gpx(&gpx_path).ok()
-    } else {
-        None
-    };
+    // HUD 轨迹：工程里的 GPX → 视频同名 .gpx → 轨迹文件自带的时间轴（只导入 .qrt 的工程
+    // 靠第三档才有配速/距离/航向）。
+    let gpx = resolve_hud_track(
+        &settings.hud.gpx_file_path,
+        &video,
+        maps.first().map(|m| &m.rm),
+    );
 
     let processing = {
         // Heavy work now runs in the dedicated preview worker; 720p fits the 16.7ms

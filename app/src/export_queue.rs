@@ -182,6 +182,12 @@ pub fn configuration(s: &Settings) -> Vec<String> {
         "crf" => format!("质量：{}", e.quality),
         _ => String::new(),
     };
+    // 存储的是 token，界面上不给用户看英文（与「帧率」同样式）。
+    let resolution = if e.resolution.eq_ignore_ascii_case("source") {
+        "与原始视频一致".to_string()
+    } else {
+        e.resolution.clone()
+    };
     vec![
         format!(
             "编码器：{backend}    格式：{}    码率控制：{rate}",
@@ -195,8 +201,7 @@ pub fn configuration(s: &Settings) -> Vec<String> {
             if e.include_hud { "✓" } else { "×" }
         ),
         format!(
-            "分段导出：{seg}    分辨率：{}    帧率：{}    导出倍速：{}x",
-            e.resolution,
+            "分段导出：{seg}    分辨率：{resolution}    帧率：{}    导出倍速：{}x",
             if e.frame_rate == "source" {
                 "与原始视频一致"
             } else {
@@ -301,7 +306,8 @@ pub fn run(mut s: Settings, out: String, handle: Arc<EncodeHandle>) {
                         info = i.clone();
                         info.duration_ms = 0.0;
                         info.frame_count = 0;
-                        dec = crate::gui::processing_size(i.width, i.height, 720);
+                        // 与直接导出同一条规则：按输出画布里面板实际需要的像素解码（上限源尺寸）。
+                        dec = crate::encode::export_decode_size(&s, i.width, i.height);
                     }
                     let seg = crate::gui::VideoSeg {
                         path: p.clone(),
@@ -398,6 +404,21 @@ pub fn run(mut s: Settings, out: String, handle: Arc<EncodeHandle>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configuration_shows_resolution_in_chinese() {
+        let mut s = Settings::default();
+        // 「与原始视频一致」在队列里不能露出 token "source"（界面文字不许出现英文）。
+        s.encode.resolution = "source".into();
+        let text = configuration(&s).join("\n");
+        assert!(text.contains("分辨率：与原始视频一致"), "{text}");
+        assert!(!text.contains("source"), "{text}");
+        // 显式尺寸照旧显示。
+        s.encode.resolution = "2688x2016".into();
+        let text = configuration(&s).join("\n");
+        assert!(text.contains("分辨率：2688x2016"), "{text}");
+    }
+
     #[test]
     fn output_length_uses_clip_speed_and_frame_rounding() {
         let mut s = Settings::default();

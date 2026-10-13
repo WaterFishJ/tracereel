@@ -111,7 +111,12 @@ fn main() {
     );
 
     let mut engine = QmlEngine::new();
-    engine.set_property(QString::from("orvPath"), QString::from("").into());
+    // 探针可以带一个真实工程（`gui.qml` 的 `orvPath` → `settings.file_path` → 启动即加载）；
+    // 默认空串，保持原有行为。
+    engine.set_property(
+        QString::from("orvPath"),
+        QString::from(std::env::var("QMLPROBE_ORV").unwrap_or_default()).into(),
+    );
     engine.set_property(QString::from("ocrTestImage"), QString::from(std::env::var("OCR_TEST_IMAGE").unwrap_or_default()).into());
 
     let qml_file = match std::env::var("QMLPROBE_FILE") {

@@ -217,6 +217,9 @@ fn main() {
             .collect(),
     )
     .unwrap();
+    // 帧时刻按**视频时钟**给（预览/导出就是这么调 `hud::draw` 的）：合成轨迹从 t=1000 s 起步、
+    // 「录像-出发时间」40 s，HUD 偏移 = GPX 偏移(0) − 40，所以轨迹 t=1000 对应视频 40 s。
+    // 从 40.1 s 起步、每帧 100 ms —— 轨迹是 10 Hz，正好每帧前进一个采样点，60 帧都在范围内。
     for frame in 0..60 {
         let mut img = qtwrap::qimage_new_argb32(800, 450);
         {
@@ -225,7 +228,7 @@ fn main() {
                 &mut p,
                 &s,
                 Some(&turning_track),
-                100.0 + frame as f64 * 100.0,
+                40_100.0 + frame as f64 * 100.0,
                 800.0,
                 450.0,
             );
@@ -244,7 +247,9 @@ fn main() {
     let video_time = 187_800.0;
     s.route.control_time_offset = 3.0;
     let route_time = video_time - 40_000.0 + 3_000.0;
-    s.hud.gpx_time_offset += s.video.start_time_offset_s - s.route.control_time_offset;
+    // 路线时钟顶替视频时钟（地图导出的做法，见 `encode.rs`）：帧时刻就是轨迹时刻，把
+    // 「录像-出发时间」设成「按表-出发时间」，HUD 偏移 = GPX 偏移(0) − 3 = −3，于是正好
+    // 读 `route_time` 那一刻的轨迹；elapsed 两边都落在 147.8 s。
     s.video.start_time_offset_s = s.route.control_time_offset;
     let mut img = qtwrap::qimage_new_argb32(1920, 1080);
     {

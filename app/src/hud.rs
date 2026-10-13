@@ -369,6 +369,22 @@ pub fn draw_in_viewport(
     draw(p, settings, track, t_ms, width, height);
     p.restore();
 }
+/// HUD 轨迹的采样偏移（秒）：把**视频时刻**换算成**轨迹时刻**，基准是「比赛出发时刻」。
+///
+/// 「录像-出发时间」已经把视频时间轴对齐到出发时刻（出发时刻 = 视频第 `T_video` 秒），所以
+/// 这里的输入时间是**出发后经过的秒数**；`gpx_time_offset` 则是这条 GPX 自己的时间轴相对
+/// 出发时刻的偏移（出发后 8 秒手表才搜到 GPS 开始记录 → −8）。两者相减就是轨迹时刻。
+///
+/// 例（孝德湖）：录像在出发前 17 秒开录 → 「录像-出发时间」= 17；出发后 8 秒才开表 →
+/// HUD 这一栏 = −8；于是 轨迹时刻 = 视频时刻 − 17 − 8 = 视频时刻 − 25。
+///
+/// **不要把「按表-出发时间」也自动加进来**：那个值描述的是轨迹（路线）文件自己的时间轴，
+/// 而 HUD 用的 GPX 可能是另一份文件，两者必须各自指定 —— 自动代入会在同一份工程里重复计入
+/// 一边，用户按自己的习惯填 −8 时就会变成 −33。
+pub fn hud_track_offset(s: &Settings) -> f64 {
+    s.hud.gpx_time_offset - s.video.start_time_offset_s
+}
+
 pub fn draw(
     p: &mut QPainter,
     settings: &Settings,
@@ -378,8 +394,9 @@ pub fn draw(
     height: f64,
 ) {
     let elapsed = (t_ms / 1000.0 - settings.video.start_time_offset_s).max(0.0);
-    let sample = track.and_then(|t| t.sample_at(t_ms / 1000.0, settings.hud.gpx_time_offset));
-    let ht = track.and_then(|t| t.hud_at(t_ms / 1000.0, settings.hud.gpx_time_offset));
+    let gpx_offset = hud_track_offset(settings);
+    let sample = track.and_then(|t| t.sample_at(t_ms / 1000.0, gpx_offset));
+    let ht = track.and_then(|t| t.hud_at(t_ms / 1000.0, gpx_offset));
     let raw = settings
         .hud
         .layout
@@ -393,7 +410,7 @@ pub fn draw(
         "distance":sample.map(|s|s.distance_km),"pace":sample.map(|s| if s.pace_min_km>0.0 {format!("{} /km",duration(s.pace_min_km*60.0))} else {"-- /km".into()}),
         "elapsed":duration(elapsed),"segment":segment(elapsed,settings),
         "phase":ht.map(|v|v.1).unwrap_or(0.0),"max_speed":track.map(|t|t.hud_max_speed()).unwrap_or(30.0),
-        "track_time":t_ms/1000.0+settings.hud.gpx_time_offset,
+        "track_time":t_ms/1000.0+gpx_offset,
         "classic_flags":[settings.hud.show_elapsed_time,settings.hud.show_segment_time,settings.hud.show_speed,
             settings.hud.show_pace,settings.hud.show_heart_rate,settings.hud.show_distance,settings.hud.show_azimuth,settings.hud.show_elevation]
     });
@@ -513,6 +530,39 @@ fn template_action_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 孝德湖工程：录像在出发前 17 秒开录（视频页填 17），出发后 8 秒手表才搜到 GPS 开始
+    /// 记录（HUD 这一栏填 −8，和「按表-出发时间」同值，因为 HUD 用的就是同一次记录）。
+    /// 合计 −25：视频 600 秒处读轨迹 575 秒。
+    #[test]
+    fn hud_offset_is_anchored_at_the_race_start() {
+        let mut s = Settings::default();
+        s.video.start_time_offset_s = 17.0;
+        s.hud.gpx_time_offset = -8.0;
+        assert_eq!(hud_track_offset(&s), -25.0);
+
+        // 填 0 时只按「录像-出发时间」换算，**不再偷偷带上轨迹那 −8 秒**：
+        // 这一栏的含义就是「GPX 相对出发时刻的偏移」。
+        s.hud.gpx_time_offset = 0.0;
+        assert_eq!(hud_track_offset(&s), -17.0);
+
+        // 没有「录像-出发时间」的工程行为跟以前完全一样：偏移就是这一栏的值。
+        s.video.start_time_offset_s = 0.0;
+        s.hud.gpx_time_offset = 3.0;
+        assert_eq!(hud_track_offset(&s), 3.0);
+    }
+
+    /// 路线时钟顶替视频时钟（地图导出 / hudcheck）：帧时刻就是轨迹时刻，把「录像-出发时间」
+    /// 设成「按表-出发时间」之后，采样偏移等于该栏自身 —— GPX 与轨迹同一条记录时正好为 0。
+    #[test]
+    fn route_clock_export_keeps_the_gpx_offset_only() {
+        let mut s = Settings::default();
+        s.route.control_time_offset = 3.0;
+        s.video.start_time_offset_s = s.route.control_time_offset;
+        s.hud.gpx_time_offset = 3.0;
+        assert_eq!(hud_track_offset(&s), 0.0);
+    }
+
     #[test]
     fn presets_have_requested_metrics_and_aligned_corners() {
         let campus = Layout::theme("campus");

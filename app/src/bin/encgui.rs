@@ -183,11 +183,13 @@ fn main() {
         let total = (((clip_end - clip_start) / 1000.0) * fps).round() as usize;
         eprintln!("[encgui] clip {clip_start}..{clip_end}ms total={total}");
 
-        // Decode + stabilizer buffer size: source AR capped to 720h (matches the GUI). draw_scene
-        // then scales this into the chosen output panel without stretching.
-        let (dec_w, dec_h) = tracereel::gui::processing_size(info.width, info.height, 720);
+        // Decode + stabilizer buffer size: the pixels the output canvas' video panel actually
+        // needs, capped at the source size (see `encode::export_decode_size`). draw_scene then
+        // scales this AR-preserved frame into the chosen output panel without stretching.
+        let (dec_w, dec_h) = tracereel::encode::export_decode_size(&settings, info.width, info.height);
 
-        // Optional gyro stabilizer (same resolution the GUI does before spawning the worker).
+        // Optional gyro stabilizer — must be loaded at exactly the decode size: gyroflow's
+        // stabilizer is bound to the size it was initialised with.
         let stab = if settings.gyro.enabled && info.has_motion_data {
             eprintln!("[encgui] loading stabilizer at {dec_w}x{dec_h}...");
             let s = tracereel::gyro::load_stabilizer(

@@ -13,7 +13,7 @@
 //! Top-level tags: 4 = image dims (x,y,w,h u16), 5 = sessions, 6 = session, 7 = route,
 //! 8 = handles, 9 = projection origin (2× int32 / 3600000 degrees).
 
-use crate::math::{haversine_distance, project_coordinate};
+use crate::math::project_coordinate;
 use crate::route::RoutePoint;
 use crate::route::RoutePoint as RP;
 
@@ -417,54 +417,11 @@ impl QuickRouteBuilder {
             return Ok(());
         }
 
-        // QuickRoute Route.CalculateSpeeds uses a centred time interval, even with
-        // smoothing disabled (t - 0.5ms .. t + 0.5ms). At an interior waypoint
-        // that averages the incoming/outgoing speeds, rather than assigning the
-        // previous segment's pace to the point. Endpoints use the one available side.
-        let t0 = points[0].date_time_ms;
-        let mut speeds = vec![0.0; points.len() - 1];
-        for i in 1..points.len() {
-            points[i].time = (points[i].date_time_ms - t0) / 1000.0;
-            let dt = (points[i].date_time_ms - points[i - 1].date_time_ms) / 1000.0;
-            let dist = haversine_distance(
-                points[i - 1].coordinate_x,
-                points[i - 1].coordinate_y,
-                points[i].coordinate_x,
-                points[i].coordinate_y,
-            );
-            if dt > 0.0 {
-                speeds[i - 1] = dist / dt;
-            }
-        }
-        for i in 0..points.len() {
-            let speed = if i == 0 {
-                speeds[0]
-            } else if i == points.len() - 1 {
-                speeds[i - 1]
-            } else {
-                (speeds[i - 1] + speeds[i]) * 0.5
-            };
-            // Match ConvertUtil.ToPace's zero sentinel and 3600-second cap.
-            points[i].pace = if speed > 0.0 { (1000.0 / (60.0 * speed)).min(60.0) } else { 0.0 };
-        }
-
-        // orientations (continuous)
-        let mut current_angle = 0.0;
-        for i in 0..points.len() - 1 {
-            let p1 = points[i];
-            let p2 = points[i + 1];
-            let dx = p2.position_x - p1.position_x;
-            let dy = p2.position_y - p1.position_y;
-            let mut angle = (-dy).atan2(dx).to_degrees();
-            angle = 90.0 - angle;
-            if angle > 180.0 {
-                angle -= 360.0;
-            }
-            let angle_delta = angle - current_angle;
-            current_angle += crate::math::wrap_angle_delta(angle_delta);
-            points[i].orientation = current_angle;
-        }
-        points.last_mut().unwrap().orientation = current_angle;
+        // QuickRoute `Route.CalculateSpeeds` / `CalculateDirections`：居中时间窗的瞬时
+        // 速度（即使关掉平滑也一样，内部点取前后两段速度的平均、端点只有一侧可用）与
+        // 连续航向角。与 `.qrt` 工程那条路（`qrt::to_route_points`）共用同一份实现，
+        // 同一份轨迹从不同来源进来必须得到相同的 pace / orientation。
+        crate::route::fill_route_metrics(points);
 
         Ok(())
     }
@@ -473,6 +430,7 @@ impl QuickRouteBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::haversine_distance;
 
     #[test]
     fn pace_uses_quickroute_centred_speed_and_endpoint_values() {

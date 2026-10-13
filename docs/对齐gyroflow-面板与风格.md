@@ -171,8 +171,74 @@ fn zoom_algorithm(mode: i32) -> i32 { if mode == 1 { 1 } else { 0 } } // 只送 
 | 「分段」页每行加跳转按钮 | 行尾加「跳转」按钮 → `win.jumpToSplit(rowIndex)`；时间换算走 **Rust** `Settings::split_video_ms(idx)`（= `boundary_ms(idx, add_video_offset=true)`，与导出用的边界同一套：分段点绝对时间 + `录像-出发时间`）。**语义：行里填的时间是「该分段的结束」= 下一个分段点，所以本段起点 = 上一个分段点：行 k（0 基）→ 分段点 k**；分段点 0 = 出发时刻，故第 1 段跳到视频开头 | `split(0..3)=0,3000,7000,12000`；`jumpToSplit(1)`→`t_ms=3000`（= 第 2 段起点，旧实现是 7000 = 该段终点）✓ |
 | 预览进度条拖动时显示时间 | `TSlider` 手柄上挂 `ToolTip`（`visible: seek.pressed`，显示 `fmtTime(seek.value)`，原版 Slider 拖动气泡同款）；同时时间标签在拖动期间显示拖动位置而非播放位置 | 无 QML 报错 ✓ |
 | 导出页「分段导出」改下拉 | 新代理属性 `encode_seg_mode` ∈ `none` / `all` / `custom`，**UI 唯一真源**：`apply_settings` 由旧的 `segEnabled/allSeg` 推出模式，`collect_settings` 由模式反推两个开关（**.orv 格式不变、无新键**）；选「自定义」时出现「分段范围」输入框，格式 `xx-xx`（正则 `^[0-9]{0,3}-[0-9]{0,3}$`），`setSegRange()` 解析后写回 start/end | 旧工程 → `seg_mode=none`；`setSegRange("1-3")` → `custom, seg=1-3` ✓ |
-| 分辨率下拉改显式尺寸 + 4K + 4:3 | 标签格式 = `尺寸 (档位名 比例)`，先 16:9（4K → 1080p → 720p）再 4:3（同序）：`3840x2160 (4K 16:9)` / `1920x1080 (1080p 16:9)` / `1280x720 (720p 16:9)` / `2880x2160 (4K 4:3)` / `1920x1440 (1440p 4:3)` / `1440x1080 (1080p 4:3)`；默认仍是 `1920x1080`。`encode.rs::encode_output_size` 本来就支持 `WxH`；`Settings::default()` 与 `load_orv()` 把旧档位名（`1080p/fhd/source`、`720p/hd`、`4k/uhd/2160p`）归一成同尺寸显式写法，否则下拉选不中、显示与导出尺寸会不一致 | 运行钩子打印：`res=1920x1080`（旧工程归一后的选中项）、`resValues/resLabels` 与上表一致 ✓ |
+| 分辨率下拉改显式尺寸 + 4K + 4:3 | 标签格式 = `尺寸 (档位名 比例)`，先 16:9（4K → 1080p → 720p）再 4:3（同序）：`3840x2160 (4K 16:9)` / `1920x1080 (1080p 16:9)` / `1280x720 (720p 16:9)` / `2880x2160 (4K 4:3)` / `1920x1440 (1440p 4:3)` / `1440x1080 (1080p 4:3)`；默认仍是 `1920x1080`。`encode.rs::encode_output_size` 本来就支持 `WxH`；`Settings::default()` 与 `load_orv()` 把旧档位名（`1080p/fhd`、`720p/hd`、`4k/uhd/2160p`）归一成同尺寸显式写法，否则下拉选不中、显示与导出尺寸会不一致（`source` 后来变回下拉里可选的一项，见第 5 节） | 运行钩子打印：`res=1920x1080`（旧工程归一后的选中项）、`resValues/resLabels` 与上表一致 ✓ |
 | 视频页「备注式」小字不显示 | 去掉「稳定化」组的说明段；镜头库状态那行小字已移除（只在缺失时才有意义，当前实现直接不显示）；功能性状态（防抖状态、最大旋转/最大缩放只读值）保留 | 运行时无报错 ✓ |
 
-> 说明：分辨率影响预览宽高比：`item.outputAspect` 用 `encode_resolution` 按 `x` 拆分，显式尺寸后预览比例精确（以前 `1080p` 选不中会退回 16:9）。
+> 说明：分辨率影响预览宽高比：`item.outputAspect` 用 `encode_resolution` 按 `x` 拆分，显式尺寸后预览比例精确（以前 `1080p` 选不中会退回 16:9）。第 5 节起：`"source"`（与原始视频一致）改走**源视频比例**，不再退回 16:9。
+
+---
+
+## 5. 分辨率新增「与原始视频一致」（保持原分辨率）
+
+需求：导出页「分辨率」要能**不缩放**，直接沿用源视频尺寸。
+
+| 需求 | 做法 | 验证 |
+|---|---|---|
+| 下拉加一项「与原始视频一致」 | 复用后端早就有的 token `source`（`app/src/encode.rs:199-227` `encode_output_size` 里 `"source" => (src_w, src_h)`，只做偶数对齐）。`app/src/bin/gui.qml` 分辨率 ComboV 变成第一项 `values: ["source", …]` / `labels: ["与原始视频一致", …]`（措辞与「帧率」那一项一致）；默认仍是 `1920x1080` | `app/tests/test_export_resolution.ps1`（无窗口，见下）✓ |
+| 存盘 → 重新打开要保住这一项 | `app/src/settings.rs` 的 `load_orv()` 旧档位名归一里**去掉 `"source"`**（原来它跟 `1080p/fhd` 一起被改成 `1920x1080`，会让用户选好的「与原始视频一致」在重开工程时变回 1080p）。老工程的 `1080p/720p/4k` 仍照旧归一；本机全部 `.orv/.trr` 里本来也没有 `source`，所以没有存量工程被改尺寸 | 单测 `settings::tests::load_orv_keeps_source_resolution_and_normalizes_legacy_presets` ✓ |
+| 预览画布与导出同比例 | 新增只读属性 `TraceReelItem.source_size`（"宽x高"：`app/src/gui.rs` 的 `apply_prepared` 里按探测到的源尺寸赋值并 `source_size_changed()`，`reload`/`apply_settings` 清零）。`gui.qml` 的 `item.outputAspect` 改走新函数 `win.aspectOf(token)`：token 不是显式尺寸且为 `source` 时，改用 `item.source_size` 的比例 | 探针实测 320x240 → 1.3333，切 1280x720 → 1.7778，切回 → 1.3333 ✓ |
+| 界面/队列文案不许露英文 | `app/src/export_queue.rs` 的 `configuration()` 把 `source` 显示成「与原始视频一致」（与「帧率」同款特判）；导出日志仍打裸 token（日志不是界面，既有日志本就写 `帧率=source`） | 单测 `export_queue::tests::configuration_shows_resolution_in_chinese` ✓ |
+
+**回归怎么跑**（自带素材，不需要真 4K 素材）：
+
+```powershell
+.\app\tests\test_export_resolution.ps1            # 会自动 build qmlprobe
+```
+
+它做三件事：ffmpeg 造一段 320x240（4:3）的 2 秒小视频 → 写一个最小工程（`resolution=source`）→
+`QT_QPA_PLATFORM=offscreen` 跑 `qmlprobe` 驱动真实的 `gui.qml`（工程路径经新的 `QMLPROBE_ORV`
+环境变量传进去，`qmlprobe` 把它转成 QML 的 `orvPath`，`gui.qml` 启动即加载）。通过时 stdout 有
+`EXPORT_RESOLUTION_PASS`，失败是 `EXPORT_RESOLUTION_FAIL`（原因同时打在 `[loop final]` 行里）。
+
+> 踩坑记录：代理属性没有 `NOTIFY`，`outputAspect` 靠 `refreshTick` 失效，而 ComboV 写值走 350ms
+> 防抖 —— 探针必须**轮询等**比例变化，读完 `settings` 就立刻读比例会假失败（第一版就是这么红的）。
+
+---
+
+## 6. 导出解码尺寸不再固定 720（视频层真正按输出尺寸解码）
+
+**问题**：导出一直把源视频按「保比例、限高 720」解码（`app/src/gui.rs` 的 `start_encode` 里
+`processing_size(info.width, info.height, 720)`，导出队列同样一处），再由 `draw_scene` 把这张
+720 级帧缩放进输出画布的视频面板。于是 1080p/4K 输出里的**视频层**都是从 720p 放大出来的
+（地图、路线、HUD 不受影响：它们本来就按输出画布绘制，地图位图上限 4096px）。以
+`demo\20261011孝德湖`（源 2688x2016、输出 1920x1080、地图占 25%）为例：解码帧只有 960x720，
+面板 1440x1080 → 放大 1.5×；选 4K 输出 → 放大 3×。
+
+**做法**：新增 `app/src/encode.rs::export_decode_size(settings, src_w, src_h)` —— 按输出画布里面板
+实际需要的像素算解码尺寸，上限=源尺寸（绝不放大）：
+
+- 面板 = 画布宽 ×(1−地图占比) × 画布高（与 `draw_scene` 同一套算式；地图判据抽成
+  `app/src/gui.rs::map_configured`，导出内容不含地图时占比按 0）；
+- 缩放系数 = `min(面板宽/源宽, 面板高/源高) × 视频缩放`，`clamp(0.0, 1.0)` → 视频既不会被放大，
+  也不多解码用不上的像素；
+- `app/src/gui.rs` 的 `start_encode`、`app/src/export_queue.rs` 的队列任务、`app/src/bin/encgui.rs`
+  三处都改用它。
+
+**必须一并解决的坑**：gyroflow 的稳定化器与帧尺寸强绑定（`gyroflow-src/src/core/stabilization/mod.rs`
+的 `process_pixels` 会 `SizeMismatch` / `InvalidStride`），而导出原先直接复用**预览那套**按 720
+初始化的 `Arc<Stabilizer>`。所以 `app/src/encode.rs` 新增 `reload_export_stabs_if_needed()`：尺寸
+不一致时在**编码线程**上按导出尺寸重新 `load_stabilizer`（含多分段的 `apply_seam_warmup_smoothing`
+接缝平滑），加载失败就退回旧稳定化器的尺寸（宁可分辨率低，也不能让帧与防抖对不上）。逐段导出
+（`encode_export_segments`）只在批次开始时加载一次，避免每段都重读运动数据；加载期间弹窗提示
+「正在按导出尺寸 … 重新准备防抖」（已有提示时（如硬件编码回退）不覆盖）。实测这段 23 分钟的
+4K 素材重读一次约 **46 秒**（`demo\20261011孝德湖`：`[encode] 按导出尺寸 1440x1080 重新加载防抖：分段 1（45.7s）`）。
+日志里会写一行 `解码尺寸 WxH（输出 …，源 …，防抖=…）`。
+
+| 验证 | 结果 |
+|---|---|
+| 单测 `encode::tests::export_decode_size_follows_the_output_panel` | 2688x2016 源：1080p 输出 → 1440x1080（旧：1280x720 再放大）；4K 输出 → 2688x2016（顶到源）；720p 输出 → 960x720（与旧行为一致）；源比输出小时不放大；含/不含地图两条分支 ✓ |
+| 端到端（`encgui`，3840x2160 源 → 1920x1080，无地图） | 日志 `解码尺寸 1920x1080（输出 1920x1080，源 3840x2160，防抖=关）`，输出 1920x1080 / 3 帧 ✓（旧行为会写 1280x720） |
+| 端到端（`encgui`，真实 4K 工程 `demo\20261011孝德湖`，防抖开） | `[encgui] loading stabilizer at 1440x1080` → 正常出片（59 秒，含读运动数据）✓ |
+| 端到端（**真实 gui.qml**，`app/tests/test_export_decode_size_gyro.ps1`，防抖开） | 预览先按 720 加载 → 导出时走尺寸重载分支：`[encode] 按导出尺寸 1440x1080 重新加载防抖：分段 1（45.7s）` → `解码尺寸 1440x1080（输出 1920x1080，源 2688x2016，防抖=开）` → 连续编码 8000+ 帧无 `SizeMismatch`（探针编够 60 帧主动中止）✓ |
+| 全量单测 | `.\build.ps1 test -p tracereel --lib` → 88 passed ✓ |
 

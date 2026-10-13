@@ -457,6 +457,12 @@ impl QuickRouteProject {
     /// QuickRoute jpeg — the route manager resamples at 1-second intervals and
     /// indexes split times in seconds, so getting this unit wrong collapses the
     /// whole route into a single step.
+    ///
+    /// `pace` and `orientation` are derived here exactly like the exported-jpeg
+    /// path does (`crate::route::fill_route_metrics`): without them a `.qrt`
+    /// route draws in one flat colour and the map never turns with the runner.
+    /// Sample times the scanner could not recover are filled by
+    /// [`fill_missing_times`] first, so `date_time_ms` stays monotonic.
     pub fn to_route_points(&self) -> Vec<RoutePoint> {
         let positions = self.map_positions();
         let t0 = self
@@ -465,7 +471,20 @@ impl QuickRouteProject {
             .find(|w| w.time_ticks > 0)
             .map(|w| w.time_ticks)
             .unwrap_or(0);
-        self.waypoints
+        let sample_ms: Vec<Option<i64>> = self
+            .waypoints
+            .iter()
+            .map(|w| {
+                if w.time_ticks > 0 && t0 > 0 {
+                    Some((w.time_ticks - t0) / TICKS_PER_MS)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let sample_ms = fill_missing_times(&sample_ms);
+        let mut points: Vec<RoutePoint> = self
+            .waypoints
             .iter()
             .enumerate()
             .map(|(i, w)| {
@@ -473,23 +492,73 @@ impl QuickRouteProject {
                     .get(i)
                     .map(|(x, y, _)| (*x, *y))
                     .unwrap_or((0.0, 0.0));
-                let ms = if w.time_ticks > 0 && t0 > 0 {
-                    (w.time_ticks - t0) / TICKS_PER_MS
-                } else {
-                    0
-                };
                 RoutePoint {
                     coordinate_x: w.longitude,
                     coordinate_y: w.latitude,
                     position_x: px,
                     position_y: py,
-                    date_time_ms: ms as f64,
-                    time: ms as f64 / 1000.0,
+                    date_time_ms: sample_ms[i] as f64,
                     ..RoutePoint::default()
                 }
             })
-            .collect()
+            .collect();
+        crate::route::fill_route_metrics(&mut points);
+        points
     }
+}
+
+/// Recover the sample times the waypoint scanner could not read.
+///
+/// A few entries of the time array are lost (`demo/AM 男子短距 第二面.qrt` loses
+/// the last one), and writing those as `0` puts a **backwards** jump at the end of
+/// an otherwise 1 Hz series: the resampler only advances on a forward step, so the
+/// final second disappears from the aligned route and `duration_s()` (the last
+/// point's `time`) reports 0. Interior gaps are linearly interpolated in index
+/// space, and a gap at either end is extrapolated with the median sample step, so
+/// the series stays monotonic. When no sample time was recovered at all every
+/// entry stays 0 — a hand-drawn course keeps `pace` 0 as before.
+fn fill_missing_times(times: &[Option<i64>]) -> Vec<i64> {
+    let n = times.len();
+    let mut out = vec![0i64; n];
+    let known: Vec<usize> = (0..n).filter(|i| times[*i].is_some()).collect();
+    if known.is_empty() {
+        return out;
+    }
+    for i in 0..n {
+        if let Some(t) = times[i] {
+            out[i] = t;
+        }
+    }
+    // Median milliseconds per index step over the known neighbours: 1000 for 1 Hz
+    // data, and still sane for a sparsely sampled track.
+    let mut steps: Vec<f64> = known
+        .windows(2)
+        .map(|w| (out[w[1]] - out[w[0]]) as f64 / (w[1] - w[0]) as f64)
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .collect();
+    steps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let step = steps.get(steps.len() / 2).copied().unwrap_or(1000.0);
+
+    for w in known.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if b == a + 1 {
+            continue;
+        }
+        let (ta, tb) = (out[a], out[b]);
+        for i in (a + 1)..b {
+            let f = (i - a) as f64 / (b - a) as f64;
+            out[i] = ta + ((tb - ta) as f64 * f).round() as i64;
+        }
+    }
+    let first = known[0];
+    let last = known[known.len() - 1];
+    for i in (0..first).rev() {
+        out[i] = out[i + 1] - step.round() as i64;
+    }
+    for i in (last + 1)..n {
+        out[i] = out[i - 1] + step.round() as i64;
+    }
+    out
 }
 
 // ------------------------------------------------------ route ↔ pixel geometry
@@ -1310,6 +1379,131 @@ mod tests {
     #[test]
     fn record_is_25_bytes() {
         assert_eq!(record(1.0, 2.0, 0).len(), WAYPOINT_RECORD_LEN);
+    }
+
+    fn demo_project(waypoints: Vec<QrtWaypoint>) -> QuickRouteProject {
+        QuickRouteProject {
+            map: Some(MapImage {
+                bytes: Vec::new(),
+                kind: MapImageKind::Jpeg,
+                width: 1200,
+                height: 900,
+            }),
+            waypoints,
+            waypoints_complete: true,
+            projection_origin: Some((113.0, 23.0)),
+            ..QuickRouteProject::default()
+        }
+    }
+
+    fn moving_waypoints(count: usize) -> Vec<QrtWaypoint> {
+        let base = 5_250_000_000_000_000_000i64;
+        // 由慢到快平稳加速（约 5 m/s → 15 m/s）。**不能快慢交替**：配速是居中时间窗
+        // 平均出来的，交替的两个速度在内部点上会平均成同一个值，自适应色带又会退回
+        // ±0.25 的窄带，整条一个颜色 —— 那样就测不出「配速有没有真的传到颜色上」。
+        let last = (count.saturating_sub(1)).max(1) as f64;
+        let mut lon = 113.0f64;
+        (0..count)
+            .map(|i| {
+                let step = (0.5 + 1.0 * i as f64 / last) * 1e-4;
+                let waypoint = QrtWaypoint {
+                    longitude: lon,
+                    latitude: 23.0 + i as f64 * 5e-5,
+                    index: i as u32,
+                    time_ticks: base + i as i64 * TICKS_PER_MS * 1000,
+                };
+                lon += step;
+                waypoint
+            })
+            .collect()
+    }
+
+    /// 回归：`.qrt` 轨迹以前只有坐标和时间，`pace`/`orientation` 全是 0 —— 配速色带
+    /// 整条一个颜色、「配速色带自适应」拿不到端点、按航向取景恒为 0°。
+    #[test]
+    fn to_route_points_fills_pace_and_orientation() {
+        let pts = demo_project(moving_waypoints(60)).to_route_points();
+        assert_eq!(pts.len(), 60);
+        assert!(
+            pts.iter().filter(|p| p.pace > 0.0).count() >= pts.len() - 2,
+            "进度均匀的 1 Hz 轨迹必须逐点算出配速"
+        );
+        assert!(pts.iter().all(|p| p.pace.is_finite() && p.pace >= 0.0));
+        assert!(
+            pts.iter().any(|p| p.orientation != 0.0),
+            "向东偏北的轨迹必须有非零航向"
+        );
+        assert!(pts.iter().all(|p| p.orientation.is_finite()));
+        // `time` 按首点归零，单位是秒（不是毫秒）。
+        assert_eq!(pts[0].time, 0.0);
+        assert_eq!(pts[1].time, 1.0);
+        assert_eq!(pts.last().unwrap().time, 59.0);
+
+        // 用户可见后果：有逐点配速 → 自适应色带取得到端点 → 整条带子不再是一个颜色。
+        let mut rm = crate::route_manager::RouteManager::default();
+        rm.initialize_from_points(
+            pts,
+            "",
+            false,
+            crate::route_manager::RouteStyle::default(),
+            crate::route_manager::ViewMode::FixedSplit,
+            0.25,
+        );
+        let band = crate::route_manager::adaptive_pace_range(&rm.routes[0].route_points)
+            .expect("有配速的 .qrt 轨迹必须能算出自适应色带");
+        assert!(band.0 > band.1, "慢端应大于快端：{band:?}");
+        assert!(
+            band.0 - band.1 > 0.5,
+            "快慢交替的轨迹必须给出有跨度的色带：{band:?}"
+        );
+        let colors: std::collections::BTreeSet<(u32, u32)> = rm.routes[0]
+            .aligned_route_points
+            .iter()
+            .map(|p| {
+                let (r, g, _) = p.pace_color(band.0, band.1);
+                ((r * 255.0).round() as u32, (g * 255.0).round() as u32)
+            })
+            .collect();
+        assert!(
+            colors.len() >= 2,
+            "配速色带应给出不止一种颜色，实际只有 {} 种",
+            colors.len()
+        );
+    }
+
+    /// 回归：丢掉时间戳的 waypoint 以前被写成 0，等于在 1 Hz 序列末尾放一个**倒跳**，
+    /// 重采样会丢掉最后一秒、`duration_s()`（取末点 time）直接变 0。
+    #[test]
+    fn to_route_points_fills_lost_sample_times_monotonically() {
+        let mut waypoints = moving_waypoints(10);
+        waypoints[7].time_ticks = 0; // 段内缺口
+        waypoints[9].time_ticks = 0; // 末尾缺口
+        let pts = demo_project(waypoints).to_route_points();
+        assert!(
+            pts.windows(2)
+                .all(|w| w[1].date_time_ms >= w[0].date_time_ms),
+            "补齐后时间必须单调不减：{:?}",
+            pts.iter().map(|p| p.date_time_ms).collect::<Vec<_>>()
+        );
+        assert_eq!(pts[7].time, 7.0, "段内缺口按相邻步长线性插值");
+        assert_eq!(pts[9].time, 9.0, "末尾缺口按中位步长外推");
+        assert!(pts.last().unwrap().time > 0.0);
+    }
+
+    #[test]
+    fn fill_missing_times_handles_every_gap_shape() {
+        // 一个时间戳都没恢复出来：保持全 0（手画的线路没有配速可言）。
+        assert_eq!(fill_missing_times(&[None, None]), vec![0, 0]);
+        // 段内缺口。
+        assert_eq!(
+            fill_missing_times(&[Some(1000), None, Some(3000)]),
+            vec![1000, 2000, 3000]
+        );
+        // 开头缺口：按中位步长向前外推。
+        assert_eq!(
+            fill_missing_times(&[None, Some(5000), Some(6000), None]),
+            vec![4000, 5000, 6000, 7000]
+        );
     }
 
     #[test]

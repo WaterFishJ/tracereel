@@ -9,6 +9,8 @@
 
 use std::path::Path;
 
+use crate::route::RoutePoint;
+
 const EARTH_RADIUS_GPX: f64 = 6_371_000.0;
 
 /// A single parsed track point.
@@ -97,6 +99,48 @@ pub fn find_gpx_for_video(video_path: &str) -> String {
 }
 
 impl GpxTrack {
+    /// Build a HUD track from route points that already carry a time axis.
+    ///
+    /// This is the「只导入了 .qrt / 轨迹图」case: a QuickRoute project stores the whole
+    /// recorded track (coordinates + 1 Hz sample times), so the HUD can show
+    /// speed / pace / distance / heading without a separate GPX export. `t` is taken
+    /// as seconds since the route's first sample — the same convention a GPX ends up
+    /// with once it is anchored at its own start — so both sources are read through the
+    /// same offset (`hud::hud_track_offset`, anchored at 比赛出发时刻).
+    ///
+    /// Altitude and heart rate stay **unavailable** (`ele` is NaN, `hr` is `None`):
+    /// neither the `.qrt` scanner nor the QuickRoute-jpeg reader decodes them, and
+    /// reporting 0 m of elevation would be a lie. Non-finite elevation also keeps the
+    /// altitude profile empty instead of drawing a flat line at zero.
+    ///
+    /// `None` means "this route has no usable time axis" — a course drawn by hand has
+    /// every `time` = 0, and the HUD must stay at "no track" there.
+    pub fn from_route_points(points: &[RoutePoint]) -> Option<Self> {
+        let mut pts: Vec<GpxPoint> = points
+            .iter()
+            .filter(|p| {
+                p.time.is_finite()
+                    && p.coordinate_x.is_finite()
+                    && p.coordinate_y.is_finite()
+                    && (p.coordinate_x != 0.0 || p.coordinate_y != 0.0)
+            })
+            .map(|p| GpxPoint {
+                t: p.time,
+                lat: p.coordinate_y,
+                lon: p.coordinate_x,
+                ele: f64::NAN,
+                hr: None,
+            })
+            .collect();
+        // Stable order by sample time: `sample_at`/`hud_at` binary-search the series.
+        pts.sort_by(|a, b| a.t.total_cmp(&b.t));
+        let (first, last) = (pts.first()?, pts.last()?);
+        if pts.len() < 2 || last.t <= first.t {
+            return None;
+        }
+        Self::from_points(pts).ok()
+    }
+
     /// Compute derived metrics from raw points.
     pub fn from_points(points: Vec<GpxPoint>) -> Result<Self, String> {
         if points.is_empty() {
@@ -458,5 +502,41 @@ mod tests {
         assert_eq!(t.hud_at(1.5, 0.0), Some((None, 0.0)));
         assert!(t.hud_profile().iter().all(|p| p[1] == 50.0));
         assert_eq!(t.hud_max_speed(), 10.0);
+    }
+
+    fn route_point(i: i64, with_time: bool) -> crate::route::RoutePoint {
+        crate::route::RoutePoint {
+            time: if with_time { i as f64 } else { 0.0 },
+            coordinate_x: 113.0 + i as f64 * 0.0001,
+            coordinate_y: 23.0,
+            ..crate::route::RoutePoint::default()
+        }
+    }
+
+    /// 「只导入了 .qrt」的工程：HUD 轨迹直接由轨迹点自带的秒级时间轴搭出来。
+    #[test]
+    fn route_points_become_a_hud_track() {
+        let pts: Vec<_> = (0..5).map(|i| route_point(i, true)).collect();
+        let track = GpxTrack::from_route_points(&pts).expect("有秒级时间轴就该给出 HUD 轨迹");
+        assert_eq!(track.points.len(), 5);
+        assert_eq!(track.start_time, 0.0);
+        assert!(!track.has_hr);
+        let s = track.sample_at(4.0, 0.0).expect("sample");
+        assert!(s.speed_kmh > 20.0, "速度应由坐标差算出来：{}", s.speed_kmh);
+        assert!(s.distance_km > 0.0);
+        assert!(s.bearing.is_finite());
+        // .qrt 不解码海拔/心率：不能假装是 0，也不能画出一条平的高度剖面。
+        assert!(s.altitude_m.unwrap().is_nan());
+        assert!(s.heart_rate.is_none());
+        assert!(track.hud_profile().is_empty());
+    }
+
+    /// 手画的线路（每个点的 `time` 都是 0）没有配速可言 —— 必须保持「没有 HUD 轨迹」。
+    #[test]
+    fn drawn_course_has_no_hud_track() {
+        let pts: Vec<_> = (0..4).map(|i| route_point(i, false)).collect();
+        assert!(GpxTrack::from_route_points(&pts).is_none());
+        assert!(GpxTrack::from_route_points(&pts[..1]).is_none());
+        assert!(GpxTrack::from_route_points(&[]).is_none());
     }
 }

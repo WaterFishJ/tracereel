@@ -2539,7 +2539,13 @@ ApplicationWindow {
                             title: "HUD"
                             Check { label: "预览"; prop: "hud_preview" }
                             Field { label: "GPX 文件"; prop: "hud_gpx_path"; filter: "*.gpx" }
-                            DSpin { label: "GPX 时间偏移（秒）"; prop: "hud_gpx_offset" }
+                            // 时间基准是「比赛出发时刻」：出发时刻在视频时间轴上的位置由「录像」
+                            // 页的「录像-出发时间」自动换算；这一栏填的是**这条 GPX 自己**相对
+                            // 出发时刻的偏移（出发后 8 秒才搜到 GPS → −8）。
+                            DSpin {
+                                label: "GPX 时间偏移（秒）"; prop: "hud_gpx_offset"
+                                hint: "以比赛出发时刻为基准：出发后 8 秒手表才开始记录就填 −8（HUD 用的就是轨迹文件同一条记录时，填成与「按表-出发时间」相同的值）；视频那一段（出发前几秒开录）由「视频」页的「录像-出发时间」自动换算，这里不用重复"
+                            }
                             HudEditor {id:hudEditor;width:parent.width;source:settings;renderer:item;enabled:!item.busy && !item.encoding}
                         }
                     }
@@ -2599,9 +2605,10 @@ ApplicationWindow {
                             }
                             ComboV {
                                 label: "分辨率"; prop: "encode_resolution"
-                                // 先 16:9（4K → 1080p → 720p），再 4:3（同样由大到小）。
-                                values: ["3840x2160", "1920x1080", "1280x720", "2880x2160", "1920x1440", "1440x1080"]
-                                labels: ["3840x2160 (4K 16:9)", "1920x1080 (1080p 16:9)", "1280x720 (720p 16:9)",
+                                // 「与原始视频一致」= 不缩放，直接用源视频尺寸（encode.rs 的 "source"）；
+                                // 其余是显式尺寸：先 16:9（4K → 1080p → 720p），再 4:3（同样由大到小）。
+                                values: ["source", "3840x2160", "1920x1080", "1280x720", "2880x2160", "1920x1440", "1440x1080"]
+                                labels: ["与原始视频一致", "3840x2160 (4K 16:9)", "1920x1080 (1080p 16:9)", "1280x720 (720p 16:9)",
                                          "2880x2160 (4K 4:3)", "1920x1440 (1440p 4:3)", "1440x1080 (1080p 4:3)"]
                             }
                             ComboV { label: "帧率"; prop: "encode_fps"; values: ["source", "60", "30", "24"]; labels: ["与原始视频一致", "60 fps", "30 fps", "24 fps"] }
@@ -2640,8 +2647,11 @@ ApplicationWindow {
         id: item
         property real outputAspect: {
             win.refreshTick
-            var r=String(settings.encode_resolution).toLowerCase().split("x")
-            return r.length===2 && Number(r[0])>0 && Number(r[1])>0 ? Number(r[0])/Number(r[1]) : 16/9
+            var a = win.aspectOf(settings.encode_resolution)
+            // 「与原始视频一致」：预览画布跟随源视频宽高比（item.source_size 由真实视频探测得到），
+            // 否则预览会退回 16:9，地图/HUD 面板比例与真实导出的画布对不上。
+            if (a <= 0 && String(settings.encode_resolution).toLowerCase() === "source") a = win.aspectOf(item.source_size)
+            return a > 0 ? a : 16/9
         }
         width: Math.min(previewArea.width, Math.max(1,previewArea.height-48)*outputAspect)
         height: width/outputAspect
@@ -2819,6 +2829,11 @@ ApplicationWindow {
         return p(h) + ":" + p(m) + ":" + p(ss)
     }
     function num(v) { v = Number(v); return isFinite(v) ? v : 0 }
+    // 「宽x高」token → 宽高比；不是显式尺寸（如 "source"）时返回 0。
+    function aspectOf(token) {
+        var r = String(token).toLowerCase().split("x")
+        return r.length === 2 && Number(r[0]) > 0 && Number(r[1]) > 0 ? Number(r[0]) / Number(r[1]) : 0
+    }
     function fmtSize(b) {
         b = Number(b) || 0
         if (b < 1024) return b + " B"

@@ -226,6 +226,38 @@ pub fn encode_output_size(enc: &EncodeSettings, src_w: usize, src_h: usize) -> (
     (even(w), even(h))
 }
 
+/// 导出解码 + 防抖缓冲尺寸：按**输出画布里面板实际需要的像素**取，上限=源尺寸（不放大）。
+///
+/// 以前固定限高 720（复用预览那套稳定化器），于是输出选 1080p / 4K 时，视频那一层其实是
+/// 从 720p 级放大出来的（地图/路线/HUD 不受影响，它们按输出画布绘制）。现在按面板实际
+/// 像素解码：1080p 输出从 1080p 源解码，4K 输出顶到源尺寸为止，既不放大也不多解码。
+///
+/// 与 `draw_scene` 用同一套版面算式（面板宽 = 画布宽 ×(1−地图占比)、面板高 = 画布高；
+/// 缩放系数 = min(面板宽/源宽, 面板高/源高) × 用户缩放），导出内容不含地图时地图占比按 0。
+/// 注意：gyroflow 的稳定化器与帧尺寸强绑定，尺寸变了必须重新加载（见
+/// [`reload_export_stabs_if_needed`]）。
+pub fn export_decode_size(settings: &Settings, src_w: usize, src_h: usize) -> (usize, usize) {
+    let src = (src_w.max(2), src_h.max(2));
+    let (out_w, out_h) = encode_output_size(&settings.encode, src.0, src.1);
+    let rel_w = if settings.encode.include_map && crate::gui::map_configured(settings) {
+        settings.map.relative_width
+    } else {
+        0.0
+    };
+    let vp_w = (1.0 - rel_w).max(0.05) * out_w as f64;
+    let vp_h = out_h as f64;
+    let base = (vp_w / src.0 as f64).min(vp_h / src.1 as f64);
+    // 视频被画成的像素尺寸 = 源尺寸 × base × 用户缩放；超过源尺寸没有意义（k 上限 1）。
+    let k = (base * settings.video.scale).clamp(0.05, 1.0);
+    let even = |v: usize| v.max(2) - (v.max(2) % 2);
+    let max_w = even(src.0);
+    let max_h = even(src.1);
+    (
+        even((src.0 as f64 * k).round() as usize).min(max_w),
+        even((src.1 as f64 * k).round() as usize).min(max_h),
+    )
+}
+
 /// Resolve the output frame rate from the `frame_rate` token + source fps.
 pub fn encode_output_fps(enc: &EncodeSettings, src_fps: f64) -> f64 {
     match enc.frame_rate.trim().to_ascii_lowercase().as_str() {
@@ -1648,16 +1680,12 @@ impl EncodePrep {
             });
         }
         let gpx = if settings.encode.include_hud {
-            let gpx_path = if !settings.hud.gpx_file_path.is_empty() {
-                settings.hud.gpx_file_path.clone()
-            } else {
-                tracereel_core::gpx::find_gpx_for_video(&settings.video.video_path)
-            };
-            if !gpx_path.is_empty() {
-                tracereel_core::gpx::parse_gpx(&gpx_path).ok()
-            } else {
-                None
-            }
+            // 与预览/离屏渲染同一条解析路径：GPX → 视频同名 .gpx → 轨迹自带的时间轴。
+            crate::gui::resolve_hud_track(
+                &settings.hud.gpx_file_path,
+                &settings.video.video_path,
+                maps.first().map(|m| &m.rm),
+            )
         } else {
             None
         };
@@ -1704,6 +1732,115 @@ pub fn segment_output_path(out: &str, a: i32, b: i32) -> String {
     dir.join(name).to_string_lossy().into_owned()
 }
 
+/// 导出用的分段表：GUI 的 job 带多段视频；空表 = 单文件调用方（CLI），合成一段占位。
+/// `has_stab`：调用方为这一段准备了稳定化器。合成段必须如实标注 —— 否则按导出尺寸
+/// 重新加载防抖时它会被当成「没有运动数据」，把防抖悄悄丢掉。
+fn effective_segs(
+    settings: &Settings,
+    segs: Vec<crate::gui::VideoSeg>,
+    src_fps: f64,
+    duration_ms: f64,
+    has_stab: bool,
+) -> Vec<crate::gui::VideoSeg> {
+    if !segs.is_empty() {
+        return segs;
+    }
+    vec![crate::gui::VideoSeg {
+        path: settings.video.video_path.clone(),
+        start_ms: 0.0,
+        duration_ms,
+        fps: src_fps,
+        frame_count: 0,
+        has_motion: has_stab,
+    }]
+}
+
+/// 按导出解码尺寸重新加载整套防抖稳定化器（每个分段一个），并做接缝预热平滑。
+/// 与预览那套（限高 720）分开：稳定化器按尺寸初始化，喂不同尺寸的帧会
+/// SizeMismatch / InvalidStride，所以尺寸不一致时必须重算。没有运动数据的分段是 None。
+fn load_export_stabilizers(
+    settings: &Settings,
+    segs: &[crate::gui::VideoSeg],
+    src_fps: f64,
+    w: usize,
+    h: usize,
+) -> Result<Vec<Option<Arc<Stabilizer>>>, String> {
+    let offset_ms = crate::gui::gyro_offset_ms(settings, src_fps);
+    let mut slots: Vec<Option<Arc<Stabilizer>>> = vec![None; segs.len()];
+    let mut loaded = 0usize;
+    for (i, seg) in segs.iter().enumerate() {
+        if !seg.has_motion {
+            continue;
+        }
+        let fps = if seg.fps > 0.0 { seg.fps } else { src_fps };
+        let t0 = std::time::Instant::now();
+        match crate::gyro::load_stabilizer(
+            &seg.path,
+            &settings.gyro,
+            w,
+            h,
+            fps,
+            seg.duration_ms,
+            seg.frame_count,
+            false,
+            offset_ms,
+            crate::gyro::no_progress(),
+        ) {
+            Ok(s) => {
+                eprintln!(
+                    "[encode] 按导出尺寸 {w}x{h} 重新加载防抖：分段 {}（{:.1}s）",
+                    i + 1,
+                    t0.elapsed().as_secs_f64()
+                );
+                slots[i] = Some(Arc::new(s));
+                loaded += 1;
+            }
+            Err(e) => {
+                return Err(format!("按导出尺寸重新加载防抖失败（分段 {}）: {e}", i + 1));
+            }
+        }
+    }
+    if loaded == 0 {
+        return Err("按导出尺寸重新加载防抖失败：没有任何分段带运动数据".into());
+    }
+    crate::gyro::apply_seam_warmup_smoothing(&slots, crate::gyro::no_progress());
+    Ok(slots)
+}
+
+/// 现有稳定化器尺寸与导出解码尺寸不一致时按导出尺寸重新加载一套。
+/// `Ok(None)` = 尺寸已经一致（不用动）；`Ok(Some(..))` = 新的一套；`Err` = 加载失败，
+/// 调用方应把解码尺寸退回旧稳定化器的尺寸（宁可分辨率低，也不能帧与稳定化器对不上）。
+fn reload_export_stabs_if_needed(
+    settings: &Settings,
+    segs: &[crate::gui::VideoSeg],
+    src_fps: f64,
+    dec_w: usize,
+    dec_h: usize,
+    stabs: &[Option<Arc<Stabilizer>>],
+    handle: &EncodeHandle,
+) -> Result<Option<Vec<Option<Arc<Stabilizer>>>>, String> {
+    if !stabs
+        .iter()
+        .flatten()
+        .any(|s| s.width != dec_w || s.height != dec_h)
+    {
+        return Ok(None);
+    }
+    // 弹窗上给一句话：重读运动数据可能要几秒到几十秒，不能让界面看起来卡住。
+    // 已经有一条提示时（例如硬件编码失败、已改用 CPU 的那条）不覆盖它。
+    let noticed = handle.notice().is_empty();
+    if noticed {
+        handle.set_notice(format!(
+            "正在按导出尺寸 {dec_w}x{dec_h} 重新准备防抖（要重读运动数据）…"
+        ));
+    }
+    let r = load_export_stabilizers(settings, segs, src_fps, dec_w, dec_h);
+    if noticed {
+        handle.set_notice(String::new());
+    }
+    r.map(Some)
+}
+
 /// 全部逐段导出：在同一后台线程上串行编码多个分段任务（每个分段一个文件）。
 /// 所有 job 必须共享同一个 `handle`：进度持续发布到该 handle，用户中止（stop）
 /// 会取消整个批次；某一段失败也会停止后续分段并把错误作为整批的结果上报。
@@ -1712,6 +1849,50 @@ pub fn encode_export_segments(jobs: Vec<EncodeJob>) {
     let Some(first) = jobs.first() else { return };
     let handle = first.handle.clone();
     let n = jobs.len();
+    // 逐段导出：所有分段同一源视频、同一解码尺寸 —— 按导出尺寸重载防抖只做一次，
+    // 否则每一段都会重读一遍运动数据。先把第一段要用的信息抄出来，之后才能改 jobs。
+    let plan = (
+        first.settings.clone(),
+        first.src_fps,
+        first.duration_ms,
+        first.stabs.clone(),
+        first.segs.clone(),
+        (first.dec_w, first.dec_h),
+    );
+    let mut jobs = jobs;
+    let (f_settings, f_fps, f_duration, f_stabs, f_segs, (f_dec_w, f_dec_h)) = plan;
+    if !f_settings.encode.map_only {
+        let segs = effective_segs(
+            &f_settings,
+            f_segs,
+            f_fps,
+            f_duration,
+            f_stabs.iter().flatten().next().is_some(),
+        );
+        match reload_export_stabs_if_needed(
+            &f_settings, &segs, f_fps, f_dec_w, f_dec_h, &f_stabs, &handle,
+        ) {
+            Ok(Some(fresh)) => {
+                for job in jobs.iter_mut() {
+                    job.stabs = fresh.clone();
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let (fw, fh) = f_stabs
+                    .iter()
+                    .flatten()
+                    .next()
+                    .map(|s| (s.width, s.height))
+                    .unwrap_or((f_dec_w, f_dec_h));
+                eprintln!("[encode] 逐段导出：{e}；本批改用 {fw}x{fh}（预览尺寸）解码");
+                for job in jobs.iter_mut() {
+                    job.dec_w = fw;
+                    job.dec_h = fh;
+                }
+            }
+        }
+    }
     for (i, job) in jobs.into_iter().enumerate() {
         *handle.batch_position.lock().unwrap() = (i, n);
         handle.set_progress(EncodeProgress::default());
@@ -1864,7 +2045,7 @@ fn encode_export_attempt(job: EncodeJob, publish_done: bool) -> Option<String> {
         clip_start,
         clip_end,
         handle,
-        stabs,
+        mut stabs,
         segs,
     } = job;
     if !settings.encode.include_map {
@@ -1882,18 +2063,7 @@ fn encode_export_attempt(job: EncodeJob, publish_done: bool) -> Option<String> {
     // Effective stitched timeline: GUI jobs carry the multi-video segments; an empty
     // list means a legacy single-file caller — synthesize one segment so the frame
     // loop below has exactly one code path.
-    let segs: Vec<crate::gui::VideoSeg> = if segs.is_empty() {
-        vec![crate::gui::VideoSeg {
-            path: settings.video.video_path.clone(),
-            start_ms: 0.0,
-            duration_ms,
-            fps: src_fps,
-            frame_count: 0,
-            has_motion: false,
-        }]
-    } else {
-        segs
-    };
+    let segs = effective_segs(&settings, segs, src_fps, duration_ms, stabs.iter().flatten().next().is_some());
     // 结束时把结果交给 handle。返回值 = 本次尝试的失败原因（成功为 None），
     // 让上层决定是否需要回退到 CPU 重试。
     let finish = |aborted: bool, error: String| -> Option<String> {
@@ -1916,11 +2086,33 @@ fn encode_export_attempt(job: EncodeJob, publish_done: bool) -> Option<String> {
     // proportions match the preview at this resolution.
     let (out_w, out_h) = encode_output_size(&settings.encode, src_w, src_h);
     let out_fps = encode_output_fps(&settings.encode, src_fps);
-    let (dec_w, dec_h) = if dec_w >= 2 && dec_h >= 2 {
+    let (mut dec_w, mut dec_h) = if dec_w >= 2 && dec_h >= 2 {
         (dec_w, dec_h)
     } else {
         crate::gui::processing_size(src_w, src_h, out_h)
     };
+    // 稳定化器按尺寸初始化，喂不同尺寸的帧会 SizeMismatch / InvalidStride：导出尺寸比
+    // 预览那套（限高 720）大时（现在常见）必须按导出尺寸重新加载一套。加载失败就退回旧
+    // 稳定化器的尺寸 —— 宁可分辨率低一点，也不能让画面和防抖对不上。
+    match reload_export_stabs_if_needed(&settings, &segs, src_fps, dec_w, dec_h, &stabs, &handle) {
+        Ok(Some(fresh)) => stabs = fresh,
+        Ok(None) => {}
+        Err(e) => {
+            let (fw, fh) = stabs
+                .iter()
+                .flatten()
+                .next()
+                .map(|s| (s.width, s.height))
+                .unwrap_or((dec_w, dec_h));
+            eprintln!("[encode] {e}；回退到 {fw}x{fh}（预览尺寸）");
+            dec_w = fw;
+            dec_h = fh;
+        }
+    }
+    crate::log_info!(
+        "解码尺寸 {dec_w}x{dec_h}（输出 {out_w}x{out_h}，源 {src_w}x{src_h}，防抖={}）",
+        if stabs.iter().flatten().next().is_some() { "开" } else { "关" }
+    );
     // Export speed N: sample source time N× faster (frame-skip), output fps unchanged,
     // so the clip holds total/N frames and is N× shorter. Audio matches via atempo.
     let speed_n = encode_speed_ratio(&settings.encode);
@@ -2306,9 +2498,12 @@ fn encode_export_map_only_run(job: EncodeJob, mark_done: bool) {
             widgets: Vec::new(),
         });
     }
-    // Map-only frame t is a route timestamp; preserve the corresponding GPX instant.
-    settings.hud.gpx_time_offset +=
-        settings.video.start_time_offset_s - settings.route.control_time_offset;
+    // Map-only frame t is a route timestamp, so the HUD has to read the track at exactly that
+    // instant. `hud::hud_track_offset` = `gpx_time_offset - start_time_offset_s`; equalising the
+    // two calibration values below makes the route clock stand in for the video clock, and the
+    // GPX offset (a property of the GPX file itself) then applies as-is. This spot used to patch
+    // `gpx_time_offset` by hand against the old "offset from the video start" convention — that
+    // arithmetic would double-count under the race-start anchoring.
     settings.video.start_time_offset_s = settings.route.control_time_offset;
     // Nominal source size so a "source" resolution token still yields a sane frame.
     let (out_w, out_h) = encode_output_size(&settings.encode, src_w.max(1920), src_h.max(1080));
@@ -2553,6 +2748,54 @@ mod tests {
         assert_eq!(encode_speed_ratio(&enc), 1.0);
         enc.speed = "100".into();
         assert_eq!(encode_speed_ratio(&enc), 8.0); // clamped to a safe max
+    }
+
+    #[test]
+    fn output_size_keeps_source_resolution_when_asked() {
+        let mut enc = enc_base();
+        // 「与原始视频一致」= 不缩放，直接用源尺寸（只做偶数对齐）。
+        enc.resolution = "source".into();
+        assert_eq!(encode_output_size(&enc, 2688, 2016), (2688, 2016));
+        assert_eq!(encode_output_size(&enc, 1920, 1081), (1920, 1080));
+        // 显式尺寸仍然照写（含 4:3），旧档位名仍能解析。
+        enc.resolution = "1440x1080".into();
+        assert_eq!(encode_output_size(&enc, 2688, 2016), (1440, 1080));
+        enc.resolution = "4k".into();
+        assert_eq!(encode_output_size(&enc, 2688, 2016), (3840, 2160));
+        enc.resolution = "1080p".into();
+        assert_eq!(encode_output_size(&enc, 2688, 2016), (1920, 1080));
+        // 默认值与无法解析的写法回退 1920x1080。
+        enc.resolution = String::new();
+        assert_eq!(encode_output_size(&enc, 2688, 2016), (1920, 1080));
+        enc.resolution = "原始".into();
+        assert_eq!(encode_output_size(&enc, 2688, 2016), (1920, 1080));
+    }
+
+    #[test]
+    fn export_decode_size_follows_the_output_panel() {
+        let mut s = crate::settings::Settings::default();
+        // 默认工程没配地图（面板 = 整幅画布）；4:3 源受高度约束 → 1440x1080。
+        s.encode.resolution = "1920x1080".into();
+        assert_eq!(export_decode_size(&s, 2688, 2016), (1440, 1080));
+        // 配了地图（占 1/4 宽）时面板更窄，但 4:3 源本例仍受高度约束 → 同尺寸。
+        s.map.image_file_path = "D:/map.qrt".into();
+        assert_eq!(export_decode_size(&s, 2688, 2016), (1440, 1080));
+        // 4K 输出：顶到源尺寸（旧行为是 1280x720，被放大 3 倍）。
+        s.encode.resolution = "3840x2160".into();
+        assert_eq!(export_decode_size(&s, 2688, 2016), (2688, 2016));
+        // 720p 输出：与旧行为一致（就是 960x720，1:1 不放大）。
+        s.encode.resolution = "1280x720".into();
+        assert_eq!(export_decode_size(&s, 2688, 2016), (960, 720));
+        // 源比输出小：绝不放大。
+        s.encode.resolution = "1920x1080".into();
+        assert_eq!(export_decode_size(&s, 640, 480), (640, 480));
+        // 用户把视频放大 2×：按放大后的像素解码，上限仍是源。
+        s.video.scale = 2.0;
+        assert_eq!(export_decode_size(&s, 2688, 2016), (2688, 2016));
+        // 导出内容不含地图 → 面板按整幅画布算（与编码时的等价改动一致）。
+        s.video.scale = 1.0;
+        s.encode.include_map = false;
+        assert_eq!(export_decode_size(&s, 2688, 2016), (1440, 1080));
     }
 
     #[test]

@@ -419,7 +419,9 @@ pub struct EncodeSettings {
     /// （如 `test.mp4` → `test[0-1].mp4`、`test[1-2].mp4` …）。见 `encode::encode_export_segments`。
     pub all_seg_enabled: bool,
     pub output_file_path: String,
-    /// Output resolution preset: "source" | "1080p" | "720p" | "4k" | "wxd" (e.g. "1920x1080").
+    /// Output resolution: "source"（与原始视频一致，输出画布 = 源视频尺寸）| 显式 "宽x高"
+    /// （如 "1920x1080"）；更早的档位名（"1080p" | "720p" | "4k"）仍由
+    /// `encode::encode_output_size` 兜底解析。
     /// When not "source", the composite is re-laid-out at that size; the video itself is
     /// never stretched (aspect is preserved by letterboxing in `draw_scene`).
     pub resolution: String,
@@ -848,11 +850,13 @@ impl Settings {
                 s.resolve_orv_paths(dir);
             }
         }
-        // 分辨率：下拉现在是**显式尺寸**（1920x1080 / 3840x2160 / 1920x1440 …），
-        // 老工程里的档位名（1080p/720p/4k，以及更早的 "source"）归一成同尺寸的显式写法，
-        // 否则下拉选不中、显示与实际导出尺寸会不一致。
+        // 分辨率：下拉是**显式尺寸**（1920x1080 / 3840x2160 / 1920x1440 …）加上一项
+        // 「与原始视频一致」（token 就是 `source`）。老工程里的档位名（1080p/720p/4k）归一成
+        // 同尺寸的显式写法，否则下拉选不中、显示与实际导出尺寸会不一致。
+        // `source` **不归一**：它是下拉里可选的一项，改掉会让用户选好的「与原始视频一致」
+        // 在重新打开工程时被悄悄换成 1920x1080（保存 → 加载的往返必须保持原值）。
         s.encode.resolution = match s.encode.resolution.trim().to_ascii_lowercase().as_str() {
-            "" | "1080p" | "fhd" | "source" => "1920x1080".to_string(),
+            "" | "1080p" | "fhd" => "1920x1080".to_string(),
             "720p" | "hd" => "1280x720".to_string(),
             "4k" | "uhd" | "2160p" => "3840x2160".to_string(),
             _ => s.encode.resolution.clone(),
@@ -1888,6 +1892,29 @@ mod tests {
         assert_eq!(s2.gyro.fov, 0.85);
         assert_eq!(s2.gyro.frame_readout_time, 11.09);
         assert_eq!(s2.encode.audio_codec, "copy");
+    }
+
+    #[test]
+    fn load_orv_keeps_source_resolution_and_normalizes_legacy_presets() {
+        let dir = std::env::temp_dir().join(format!("tracereel-res-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let load = |name: &str, res: &str| -> String {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("[encode]\nresolution={res}\n")).unwrap();
+            Settings::load_orv(p.to_string_lossy().as_ref())
+                .encode
+                .resolution
+        };
+        // 「与原始视频一致」是下拉里可选的一项：存盘 → 重新打开必须原样保留，
+        // 否则用户选好的「与原始视频一致」会被悄悄换成 1920x1080。
+        assert_eq!(load("keep.trr", "source"), "source");
+        // 老工程的档位名仍然归一成显式尺寸（下拉选不中会导致显示与实际导出不一致）。
+        assert_eq!(load("p1080.trr", "1080p"), "1920x1080");
+        assert_eq!(load("p720.trr", "720p"), "1280x720");
+        assert_eq!(load("uhd.trr", "4k"), "3840x2160");
+        // 显式尺寸原样保留。
+        assert_eq!(load("explicit.trr", "2688x2016"), "2688x2016");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -72,6 +72,21 @@ $exe = if ($Release) {
 }
 $profileLabel = if ($Release) { "release" } else { "debug" }
 
+# 正在运行的 exe 在 Windows 上不能被覆盖：cargo 重新链接那一步会失败在
+#   error: failed to remove file `...\target\release\tracereel-gui.exe`
+#   Caused by: 拒绝访问。 (os error 5)
+# 用户看到的就是「编译失败」—— 只有 TraceReel 窗口还开着才会这样。提前拦下来，
+# 直接说清楚该关掉哪个窗口，别让人去猜源码哪里写错了。
+# （--SkipBuild 不编译，只再开一个窗口，所以不拦。）
+if (-not $SkipBuild) {
+    $running = @(Get-Process -Name "tracereel-gui" -ErrorAction SilentlyContinue |
+        Where-Object { -not $_.Path -or $_.Path -ieq $exe })
+    if ($running.Count -gt 0) {
+        $pids = ($running | ForEach-Object { $_.Id }) -join "、"
+        throw "TraceReel 正在运行（PID $pids），Windows 不允许覆盖正在运行的程序：cargo 会报「拒绝访问。(os error 5)」并显示编译失败。请先关闭 TraceReel 窗口（或结束该进程）后重试。"
+    }
+}
+
 # Always let Cargo decide. Its freshness check works on content fingerprints
 # and covers the whole dependency graph, so an unchanged tree only costs the
 # sub-second check while a changed tree can never launch a stale binary.
@@ -85,6 +100,7 @@ if ($SkipBuild) {
     & (Join-Path $Root "build.ps1") @buildArgs
     if ($LASTEXITCODE -ne 0) {
         Write-Host "编译失败，已取消启动；请修复上面的错误后重试。"
+        Write-Host "（若上面是「拒绝访问。(os error 5)」，说明 TraceReel 窗口还开着：先关掉它再重试。）"
         exit 1
     }
 }

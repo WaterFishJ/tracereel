@@ -16,8 +16,23 @@ $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $QtRoot = if ($env:TRACEREEL_QT_ROOT) { $env:TRACEREEL_QT_ROOT } else { "C:\Qt\6.8.2\msvc2022_64" }
-if (-not (Test-Path (Join-Path $QtRoot "bin\qmake.exe"))) {
+$QMake = Join-Path $QtRoot "bin\qmake.exe"
+if (-not (Test-Path $QMake)) {
     throw "找不到 Qt：$QtRoot。请安装 Qt 6.8（msvc2022_64），或用 TRACEREEL_QT_ROOT 指定其目录。"
+}
+# qttypes（qmetaobject 的构建依赖）**先看 QMAKE 环境变量**，只有没设时才去 PATH 里
+# 依次找 qmake6 / qmake / qmake-qt5。PATH 顺序一变（某个 IDE、编辑器插件或别的脚本
+# 改了 PATH，或有人直接跑 `cargo build`），它就在构建脚本里 panic：
+#   Failed to execute qmake. Make sure 'qmake' is in your path! / entity not found
+# 报错完全看不出是 Qt 没配好，还会把 target 里的 qttypes 指纹弄脏。这里显式指向 Qt
+# 自带的 qmake，构建不再依赖 PATH 顺序。
+$env:QMAKE = $QMake
+# 真跑一次 qmake：Qt 装残缺（有 qmake.exe 但缺 DLL）时要在这里报中文错误，而不是
+# 等到 qttypes 的构建脚本里崩掉。注意**别用 `| Select-Object -First 1`**：它会在读到
+# 第一行后就掐断管道，原生进程拿不到退出码，$LASTEXITCODE 变成空值，这里就会误判成失败。
+$qtVersion = (& $QMake -query QT_VERSION | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($qtVersion)) {
+    throw "qmake 无法执行：$QMake（退出码 $LASTEXITCODE）。Qt 安装可能不完整，请重装 Qt 6.8（msvc2022_64）或用 TRACEREEL_QT_ROOT 指定目录。"
 }
 
 # ffmpeg dev directory. 必须含**软件 AV1 编码器**（libsvtav1 / libaom-av1），
@@ -52,6 +67,7 @@ $env:QML2_IMPORT_PATH = "$QtRoot\qml"
 Write-Host "FFMPEG_DIR=$env:FFMPEG_DIR"
 Write-Host "QT_INCLUDE_PATH=$env:QT_INCLUDE_PATH"
 Write-Host "QT_LIBRARY_PATH=$env:QT_LIBRARY_PATH"
+Write-Host "QMAKE=$env:QMAKE（Qt $qtVersion）"
 
 Push-Location $Root
 $cargoExit = 1
