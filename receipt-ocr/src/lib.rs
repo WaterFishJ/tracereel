@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 #[derive(Deserialize)]
 pub struct Request {
     pub path: PathBuf,
+    /// 原图上归一化的四角：左上、右上、右下、左下。
     pub corners: geometry::Quad,
+    /// 整 90° 挡位：0 不转、1 顺时针 90°、2 180°、3 逆时针 90°。
     #[serde(default)]
     pub rotation: u8,
 }

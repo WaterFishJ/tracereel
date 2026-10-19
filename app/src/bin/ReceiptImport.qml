@@ -9,8 +9,8 @@ Dialog {
     id: dialog
     title: "成绩条图片导入（本地 OCR）"
     modal: true
-    width: Math.min(parent.width - 40, 1100)
-    height: Math.min(parent.height - 40, 820)
+    width: Math.min(parent.width - 40, 1320)
+    height: Math.min(parent.height - 40, 900)
     anchors.centerIn: parent
     closePolicy: Popup.NoAutoClose
     signal imported(string times, string codes, bool relative)
@@ -30,6 +30,17 @@ Dialog {
     property var output: Logic.build(rows, timeColumn.currentIndex - 1, timeKind.currentIndex === 1, ordinalColumn.currentIndex - 1, codeColumn.currentIndex - 1)
     property var suspected: Logic.suspects(rows, codeColumn.currentIndex - 1)
     property int suspectedCount: suspected.filter(function(value) { return value }).length
+    /// 预览的旋转角（度，正值＝顺时针）：只是把照片转过来方便看清、框准，四角仍然
+    /// 量在原图上，所以转多少都不改变识别结果，也不用重新识别。
+    property real fineAngle: 0
+    readonly property bool showingCorrected: showCorrected.checked && dialog.correctedUrl.length > 0
+    /// 预览要转的角度：转的是源图照片；校正图已经是摆正的样子，不用再转。
+    readonly property real previewRotation: dialog.showingCorrected ? 0 : dialog.fineAngle
+    function setFineAngle(value) {
+        var v = Math.round(Math.max(-180, Math.min(180, value)) * 10) / 10
+        if (dialog.fineAngle !== v) dialog.fineAngle = v
+        if (!angleField.activeFocus) angleField.text = v.toFixed(1)
+    }
     function columnNames(optional) {
         var names = [optional ? "不指定" : "请选择"]
         for (var i = 0; i < columns; i++) names.push("第 " + (i + 1) + " 列")
@@ -51,7 +62,12 @@ Dialog {
     }
     function recognizeImage() {
         rows = []; undoRows=[]; correctedUrl = ""; message = "正在校正图片并识别…"
-        engine.start(JSON.stringify({path:imagePath, corners:corners, rotation:rotation.currentIndex}))
+        engine.start(dialog.requestJson())
+    }
+    /// 送给引擎的请求。单拎出来是为了能在测试里核对四角真的传出去了 ——
+    /// 角度只影响预览，不参与识别，所以这里没有它。
+    function requestJson() {
+        return JSON.stringify({path:imagePath, corners:corners})
     }
     function selectImage(url) {
         imageUrl = String(url)
@@ -59,7 +75,7 @@ Dialog {
         if (/^\/[A-Za-z]:/.test(imagePath)) imagePath = imagePath.substring(1)
         rows = []; undoRows=[]; columns = 0; correctedUrl = ""; message = ""
         corners = [[0.05,0.05],[0.95,0.05],[0.95,0.95],[0.05,0.95]]
-        rotation.currentIndex = 0
+        dialog.setFineAngle(0)
     }
     ReceiptOcr {
         id: engine
@@ -72,7 +88,7 @@ Dialog {
             dialog.rows = data.rows.map(function(r) { return {cells:r.cells, scores:r.scores, include:true} })
             dialog.undoRows = []
             dialog.correctedUrl = data.preview
-            dialog.message = data.rows.length ? "请核对列和行，取消勾选表头、起点等无关行；低置信度文字以橙色显示。" : "未识别出文字，请调整四角或旋转方向后重试。"
+            dialog.message = data.rows.length ? "请核对列和行，取消勾选表头、起点等无关行；低置信度文字以橙色显示。" : "未识别出文字，请调整四角后重试。"
             timeColumn.currentIndex = 0; codeColumn.currentIndex = 0; ordinalColumn.currentIndex = 0
         }
     }
@@ -87,7 +103,6 @@ Dialog {
         spacing: 8
         RowLayout {
             Button { text: "选择图片"; enabled: !engine.busy; onClicked: picker.open() }
-            ComboBox { id: rotation; model: ["不旋转", "顺时针 90°", "旋转 180°", "逆时针 90°"]; enabled: !engine.busy }
             CheckBox { id: showCorrected; text: "查看校正图"; enabled: dialog.correctedUrl.length > 0; checked: false }
             Button {
                 text: engine.busy ? "正在本地识别…" : "校正并识别"
@@ -96,31 +111,61 @@ Dialog {
             }
             BusyIndicator { running: engine.busy; visible: running; Layout.preferredWidth: 28; Layout.preferredHeight: 28 }
         }
-        Label { text: "请使用清晰照片。拖动四角框住成绩表：①左上 ②右上 ③右下 ④左下。选择旋转方向后识别。"; wrapMode: Text.Wrap; Layout.fillWidth: true }
+        RowLayout {
+            Layout.fillWidth: true
+            Label { text: "旋转角" }
+            TextField {
+                id: angleField
+                objectName: "receiptAngleField"
+                Layout.preferredWidth: 68
+                enabled: !engine.busy
+                text: dialog.fineAngle.toFixed(1)
+                // 编辑时不要抢用户的输入，但焦点一离开就按真实角度回填，
+                // 免得点「归零」这类按钮时框里还留着旧数字。
+                onActiveFocusChanged: if (!activeFocus) text = dialog.fineAngle.toFixed(1)
+                onEditingFinished: dialog.setFineAngle(parseFloat(text) || 0)
+            }
+            Label { text: "°" }
+            // 不加 flat：扁平按钮在深色主题下边框和文字都看不出来，用户只看见一片空。
+            // 也不用 fineAngle 去禁用：0° 时就该能按（按了没变化），禁用反而让按钮消失。
+            Button { text: "归零"; enabled: !engine.busy; onClicked: dialog.setFineAngle(0) }
+            Label {
+                text: "拖预览图上方圆钮把照片转正（转的时候出网格标，把表格的行对到横线上），再拖四角框住成绩表"
+                color: palette.mid
+                elide: Text.ElideRight
+            }
+            Item { Layout.fillWidth: true }
+        }
+        Label { text: "请使用清晰照片。先拖预览图上方的圆钮把照片转正（网格标对着表格的行），再拖动四角框住成绩表：①左上 ②右上 ③右下 ④左下，然后点「校正并识别」。"; wrapMode: Text.Wrap; Layout.fillWidth: true }
         SplitView {
             Layout.fillWidth: true
             Layout.fillHeight: true
             SplitView {
                 orientation: Qt.Vertical
-                SplitView.preferredWidth: 340
-                SplitView.minimumWidth: 200
+                // 图片是主要操作区：给它比表格更大的一块，四角/旋转才拖得准。
+                SplitView.preferredWidth: Math.max(420, dialog.width * 0.56)
+                SplitView.minimumWidth: 340
                 ReceiptImageView {
+                    id: imageView
                     SplitView.fillHeight: true
-                    SplitView.minimumHeight: 160
-                    source: showCorrected.checked && dialog.correctedUrl.length ? dialog.correctedUrl : dialog.imageUrl
-                    corners: showCorrected.checked && dialog.correctedUrl.length ? [] : dialog.corners
+                    SplitView.minimumHeight: 200
+                    source: dialog.showingCorrected ? dialog.correctedUrl : dialog.imageUrl
+                    corners: dialog.showingCorrected ? [] : dialog.corners
                     editable: !engine.busy
-                    onCornerMoved: function(index, imageX, imageY) {
+                    previewRotation: dialog.previewRotation
+                    rotatable: !dialog.showingCorrected && dialog.imageUrl.length > 0 && !engine.busy
+                    onAngleDragged: function(angle) { dialog.setFineAngle(angle) }
+                    onCornerMoved: function(index, canvasX, canvasY) {
                         var updated = dialog.corners.slice()
-                        updated[index] = [imageX, imageY]
+                        updated[index] = [canvasX, canvasY]
                         dialog.corners = updated
                     }
                 }
                 GroupBox {
                     title: "导入预览"
                     visible: dialog.rows.length > 0
-                    SplitView.preferredHeight: 260
-                    SplitView.minimumHeight: 120
+                    SplitView.preferredHeight: 170
+                    SplitView.minimumHeight: 90
                     ColumnLayout {
                         anchors.fill: parent
                         Label {

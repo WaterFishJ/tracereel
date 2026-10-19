@@ -56,6 +56,37 @@ ApplicationWindow {
         importer.rows=original; importer.timeKindIndex=0; importer.undoRows=[]; importer.message="重复打卡提示、向上／向下合并和撤销检查通过。"
         return true
     }
+    function checkAngleAdjustment() {
+        // 旋转角：数值框与预览角必须同步；源图模式下预览角就是当前角。
+        importer.setFineAngle(2.5)
+        if (Math.abs(importer.fineAngle - 2.5) > 1e-9 || Math.abs(importer.previewRotation - 2.5) > 1e-9) return false
+        if (cellText(importer.contentItem, "receiptAngleField") !== "2.5") return false
+        // 角度只影响预览，不进请求：四角按原图量好就够了。
+        var request = JSON.parse(importer.requestJson())
+        if (request.angle !== undefined || request.rotation !== undefined) return false
+        if (request.corners.length !== 4) return false
+        importer.setFineAngle(0.04)
+        if (cellText(importer.contentItem, "receiptAngleField") !== "0.0") return false
+        importer.setFineAngle(0)
+        if (importer.fineAngle !== 0 || importer.previewRotation !== 0) return false
+        // 角度可以随便转，量程是 ±180°。
+        importer.setFineAngle(-120)
+        var turned = Math.abs(importer.fineAngle + 120) < 1e-9
+        importer.setFineAngle(240)
+        var high = Math.abs(importer.fineAngle - 180) < 1e-9
+        importer.setFineAngle(-240)
+        var low = Math.abs(importer.fineAngle + 180) < 1e-9
+        importer.setFineAngle(0)
+        return turned && high && low && importer.previewRotation === 0
+    }
+    Timer {
+        id: shotTimer
+        interval: 900
+        onTriggered: importer.contentItem.grabToImage(function(result) {
+            result.saveToFile("target/receipt-import-preview.png")
+            Qt.quit()
+        })
+    }
     Timer {
         interval: 200; repeat: true; running: true
         onTriggered: {
@@ -76,6 +107,12 @@ ApplicationWindow {
                     return
                 }
                 stop()
+                // 角度微调只跟 QML 的滑杆/预览联动有关，不依赖这张样图读出来的成绩，
+                // 所以放在成绩断言之前，样图对不上时也能看出是哪一边坏了。
+                if (!window.checkAngleAdjustment()) {
+                    console.error("RECEIPT_TEST_FAIL angle adjustment " + JSON.stringify({fine:importer.fineAngle, preview:importer.previewRotation}))
+                    Qt.quit(); return
+                }
                 if (importer.output.error || importer.output.times.length !== 19 || importer.output.times[18] !== "22:03.1"
                         || importer.output.times[0] !== "1:21" || importer.suspectedCount !== 0
                         || importer.output.codes[11] !== "120" || importer.output.codes[17] !== "120"
@@ -87,10 +124,9 @@ ApplicationWindow {
                 if (!window.checkDuplicateActions()) {
                     console.error("RECEIPT_TEST_FAIL duplicate merge controls"); Qt.quit(); return
                 }
-                importer.contentItem.grabToImage(function(result) {
-                    result.saveToFile("target/receipt-import-preview.png")
-                    Qt.quit()
-                })
+                // 等异步图片真的画出来再截图：这张图只是给人看的产物，
+                // 太早抓会得到一片空白。
+                shotTimer.start()
             }
         }
     }

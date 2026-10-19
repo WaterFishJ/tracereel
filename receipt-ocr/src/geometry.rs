@@ -5,6 +5,7 @@ pub type Quad = [[f32; 2]; 4];
 pub fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
     (a[0] - b[0]).hypot(a[1] - b[1])
 }
+/// 把 `quad` 映射成 `width × height` 的矩形（单次重采样）。
 pub fn warp(image: &RgbImage, quad: Quad, width: u32, height: u32) -> Result<RgbImage, String> {
     let from = quad.map(|p| (p[0], p[1]));
     let to = [
@@ -25,6 +26,8 @@ pub fn warp(image: &RgbImage, quad: Quad, width: u32, height: u32) -> Result<Rgb
     );
     Ok(output)
 }
+/// 透视校正 + 摆正：`corners` 是原图上归一化的四角（左上、右上、右下、左下），
+/// `rotation` 是整 90° 挡位。
 pub fn rectify(image: &RgbImage, corners: Quad, rotation: u8) -> Result<RgbImage, String> {
     if corners
         .iter()
@@ -108,5 +111,6 @@ mod tests {
         assert_eq!(rotated.dimensions(), (118, 198));
         assert!(rectify(&image, [[0., 0.], [1., 1.], [1., 0.], [0., 1.]], 0).is_err());
         assert!(rectify(&image, [[0., 0.], [0.01, 0.], [0.01, 1.], [0., 1.]], 0).is_err());
+        assert!(rectify(&image, [[0., 0.], [f32::NAN, 0.], [1., 1.], [0., 1.]], 0).is_err());
     }
 }
