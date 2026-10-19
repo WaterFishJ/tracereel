@@ -1594,13 +1594,6 @@ ApplicationWindow {
         if (w) collectExportTexts(w.contentItem, out)
         return out
     }
-    // 自动化用：把握手窗口抓成图片（异步保存到 filePath），返回是否已发起。
-    function debugGrabExportWindow(which, filePath) {
-        var w = (which === "queue") ? queueWindow : encodeWin
-        if (!w || !w.contentItem) return false
-        w.contentItem.grabToImage(function (r) { r.saveToFile(filePath) })
-        return true
-    }
     function collectExportTexts(node, out) {
         if (!node) return
         if (node.configText !== undefined && out.config.length === 0) out.config = String(node.configText)

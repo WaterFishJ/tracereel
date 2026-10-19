@@ -450,6 +450,27 @@ pub struct EncodeSettings {
     pub include_hud: bool,
 }
 
+impl EncodeSettings {
+    /// 「自定义时间」实际生效的起止（毫秒；0 = 开头 / 到末尾）。
+    ///
+    /// 与 [`Settings::resolve_encode_clip_ms`] 用同一条规则：开始没填（≤0）从 0 起；
+    /// 结束没填、或填得比开始还早（≤开始）就按「到末尾」(0) 算。
+    /// 导出进度窗口与导出队列的文字也用它，保证「写出来的范围」就是「真正导出的范围」。
+    pub fn effective_time_range(&self) -> (f64, f64) {
+        let start = if self.range_start_ms.is_finite() && self.range_start_ms > 0.0 {
+            self.range_start_ms
+        } else {
+            0.0
+        };
+        let end = if self.range_end_ms.is_finite() && self.range_end_ms > start {
+            self.range_end_ms
+        } else {
+            0.0
+        };
+        (start, end)
+    }
+}
+
 /// Gyroflow stabilization settings.
 ///
 /// **所有稳定化参数都在这里**（不再依赖 `.gyroflow` 文件）：GUI 的「稳定化」页直接编辑这些字段，
@@ -1108,6 +1129,11 @@ impl Settings {
             }
         }
         s.hud.scope = ini.get_string("hud", "scope", &s.hud.scope);
+        // 白名单：只认「视频区」「整幅画面」两种；手改或旧版遗留的其它值一律回到默认「视频区」。
+        s.hud.scope = match s.hud.scope.trim().to_ascii_lowercase().as_str() {
+            "frame" => "frame".to_string(),
+            _ => "video".to_string(),
+        };
         s.hud.gpx_time_offset = ini.get_f64("hud", "gpxTimeOffset", s.hud.gpx_time_offset);
         s.hud.show_elapsed_time = ini.get_bool("hud", "showElapsedTime", s.hud.show_elapsed_time);
         s.hud.show_segment_time = ini.get_bool("hud", "showSegmentTime", s.hud.show_segment_time);
@@ -1169,6 +1195,13 @@ impl Settings {
             "none"
         };
         s.encode.clip_mode = ini.get_string("encode", "clipMode", derived_mode);
+        // 白名单：只认四挡；手改或旧版遗留的未知值回退到按两个开关反推的挡位。
+        let mode = s.encode.clip_mode.trim().to_ascii_lowercase();
+        s.encode.clip_mode = if matches!(mode.as_str(), "none" | "all" | "custom" | "time") {
+            mode
+        } else {
+            derived_mode.to_string()
+        };
         // 老文件只有 clipStartMs/clipEndMs（当时自定义时间直接写那一对），补到 range_* 上。
         if s.encode.clip_mode.eq_ignore_ascii_case("time")
             && s.encode.range_start_ms == 0.0
@@ -1364,19 +1397,9 @@ impl Settings {
         // 「自定义时间」：起止就是界面上填的那两个毫秒值（`range_*`），不参与分段推导。
         // 填反了（结束 ≤ 开始）当没填，即到末尾。`range_*` 本身不动，切挡位回来还在。
         if self.encode.clip_mode.eq_ignore_ascii_case("time") {
-            let start = if self.encode.range_start_ms.is_finite() && self.encode.range_start_ms > 0.0
-            {
-                self.encode.range_start_ms
-            } else {
-                0.0
-            };
+            let (start, end) = self.encode.effective_time_range();
             self.encode.clip_start_ms = start;
-            self.encode.clip_end_ms =
-                if self.encode.range_end_ms.is_finite() && self.encode.range_end_ms > start {
-                    self.encode.range_end_ms
-                } else {
-                    0.0
-                };
+            self.encode.clip_end_ms = end;
             return;
         }
         if !self.encode.seg_enabled {
@@ -2212,6 +2235,22 @@ mod tests {
             .join("\n");
         let parsed = Settings::from_ini(&IniFile::parse(&old_ini));
         assert_eq!(parsed.encode.clip_mode, "all");
+    }
+
+    /// 「导出范围」与 HUD「显示范围」只认白名单取值：手改出来的未知值不能落进运行时。
+    #[test]
+    fn unknown_clip_mode_and_hud_scope_fall_back_to_defaults() {
+        let ini = "[encode]\nclipMode=whatever\nsegEnabled=true\nallSegEnabled=false\n\n[hud]\nscope=canvas\n";
+        let parsed = Settings::from_ini(&IniFile::parse(ini));
+        // 未知 clipMode → 按旧开关反推（segEnabled 开、allSegEnabled 关 → 自定义分段）。
+        assert_eq!(parsed.encode.clip_mode, "custom");
+        // 未知 scope → 默认「视频区」，不会让 HUD 跑到地图上。
+        assert_eq!(parsed.hud.scope, "video");
+        // 合法值（大小写、空白不敏感）照常保留。
+        let ini = "[encode]\nclipMode= TIME \n\n[hud]\nscope= Frame \n";
+        let parsed = Settings::from_ini(&IniFile::parse(ini));
+        assert_eq!(parsed.encode.clip_mode, "time");
+        assert_eq!(parsed.hud.scope, "frame");
     }
 
     /// 颜色序列化必须保真不透明度（简洁/高亮的默认色都带 alpha），全不透明时收敛成 6 位，

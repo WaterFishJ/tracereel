@@ -742,7 +742,11 @@ impl SettingsProxy {
         s.encode.start_seg = self.encode_start_seg;
         s.encode.end_seg = self.encode_end_seg;
         // 分段导出：下拉模式是唯一真源，由它推出底层两个开关（老工程按开关推出模式，见 apply_settings）。
-        let seg_mode = self.encode_seg_mode.to_string().to_ascii_lowercase();
+        // 只认四种取值；下拉之外（脚本、手改 QML）传进来的未知值按「全部」处理。
+        let mut seg_mode = self.encode_seg_mode.to_string().to_ascii_lowercase();
+        if !matches!(seg_mode.as_str(), "none" | "all" | "custom" | "time") {
+            seg_mode = "none".to_string();
+        }
         s.encode.clip_mode = seg_mode.clone();
         match seg_mode.as_str() {
             "none" => {
@@ -772,7 +776,11 @@ impl SettingsProxy {
         s.encode.map_only = !s.encode.include_video;
         s.encode.output_file_path = self.encode_output_path.to_string();
 
-        s.hud.scope = self.hud_scope.to_string();
+        // 白名单：HUD 只认「视频区 / 整幅画面」，未知值回到默认「视频区」。
+        s.hud.scope = match self.hud_scope.to_string().trim().to_ascii_lowercase().as_str() {
+            "frame" => "frame".to_string(),
+            _ => "video".to_string(),
+        };
         s.hud.gpx_file_path = self.hud_gpx_path.to_string();
         s.hud.layout = crate::hud::Layout::parse(&self.hud_layout.to_string()).ok();
         s.hud.gpx_time_offset = self.hud_gpx_offset;

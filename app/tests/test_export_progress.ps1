@@ -1,4 +1,4 @@
-﻿# 导出进度弹窗一致性回归：直接导出的「编码」窗口与「导出队列」里正在导出的那一项必须显示
+# 导出进度弹窗一致性回归：直接导出的「编码」窗口与「导出队列」里正在导出的那一项必须显示
 # 同一套内容 —— 导出配置 + 已用时 / 剩余用时 / 当前帧 / 总帧数 / 帧/秒；
 # 其余（总用时、视频当前/总长、输出大小）都不该出现。
 #
@@ -59,7 +59,7 @@ outputFilePath=$outPosix
     $code = $LASTEXITCODE
     $logs | ForEach-Object { Write-Host $_ }
     $text = $logs -join "`n"
-    if ($text -notmatch 'EXPORT_PROGRESS_PASS') {
+    if ($code -ne 0 -or $text -notmatch 'EXPORT_PROGRESS_PASS' -or $text -match 'EXPORT_PROGRESS_FAIL') {
         throw "导出进度弹窗一致性回归失败（exit=$code）"
     }
     Write-Output 'EXPORT_PROGRESS_TEST_PASS'

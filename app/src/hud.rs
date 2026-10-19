@@ -276,7 +276,27 @@ impl Layout {
 /// 分段列表为空（没填分段点）时没有终点可依，返回 `None`，总用时按原样跟随视频时刻。
 /// 扫描 GPX / 轨迹末点来决定终点是不对的：那两份数据往往一边多录了几秒、
 /// 或者终点之后还在走，真正的终点成绩只有分段表说得清楚。
+thread_local! {
+    /// `elapsed_freeze_s` 的缓存：HUD 每帧都会问一次终点时刻，而解析分段串会分配内存。
+    /// 键 =（分段串, 相对/绝对），分段设置一变就重算；正常播放时每帧只是字符串比较。
+    static FREEZE: std::cell::RefCell<(String, bool, Option<f64>)> = Default::default();
+}
+
 pub fn elapsed_freeze_s(settings: &Settings) -> Option<f64> {
+    FREEZE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        if c.0 != settings.splits.split_times || c.1 != settings.splits.is_relative {
+            *c = (
+                settings.splits.split_times.clone(),
+                settings.splits.is_relative,
+                compute_elapsed_freeze_s(settings),
+            );
+        }
+        c.2
+    })
+}
+
+fn compute_elapsed_freeze_s(settings: &Settings) -> Option<f64> {
     let info = tracereel_core::splits::build_runner_info(
         &settings.splits.split_times,
         settings.splits.is_relative,

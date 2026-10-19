@@ -150,18 +150,27 @@ pub fn output_durations(s: &Settings, duration_ms: f64, fps: f64) -> Result<Vec<
         .collect())
 }
 
-/// 毫秒 → 「时:分:秒」文本；0（或非正）用 `empty` 说明（如「开头」「末尾」）。
+/// 毫秒 → 「时:分:秒[.十分之一秒]」文本；0（或非正）用 `empty` 说明（如「开头」「末尾」）。
+///
+/// 整秒时刻不显示小数（`0:01:05`）；带零头的保留一位小数（`0:00:01.5`），
+/// 不再四舍五入成整秒 —— 用户填 1.5 秒却看到 2 秒会以为导出范围被改了。
 fn time_text(ms: f64, empty: &str) -> String {
     if !ms.is_finite() || ms <= 0.0 {
         return empty.to_string();
     }
-    let total = (ms / 1000.0).round() as i64;
-    format!(
+    let tenths = (ms / 100.0).round() as i64;
+    let (total, frac) = (tenths / 10, tenths % 10);
+    let base = format!(
         "{}:{:02}:{:02}",
         total / 3600,
         (total / 60) % 60,
         total % 60
-    )
+    );
+    if frac == 0 {
+        base
+    } else {
+        format!("{base}.{frac}")
+    }
 }
 
 pub fn configuration(s: &Settings) -> Vec<String> {
@@ -188,11 +197,15 @@ pub fn configuration(s: &Settings) -> Vec<String> {
     let seg = match e.clip_mode.trim().to_ascii_lowercase().as_str() {
         "all" => format!("逐段导出（{} 段）", s.encode_total_segments()),
         "custom" => format!("自定义分段（{}-{}）", e.start_seg, e.end_seg),
-        "time" => format!(
-            "自定义时间（{} → {}）",
-            time_text(e.range_start_ms, "开头"),
-            time_text(e.range_end_ms, "末尾")
-        ),
+        "time" => {
+            // 与真正导出同一条规则：填反/留空都按「到末尾」，文字不能写出导不出来的区间。
+            let (start, end) = e.effective_time_range();
+            format!(
+                "自定义时间（{} → {}）",
+                time_text(start, "开头"),
+                time_text(end, "末尾")
+            )
+        }
         _ => "全部".to_string(),
     };
     let rate_value = match e.rate_control.as_str() {
@@ -477,6 +490,19 @@ mod tests {
         s.encode.range_start_ms = 0.0;
         let text = configuration(&s).join("\n");
         assert!(text.contains("导出范围：自定义时间（开头 → 末尾）"), "{text}");
+        // 结束填得比开始还早：实际导到末尾，文字也必须这么写（不能显示反过来的区间）。
+        s.encode.range_start_ms = 30_000.0;
+        s.encode.range_end_ms = 10_000.0;
+        let text = configuration(&s).join("\n");
+        assert!(text.contains("导出范围：自定义时间（0:00:30 → 末尾）"), "{text}");
+        // 不足 1 秒的起止保留 0.1 秒，不再四舍五入成整秒。
+        s.encode.range_start_ms = 1_500.0;
+        s.encode.range_end_ms = 2_500.0;
+        let text = configuration(&s).join("\n");
+        assert!(
+            text.contains("导出范围：自定义时间（0:00:01.5 → 0:00:02.5）"),
+            "{text}"
+        );
     }
 
     #[test]
