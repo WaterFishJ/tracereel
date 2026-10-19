@@ -54,6 +54,18 @@ impl PreviewAudio {
         #[cfg(windows)]
         self.0.stop();
     }
+
+    /// 当前是否有一条活着的解码会话（诊断/回归用；暂停中仍算活着）。
+    pub fn running(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.0.running()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -217,6 +229,14 @@ mod engine {
 
         pub fn set_paused(&self, paused: bool) {
             self.shared.lock().unwrap().paused = paused;
+        }
+
+        /// 当前是否有一条活着的解码会话（供诊断/回归；暂停中仍算活着）。
+        pub fn running(&self) -> bool {
+            self.shared
+                .lock()
+                .map(|s| s.current.is_some())
+                .unwrap_or(false)
         }
 
         pub fn stop(&self) {

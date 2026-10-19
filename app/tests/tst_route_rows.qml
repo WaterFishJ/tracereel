@@ -357,5 +357,31 @@ Item {
             // 百分比是「显示单位」：设置里存的仍是原版 0..255 的 alpha，界面换算由 alphaPercent 负责。
             compare(row("路线透明度 (%)").decimals, 0, "百分比透明度不要小数")
         }
+
+        // 「画面占比」在没有视频时不起作用（地图铺满整帧）：这一行要灰显只读、恒显 100%，
+        // 并在悬停时说明原因。「没有视频」有两种来源：没选视频文件，或「导出」页没勾视频。
+        function test_map_share_is_forced_full_without_video() {
+            var share = row("画面占比 (%)")
+            verify(share !== null, "缺少「画面占比 (%)」这一行")
+            verify(share.forcedFull === false, "有视频时不该灰显")
+            verify(String(share.hint).length > 0, "灰显时要有悬停提示文案")
+
+            // 没选视频文件 → 灰显。
+            host.settings.video_path = ""
+            host.refreshTick++
+            verify(share.forcedFull === true, "没有视频文件时「画面占比」要灰显")
+
+            // 有视频文件，但「导出」页没勾视频 → 同样灰显。
+            host.settings.video_path = "clip.mp4"
+            host.settings.encode_include_video = false
+            host.refreshTick++
+            verify(share.forcedFull === true, "没勾「导出 → 视频」时「画面占比」要灰显")
+
+            // 恢复：值本身没被改过，仍然是用户原先填的 0.75。
+            host.settings.encode_include_video = true
+            host.refreshTick++
+            compare(share.forcedFull, false, "勾回视频后要能继续调")
+            compare(host.settings.relative_width, 0.75, "灰显只是显示态，不许悄悄改掉存着的占比")
+        }
     }
 }

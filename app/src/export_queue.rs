@@ -150,6 +150,20 @@ pub fn output_durations(s: &Settings, duration_ms: f64, fps: f64) -> Result<Vec<
         .collect())
 }
 
+/// 毫秒 → 「时:分:秒」文本；0（或非正）用 `empty` 说明（如「开头」「末尾」）。
+fn time_text(ms: f64, empty: &str) -> String {
+    if !ms.is_finite() || ms <= 0.0 {
+        return empty.to_string();
+    }
+    let total = (ms / 1000.0).round() as i64;
+    format!(
+        "{}:{:02}:{:02}",
+        total / 3600,
+        (total / 60) % 60,
+        total % 60
+    )
+}
+
 pub fn configuration(s: &Settings) -> Vec<String> {
     let e = &s.encode;
     let backend = match e.backend.as_str() {
@@ -170,12 +184,16 @@ pub fn configuration(s: &Settings) -> Vec<String> {
         "none" => "无音频",
         x => x,
     };
-    let seg = if !e.seg_enabled {
-        "不分段".into()
-    } else if e.all_seg_enabled {
-        format!("逐段导出（{} 段）", s.encode_total_segments())
-    } else {
-        format!("自定义（{}-{}）", e.start_seg, e.end_seg)
+    // 导出范围（原「分段导出」）：四挡与导出页下拉一致，这里只做文字说明。
+    let seg = match e.clip_mode.trim().to_ascii_lowercase().as_str() {
+        "all" => format!("逐段导出（{} 段）", s.encode_total_segments()),
+        "custom" => format!("自定义分段（{}-{}）", e.start_seg, e.end_seg),
+        "time" => format!(
+            "自定义时间（{} → {}）",
+            time_text(e.range_start_ms, "开头"),
+            time_text(e.range_end_ms, "末尾")
+        ),
+        _ => "全部".to_string(),
     };
     let rate_value = match e.rate_control.as_str() {
         "cbr" | "vbr" => format!("码率：{} Mbps", e.bitrate.trim().trim_end_matches(['M', 'm'])),
@@ -201,7 +219,7 @@ pub fn configuration(s: &Settings) -> Vec<String> {
             if e.include_hud { "✓" } else { "×" }
         ),
         format!(
-            "分段导出：{seg}    分辨率：{resolution}    帧率：{}    导出倍速：{}x",
+            "导出范围：{seg}    分辨率：{resolution}    帧率：{}    导出倍速：{}x",
             if e.frame_rate == "source" {
                 "与原始视频一致"
             } else {
@@ -417,6 +435,48 @@ mod tests {
         s.encode.resolution = "2688x2016".into();
         let text = configuration(&s).join("\n");
         assert!(text.contains("分辨率：2688x2016"), "{text}");
+    }
+
+    #[test]
+    fn configuration_spells_out_the_export_range() {
+        let mut s = Settings::default();
+        s.encode.clip_mode = "none".into();
+        assert!(
+            configuration(&s).join("\n").contains("导出范围：全部"),
+            "{}",
+            configuration(&s).join("\n")
+        );
+        // 逐段导出带段数；自定义分段带分段点编号；自定义时间带起止。
+        s.encode.clip_mode = "all".into();
+        s.splits.split_times = "1|5|9".into();
+        s.encode.all_seg_enabled = true;
+        assert!(
+            configuration(&s).join("\n").contains("导出范围：逐段导出（3 段）"),
+            "{}",
+            configuration(&s).join("\n")
+        );
+        s.encode.clip_mode = "custom".into();
+        s.encode.seg_enabled = true;
+        s.encode.start_seg = 1;
+        s.encode.end_seg = 2;
+        assert!(
+            configuration(&s).join("\n").contains("导出范围：自定义分段（1-2）"),
+            "{}",
+            configuration(&s).join("\n")
+        );
+        s.encode.clip_mode = "time".into();
+        s.encode.range_start_ms = 65_000.0;
+        s.encode.range_end_ms = 150_000.0;
+        let text = configuration(&s).join("\n");
+        assert!(text.contains("导出范围：自定义时间（0:01:05 → 0:02:30）"), "{text}");
+        // 结束留空（0）表示到末尾。
+        s.encode.range_end_ms = 0.0;
+        let text = configuration(&s).join("\n");
+        assert!(text.contains("导出范围：自定义时间（0:01:05 → 末尾）"), "{text}");
+        // 开始留空（0）表示从开头。
+        s.encode.range_start_ms = 0.0;
+        let text = configuration(&s).join("\n");
+        assert!(text.contains("导出范围：自定义时间（开头 → 末尾）"), "{text}");
     }
 
     #[test]

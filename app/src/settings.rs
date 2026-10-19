@@ -376,8 +376,10 @@ pub struct SplitSettings {
 #[derive(Debug, Clone)]
 pub struct HudSettings {
     pub layout: Option<crate::hud::Layout>,
-    /// Whether HUD is painted in the interactive preview. Export uses include_hud.
-    pub preview_enabled: bool,
+    /// HUD 的绘制范围：`"video"`（跟随视频画面，默认，兼容旧工程）/ `"frame"`（整幅画面，
+    /// 可以摆到地图那半边）。没有视频面板时（只导地图+HUD，或预览里取消勾选「视频」）
+    /// 不论取哪个值都按整幅画面画 —— 否则 HUD 会被挤进宽度为 0 的视频区而整块消失。
+    pub scope: String,
     pub gpx_file_path: String,
     pub gpx_time_offset: f64,
     pub show_elapsed_time: bool,
@@ -407,6 +409,17 @@ pub struct EncodeSettings {
     pub audio_bitrate: String,
     pub clip_start_ms: f64,
     pub clip_end_ms: f64,
+    /// 「自定义时间」自己填的起止（毫秒，0 = 开头 / 到末尾）。
+    /// 独立于 `clip_start_ms`/`clip_end_ms`：那一对是**导出时**按模式推导出来的结果，
+    /// 切到「全部」会被归零；这里存的是用户填的值，切来切去都还在。
+    pub range_start_ms: f64,
+    pub range_end_ms: f64,
+    /// 导出范围（界面「导出范围」下拉的唯一真源）：
+    /// `"none"` 全部（整段导出，`clip_*` 归零）| `"all"` 逐段导出（每段一个文件）|
+    /// `"custom"` 自定义分段（按 `start_seg`/`end_seg` 推导 `clip_*`）|
+    /// `"time"` 自定义时间（`clip_start_ms`/`clip_end_ms` 就是界面上填的时间，不做推导）。
+    /// 旧文件没有这个键时按 `all_seg_enabled`/`seg_enabled` 反推（见 `from_ini`）。
+    pub clip_mode: String,
     /// Segment-based export boundaries. When `seg_enabled`, `clip_start_ms`/`clip_end_ms`
     /// are DERIVED from these point indices: `start_seg = a` → export begins at split point a
     /// (0 = the start line / departure time); `end_seg = b` → export ends at split point b
@@ -626,7 +639,7 @@ impl Default for Settings {
             },
             hud: HudSettings {
                 layout: Some(crate::hud::Layout::theme("campus")),
-                preview_enabled: true,
+                scope: "video".into(),
                 gpx_file_path: String::new(),
                 gpx_time_offset: 0.0,
                 show_elapsed_time: true,
@@ -650,6 +663,9 @@ impl Default for Settings {
                 audio_bitrate: "128k".to_string(),
                 clip_start_ms: 0.0,
                 clip_end_ms: 0.0,
+                range_start_ms: 0.0,
+                range_end_ms: 0.0,
+                clip_mode: "none".to_string(),
                 seg_enabled: false,
                 start_seg: 0,
                 end_seg: 0,
@@ -1091,7 +1107,7 @@ impl Settings {
                 Err(e) => log::warn!("HUD 布局加载失败，使用经典面板: {e}"),
             }
         }
-        s.hud.preview_enabled = ini.get_bool("hud", "previewEnabled", s.hud.preview_enabled);
+        s.hud.scope = ini.get_string("hud", "scope", &s.hud.scope);
         s.hud.gpx_time_offset = ini.get_f64("hud", "gpxTimeOffset", s.hud.gpx_time_offset);
         s.hud.show_elapsed_time = ini.get_bool("hud", "showElapsedTime", s.hud.show_elapsed_time);
         s.hud.show_segment_time = ini.get_bool("hud", "showSegmentTime", s.hud.show_segment_time);
@@ -1113,6 +1129,8 @@ impl Settings {
         s.encode.audio_bitrate = ini.get_string("encode", "audioBitrate", &s.encode.audio_bitrate);
         s.encode.clip_start_ms = ini.get_f64("encode", "clipStartMs", s.encode.clip_start_ms);
         s.encode.clip_end_ms = ini.get_f64("encode", "clipEndMs", s.encode.clip_end_ms);
+        s.encode.range_start_ms = ini.get_f64("encode", "rangeStartMs", s.encode.range_start_ms);
+        s.encode.range_end_ms = ini.get_f64("encode", "rangeEndMs", s.encode.range_end_ms);
         s.encode.output_file_path =
             ini.get_string("encode", "outputFilePath", &s.encode.output_file_path);
         s.encode.resolution = ini.get_string("encode", "resolution", &s.encode.resolution);
@@ -1142,6 +1160,23 @@ impl Settings {
         s.encode.seg_enabled = ini.get_bool("encode", "segEnabled", s.encode.seg_enabled);
         s.encode.all_seg_enabled =
             ini.get_bool("encode", "allSegEnabled", s.encode.all_seg_enabled);
+        // 旧文件没有 clipMode：按两个开关反推（逐段 > 自定义分段 > 全部）。
+        let derived_mode = if s.encode.all_seg_enabled {
+            "all"
+        } else if s.encode.seg_enabled {
+            "custom"
+        } else {
+            "none"
+        };
+        s.encode.clip_mode = ini.get_string("encode", "clipMode", derived_mode);
+        // 老文件只有 clipStartMs/clipEndMs（当时自定义时间直接写那一对），补到 range_* 上。
+        if s.encode.clip_mode.eq_ignore_ascii_case("time")
+            && s.encode.range_start_ms == 0.0
+            && s.encode.range_end_ms == 0.0
+        {
+            s.encode.range_start_ms = s.encode.clip_start_ms;
+            s.encode.range_end_ms = s.encode.clip_end_ms;
+        }
 
         s.gyro.enabled = ini.get_bool("gyro", "enabled", s.gyro.enabled);
         s.gyro.fov = ini.get_f64("gyro", "fov", s.gyro.fov);
@@ -1274,8 +1309,9 @@ impl Settings {
 
         // Segments are the source of truth for the export clip when enabled; concrete clip ms
         // are derived so every consumer (GUI + CLI) sees a consistent range. Legacy files
-        // (segEnabled = false) keep their stored clipStartMs/clipEndMs untouched.
-        if s.encode.seg_enabled {
+        // (segEnabled = false) keep their stored clipStartMs/clipEndMs untouched — except
+        // 「自定义时间」, whose clip ms 也要从 range_* 重新算出来，好让命令行导出看到同一个范围。
+        if s.encode.seg_enabled || s.encode.clip_mode.eq_ignore_ascii_case("time") {
             s.resolve_encode_clip_ms();
         }
 
@@ -1325,6 +1361,24 @@ impl Settings {
     /// `start=0,end=1` → [departure, 10] (length = 分段1); `start=1,end=3` → [10, 60]
     /// (length = 分段2+分段3). Control-time offsets cancel — verified against RouteManager.
     pub fn resolve_encode_clip_ms(&mut self) {
+        // 「自定义时间」：起止就是界面上填的那两个毫秒值（`range_*`），不参与分段推导。
+        // 填反了（结束 ≤ 开始）当没填，即到末尾。`range_*` 本身不动，切挡位回来还在。
+        if self.encode.clip_mode.eq_ignore_ascii_case("time") {
+            let start = if self.encode.range_start_ms.is_finite() && self.encode.range_start_ms > 0.0
+            {
+                self.encode.range_start_ms
+            } else {
+                0.0
+            };
+            self.encode.clip_start_ms = start;
+            self.encode.clip_end_ms =
+                if self.encode.range_end_ms.is_finite() && self.encode.range_end_ms > start {
+                    self.encode.range_end_ms
+                } else {
+                    0.0
+                };
+            return;
+        }
         if !self.encode.seg_enabled {
             self.encode.clip_start_ms = 0.0;
             self.encode.clip_end_ms = 0.0;
@@ -1560,11 +1614,7 @@ impl Settings {
             "showSegmentTime",
             &format!("{}", self.hud.show_segment_time),
         );
-        ini.set(
-            "hud",
-            "previewEnabled",
-            &format!("{}", self.hud.preview_enabled),
-        );
+        ini.set("hud", "scope", &self.hud.scope);
         ini.set("hud", "showSpeed", &format!("{}", self.hud.show_speed));
         ini.set("hud", "showPace", &format!("{}", self.hud.show_pace));
         ini.set(
@@ -1603,6 +1653,16 @@ impl Settings {
             "clipEndMs",
             &format!("{}", self.encode.clip_end_ms),
         );
+        ini.set(
+            "encode",
+            "rangeStartMs",
+            &format!("{}", self.encode.range_start_ms),
+        );
+        ini.set(
+            "encode",
+            "rangeEndMs",
+            &format!("{}", self.encode.range_end_ms),
+        );
         ini.set("encode", "startSeg", &format!("{}", self.encode.start_seg));
         ini.set("encode", "endSeg", &format!("{}", self.encode.end_seg));
         ini.set(
@@ -1615,6 +1675,7 @@ impl Settings {
             "segEnabled",
             &format!("{}", self.encode.seg_enabled),
         );
+        ini.set("encode", "clipMode", &self.encode.clip_mode);
         ini.set("encode", "outputFilePath", &self.encode.output_file_path);
         ini.set("encode", "resolution", &self.encode.resolution);
         ini.set("encode", "frameRate", &self.encode.frame_rate);
@@ -1874,9 +1935,9 @@ mod tests {
         ] {
             assert_eq!(actual.get("route", key), expected.get("route", key), "{key}");
         }
-        assert!(defaults.hud.preview_enabled);
+        assert_eq!(defaults.hud.scope, "video");
         let startup = Settings::load_orv("");
-        assert!(startup.hud.preview_enabled);
+        assert_eq!(startup.hud.scope, "video");
         assert_eq!(startup.hud.layout.unwrap().json(), crate::hud::Layout::theme("campus").json());
         assert_eq!(defaults.hud.layout.unwrap().json(), crate::hud::Layout::theme("campus").json());
         assert!(defaults.video.video_path.is_empty());
@@ -1943,13 +2004,13 @@ mod tests {
         current.encode.include_map = false;
         current.encode.include_video = true;
         current.encode.include_hud = false;
-        current.hud.preview_enabled = false;
+        current.hud.scope = "frame".into();
         let loaded = Settings::from_ini(&IniFile::parse(&current.to_ini()));
         assert!(!loaded.encode.include_map);
         assert!(loaded.encode.include_video);
         assert!(!loaded.encode.include_hud);
         assert!(!loaded.encode.map_only);
-        assert!(!loaded.hud.preview_enabled);
+        assert_eq!(loaded.hud.scope, "frame");
     }
 
     #[test]
@@ -2087,6 +2148,70 @@ mod tests {
             "got {}",
             s.encode.clip_end_ms
         );
+    }
+
+    /// 「导出范围 = 自定义时间」：起止就按填的时间用，不受分段开关影响，也不被归零；
+    /// 填反了（结束 ≤ 开始）当没填（clip_end_ms = 0 → 到末尾）。
+    #[test]
+    fn time_range_mode_uses_the_typed_bounds() {
+        let mut s = Settings::default();
+        s.encode.clip_mode = "time".into();
+        s.encode.range_start_ms = 12_500.0;
+        s.encode.range_end_ms = 48_000.0;
+        // 即使还留着分段开关，自定义时间也不该被分段推导覆盖。
+        s.encode.seg_enabled = true;
+        s.encode.start_seg = 0;
+        s.encode.end_seg = 1;
+        s.resolve_encode_clip_ms();
+        assert_eq!(s.encode.clip_start_ms, 12_500.0);
+        assert_eq!(s.encode.clip_end_ms, 48_000.0);
+
+        // 填反了 → 结束归零，即导出到末尾；用户填的值本身不改（切挡位回来还在）。
+        s.encode.range_start_ms = 30_000.0;
+        s.encode.range_end_ms = 10_000.0;
+        s.resolve_encode_clip_ms();
+        assert_eq!(s.encode.clip_start_ms, 30_000.0);
+        assert_eq!(s.encode.clip_end_ms, 0.0);
+        assert_eq!(s.encode.range_end_ms, 10_000.0);
+
+        // 只填开始 → 也是到末尾。
+        s.encode.range_end_ms = 0.0;
+        s.resolve_encode_clip_ms();
+        assert_eq!(s.encode.clip_start_ms, 30_000.0);
+        assert_eq!(s.encode.clip_end_ms, 0.0);
+
+        // 换个模式回到「全部」就照旧归零，但填过的起止还留着。
+        s.encode.clip_mode = "none".into();
+        s.resolve_encode_clip_ms();
+        assert_eq!(s.encode.clip_start_ms, 0.0);
+        assert_eq!(s.encode.clip_end_ms, 0.0);
+        assert_eq!(s.encode.range_start_ms, 30_000.0);
+    }
+
+    /// 「导出范围」四种模式要能从 .orv 里原样读回；老文件没有 clipMode 时按两个旧开关反推。
+    #[test]
+    fn clip_mode_roundtrips_and_defaults_from_legacy_flags() {
+        let mut s = Settings::default();
+        s.encode.clip_mode = "time".into();
+        s.encode.clip_start_ms = 1_000.0;
+        s.encode.clip_end_ms = 2_000.0;
+        let ini = s.to_ini();
+        assert!(ini.contains("clipMode=time"), "missing clipMode:\n{ini}");
+        let back = Settings::from_ini(&IniFile::parse(&ini));
+        assert_eq!(back.encode.clip_mode, "time");
+
+        // 老文件：无 clipMode 键。
+        let mut old = Settings::default();
+        old.encode.seg_enabled = true;
+        old.encode.all_seg_enabled = true;
+        let old_ini: String = old
+            .to_ini()
+            .lines()
+            .filter(|l| !l.starts_with("clipMode="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = Settings::from_ini(&IniFile::parse(&old_ini));
+        assert_eq!(parsed.encode.clip_mode, "all");
     }
 
     /// 颜色序列化必须保真不透明度（简洁/高亮的默认色都带 alpha），全不透明时收敛成 6 位，

@@ -38,6 +38,8 @@ struct PreviewControl {
     ph: usize,
     fps: f64,
     preview_perf: bool,
+    /// 当前播放倍速（worker 用它决定要不要「不等正好那一帧」）。
+    speed: f64,
     gyro: Option<Arc<Mutex<Vec<Option<Arc<Stabilizer>>>>>>,
 }
 
@@ -67,6 +69,14 @@ pub(crate) fn locate_video_seg(segs: &[VideoSeg], t_ms: f64) -> (usize, f64) {
         i += 1;
     }
     (i, (t_ms - segs[i].start_ms).max(0.0))
+}
+
+/// 预览该不该出声：有视频段，并且「导出 → 视频」勾着。
+///
+/// 没勾视频时预览画面里根本没有视频轨（见 `preview_layers`），声音也就没有对应的
+/// 画面，一并关掉 —— 用户的原话是「如果没有勾选视频的时候，就不要有声音了」。
+pub(crate) fn preview_audio_wanted(has_segments: bool, video_layer: bool) -> bool {
+    has_segments && video_layer
 }
 
 /// Locate the map owning global time `t_ms` on the stitched map timeline: `starts` holds
@@ -174,6 +184,10 @@ pub struct TraceReelItem {
     /// 「编码：中央处理器（AV1 · libsvtav1）｜解码：显卡硬解」）。
     /// 让用户不必去翻进程命令行就能确认编码器是否选对。
     encode_encoder_info: qt_property!(QString; NOTIFY encode_state_changed),
+    /// 这次导出用的配置说明（与「导出队列」里每项显示的是同一套文字，见
+    /// `export_queue::configuration`）。直接导出和队列导出都在开始编码时写入，
+    /// 进度弹窗直接显示它，两边就不必各写一份格式化代码。
+    encode_config: qt_property!(QString; NOTIFY encode_state_changed),
     encode_output: qt_property!(QString; NOTIFY encode_done_changed),
     /// True when the user aborted (partial fragmented mp4 is kept and playable).
     encode_aborted: qt_property!(bool; NOTIFY encode_done_changed),
@@ -225,6 +239,34 @@ pub struct TraceReelItem {
             QString::from(parts.join("|"))
         }
     ),
+    /// 诊断/回归：预览音频此刻是否有一条活着的解码会话。
+    /// 「没勾「导出 → 视频」就不出声」这条规则靠它断言（见 app/tests/hud_scope_probe.qml）。
+    debug_audio_running: qt_method!(fn debug_audio_running(&self) -> bool {
+        self.preview_audio
+            .as_ref()
+            .map(|pa| pa.running())
+            .unwrap_or(false)
+    }),
+    /// 诊断/回归：第 `index` 张地图上运动员当前的像素位置（"x,y"；没有这张地图
+    /// 或还没算过时返回空串）。
+    ///
+    /// 「关掉视频预览后运动员不动、只有轨迹在动」那条 bug 就是靠它断言的：没有视频
+    /// 帧落地时，运动员位置也必须跟着播放头往前走。
+    debug_runner_position: qt_method!(fn debug_runner_position(&self, index: i32) -> QString {
+        let Ok(i) = usize::try_from(index) else {
+            return QString::default();
+        };
+        match self.maps.get(i) {
+            Some(m) => match m.rm.routes.first() {
+                Some(r) => QString::from(format!(
+                    "{:.3},{:.3}",
+                    r.runner_position.0, r.runner_position.1
+                )),
+                None => QString::default(),
+            },
+            None => QString::default(),
+        }
+    }),
     queue_json: qt_property!(QString; NOTIFY queue_changed),
     queue_error: qt_property!(QString; NOTIFY queue_changed),
     queue_running: qt_property!(bool; NOTIFY queue_changed),
@@ -307,7 +349,8 @@ pub struct TraceReelItem {
                 self.finish_encode(false, "", "请至少选择一个导出内容：地图、视频或 HUD");
                 return;
             }
-            // Preview visibility is intentionally unrelated to export layer selection.
+            // 预览和导出用同一套勾选（见 `preview_layers`）：不导视频就是「只导地图+HUD」，
+            // 走 map-only 那条渲染路径，HUD 铺满整帧。
             settings.encode.map_only = !settings.encode.include_video;
             if !settings.encode.include_video {
                 settings.encode.audio_codec = "none".into();
@@ -325,6 +368,9 @@ pub struct TraceReelItem {
             let info = crate::encode::encoder_status_text(&settings.encode);
             eprintln!("[encode] {info}");
             self.encode_encoder_info = QString::from(info.as_str());
+            // 进度弹窗里的「导出配置」：和导出队列里每项显示的那几行完全同一套文字。
+            self.encode_config =
+                QString::from(crate::export_queue::configuration(&settings).join("\n").as_str());
             self.encode_state_changed();
             // 「全部逐段导出」：在「按分段导出」勾选的基础上，把每个分段各导出成一个独立文件
             // （文件名扩展名前追加 [起-止]）。所有分段 job 在同一个后台线程上串行编码、共享同一
@@ -552,7 +598,7 @@ pub struct TraceReelItem {
                 // retries a cold decoder. Because poll_preview_frame accepts any current-
                 // generation frame while paused, re-bumping the request id here does not cause
                 // published frames to be rejected (that was the "video never appears" bug).
-                if self.video_image.is_none() {
+                if self.video_layer_on() && self.video_image.is_none() {
                     self.request_preview_frame(self.t_ms);
                 }
                 self.poll_preview_frame();
@@ -634,10 +680,12 @@ pub struct TraceReelItem {
             }
             self.was_playing = true;
             // Retry the gyro load every tick while playing: covers the race where the user
-            // presses play before the async project apply has landed.
-            self.ensure_gyro_loaded();
-            self.request_preview_frame(self.t_ms);
-            self.poll_preview_frame();
+            // presses play before the async project apply has landed. 没有视频层就不必加载
+            // 防抖（它是逐帧处理视频用的）。
+            if self.video_layer_on() {
+                self.ensure_gyro_loaded();
+            }
+            self.pump_preview_frame();
             self.sync_preview_audio();
         }
     ),
@@ -658,8 +706,7 @@ pub struct TraceReelItem {
             if let Ok(mut c) = self.preview_control.lock() {
                 c.generation = c.generation.wrapping_add(1);
             }
-            self.request_preview_frame(self.t_ms);
-            self.poll_preview_frame();
+            self.pump_preview_frame();
         }
     ),
     set_playing: qt_method!(
@@ -855,17 +902,6 @@ pub struct TraceReelItem {
         }
     ),
 
-    /// Toggle HUD in the interactive preview without reloading video, map, route or gyro data.
-    apply_hud_preview: qt_method!(
-        fn apply_hud_preview(&mut self, enabled: bool) {
-            if let Some(s) = self.settings.as_mut() {
-                s.hud.preview_enabled = enabled;
-            }
-            let this: &dyn QQuickItem = &*self;
-            this.update();
-        }
-    ),
-
     // Internal rendering state (not exposed to QML).
     apply_hud: qt_method!(
         fn apply_hud(&mut self, json: QString) {
@@ -947,7 +983,7 @@ pub struct TraceReelItem {
     ),
     hud_viewport: qt_method!(
         fn hud_viewport(&self, width: f64, height: f64) -> QString {
-            let settings = self.settings.clone().unwrap_or_default();
+            let settings = preview_layers(self.settings.clone().unwrap_or_default());
             let size = self.video_image.as_ref().map(|image|
                 (qtwrap::qimage_width(image) as f64, qtwrap::qimage_height(image) as f64))
                 .or_else(|| self.video_info.as_ref().map(|info| (info.width as f64, info.height as f64)));
@@ -1057,6 +1093,8 @@ pub struct TraceReelItem {
     speed: f64,
     /// 预览音频引擎（ffmpeg→waveOut，atempo 保音调）；首次播放时创建。
     preview_audio: Option<crate::preview_audio::PreviewAudio>,
+    /// 预览音频是否已经因为「没有视频层」被关掉（避免每个 tick 都去 stop 一次）。
+    audio_off: bool,
 }
 
 impl TraceReelItem {
@@ -1126,6 +1164,9 @@ impl TraceReelItem {
         let info = crate::encode::encoder_status_text(&s.encode);
         eprintln!("[encode] {info}");
         self.encode_encoder_info = QString::from(info.as_str());
+        // 队列导出时弹窗显示的仍然是「这一项自己的配置」，不是当前工程的设置。
+        self.encode_config =
+            QString::from(crate::export_queue::configuration(&s).join("\n").as_str());
         self.set_encode_state(EncodeProgress::default());
         self.encode_segment = "正在准备队列任务…".into(); self.encode_state_changed(); self.publish_queue();
         std::thread::spawn(move || crate::export_queue::run(s, e.output, handle));
@@ -1139,12 +1180,75 @@ impl TraceReelItem {
         }
     }
 
+    /// 预览里的「视频层」开着没有：没勾「导出 → 视频」时预览根本不画视频
+    /// （见 `preview_layers`），于是解码、防抖、声音全都白干。
+    fn video_layer_on(&self) -> bool {
+        self.settings
+            .as_ref()
+            .map(|s| s.encode.include_video)
+            .unwrap_or(true)
+    }
+
+    /// 把每张地图的路线管理器推进到 `self.t_ms`：运动员位置与镜头取景都在
+    /// `RouteManager::update` 里算。
+    ///
+    /// 这一步以前只挂在「有视频帧落地」那条路径上（`poll_preview_frame`），于是关掉
+    /// 视频预览后没有任何帧落地，运动员和镜头就停在原处、只有轨迹在动 —— 用户
+    /// 报的正是这个 bug。现在没有视频层时由 [`Self::pump_preview_frame`] 每 tick
+    /// 推进一次。
+    fn advance_map_runners(&mut self) {
+        let (iw, ih) = (
+            qtwrap::qquick_item_width(self.get_cpp_object()),
+            qtwrap::qquick_item_height(self.get_cpp_object()),
+        );
+        let ft = if self.fps > 0.0 {
+            1000.0 / self.fps
+        } else {
+            16.0
+        };
+        for lm in &mut self.maps {
+            if iw > 0.0
+                && ih > 0.0
+                && ((lm.rm.window_width - iw).abs() > 1.0
+                    || (lm.rm.window_height - ih).abs() > 1.0)
+            {
+                lm.rm.window_resized(iw, ih);
+            }
+            lm.rm.update(self.t_ms / 1000.0, ft);
+        }
+    }
+
+    /// 让预览出一帧：视频层开着时照常向 worker 要点；关着时**不解码**，
+    /// 只按当前播放头重画一次（地图/轨迹/HUD 照样跟着走，倍速也不会被
+    /// 解码吞吐拖慢 —— 之前这里每帧都在解 4K，倍速越高越卡）。
+    fn pump_preview_frame(&mut self) {
+        if self.video_layer_on() {
+            self.request_preview_frame(self.t_ms);
+        }
+        self.poll_preview_frame();
+        if !self.video_layer_on() {
+            // 没有帧落地，就没有人推进运动员/镜头（见 `advance_map_runners`）。
+            self.advance_map_runners();
+            let this: &dyn QQuickItem = &*self;
+            this.update();
+        }
+    }
+
     /// 让预览音频跟随播放头：seek/接缝稳定期内暂停；正常播放时按当前段
     /// 与倍速下发播放请求（倍速变化或位置漂移会自动重启解码会话）。
     fn sync_preview_audio(&mut self) {
-        if self.segs.is_empty() {
+        if !preview_audio_wanted(!self.segs.is_empty(), self.video_layer_on()) {
+            // 没勾「导出 → 视频」：预览画面里没有视频轨，声音也不该响；
+            // 顺手把解码会话关掉（真停，不是暂停），别让它在后台空转。
+            if !self.audio_off {
+                self.audio_off = true;
+                if let Some(pa) = &self.preview_audio {
+                    pa.stop();
+                }
+            }
             return;
         }
+        self.audio_off = false;
         let sp = self.play_speed();
         let (si, local) = locate_video_seg(&self.segs, self.t_ms);
         let path = self.segs[si].path.clone();
@@ -1489,7 +1593,11 @@ impl TraceReelItem {
                 let mut rgba: Option<Vec<u8>> = None;
                 let mut pipe_dead = false;
                 if let Some(p) = decoder.as_mut() {
-                    rgba = p.get(t_snap).map(|f| f.as_ref().clone());
+                    // 1x 时要等"正好那一帧"（画面才准）；加速播放时时钟本来就跑在解码
+                    // 前面、注定要跳帧，等满 180ms 只会把每次 tick 都拖慢 —— 直接拿最新的。
+                    rgba = p
+                        .get_with(t_snap, req.playing && req.speed > 1.01)
+                        .map(|f| f.as_ref().clone());
                     pipe_dead = rgba.is_none() && p.dead();
                 }
                 if rgba.is_none() && pipe_dead {
@@ -1605,6 +1713,7 @@ impl TraceReelItem {
             c.gyro = self.gyro.clone();
             c.t_ms = self.t_ms;
             c.playing = self.playing;
+            c.speed = self.play_speed();
             self.preview_request_id = c.request_id;
         }
         if let Ok(mut s) = self.preview_frame.lock() {
@@ -1614,9 +1723,11 @@ impl TraceReelItem {
 
     fn request_preview_frame(&mut self, t_ms: f64) {
         self.ensure_preview_worker();
+        let speed = self.play_speed();
         if let Ok(mut c) = self.preview_control.lock() {
             c.t_ms = t_ms.max(0.0);
             c.playing = self.playing;
+            c.speed = speed;
             c.gyro = self.gyro.clone();
             c.request_id = c.request_id.wrapping_add(1);
             self.preview_request_id = c.request_id;
@@ -1660,30 +1771,10 @@ impl TraceReelItem {
                     frame.h as i32,
                     &frame.rgba,
                 ));
-                let (iw, ih) = (
-                    qtwrap::qquick_item_width(self.get_cpp_object()),
-                    qtwrap::qquick_item_height(self.get_cpp_object()),
-                );
                 // Update EVERY map's route manager, not just the one currently shown:
                 // after a mid-video map switch the new manager's runner/camera state must
                 // already be current (the cost is negligible compared to one frame).
-                {
-                    let ft = if self.fps > 0.0 {
-                        1000.0 / self.fps
-                    } else {
-                        16.0
-                    };
-                    for lm in &mut self.maps {
-                        if iw > 0.0
-                            && ih > 0.0
-                            && ((lm.rm.window_width - iw).abs() > 1.0
-                                || (lm.rm.window_height - ih).abs() > 1.0)
-                        {
-                            lm.rm.window_resized(iw, ih);
-                        }
-                        lm.rm.update(self.t_ms / 1000.0, ft);
-                    }
-                }
+                self.advance_map_runners();
                 let this: &dyn QQuickItem = &*self;
                 this.update();
                 self.shown_seg = Some(frame.seg_idx);
@@ -2202,7 +2293,7 @@ impl QQuickItem for TraceReelItem {
 
 impl QQuickPaintedItem for TraceReelItem {
     fn paint(&mut self, p: &mut QPainter) {
-        let Some(mut settings) = self.settings.as_ref().cloned() else {
+        let Some(settings) = self.settings.as_ref().cloned() else {
             return;
         };
         // Pick the active map by global timeline: the one with the greatest start_ms
@@ -2236,7 +2327,9 @@ impl QQuickPaintedItem for TraceReelItem {
             || !settings.map.image_file_path.trim().is_empty()
             || !settings.route.quick_route_jpeg_file_path.trim().is_empty()
             || !settings.hud.gpx_file_path.trim().is_empty();
-        if !has_project_content || !settings.hud.preview_enabled {
+        // 预览按导出页的三个勾选合成：没勾的层不画，剩下的铺满画布。
+        let mut settings = preview_layers(settings);
+        if !has_project_content {
             settings.hud.layout = Some(crate::hud::Layout {
                 version: 1,
                 widgets: Vec::new(),
@@ -2246,8 +2339,16 @@ impl QQuickPaintedItem for TraceReelItem {
             p,
             &rm,
             &settings,
-            map_image,
-            self.video_image.clone(),
+            if settings.encode.include_map {
+                map_image
+            } else {
+                None
+            },
+            if settings.encode.include_video {
+                self.video_image.clone()
+            } else {
+                None
+            },
             W,
             H,
             self.t_ms,
@@ -2255,6 +2356,28 @@ impl QQuickPaintedItem for TraceReelItem {
             self.gpx.as_ref(),
         );
     }
+}
+
+/// 预览画面按「导出页勾了哪几层」合成：没勾的层不画，勾了的铺满画布。
+///
+/// 预览以前有自己的「HUD 预览」开关，和导出勾选各管各的，结果勾掉 HUD 导出、预览却还在画，
+/// 或者只导地图+HUD 时预览画不出成品的样子。现在只有一套真相（`encode.include_*`）：
+/// 这里把它翻译成 `draw_scene` 认的版面参数 —— 去掉地图就把地图带宽归零（视频铺满），
+/// 去掉视频就让地图占满整帧，去掉 HUD 就把布局清空。
+pub fn preview_layers(mut s: Settings) -> Settings {
+    if !s.encode.include_map {
+        s.map.relative_width = 0.0;
+    }
+    if !s.encode.include_video {
+        s.map.relative_width = 1.0;
+    }
+    if !s.encode.include_hud {
+        s.hud.layout = Some(crate::hud::Layout {
+            version: 1,
+            widgets: Vec::new(),
+        });
+    }
+    s
 }
 
 /// Composite the map + route (left) and video (right) onto `p`. Shared by the GUI
@@ -2853,6 +2976,9 @@ const ROUTE_DISPLAY_KEYS: &[(&str, &str)] = &[
     ("map", "angle"),
     ("map", "userAngle"),
     ("map", "userScale"),
+    // HUD 的显示范围只决定 HUD 落在哪块区域（视频区/整幅画面），不碰任何素材，
+    // 就地重画就够，不必为下拉一下重载视频。
+    ("hud", "scope"),
 ];
 
 /// 比较两份设置的规范化 `.orv` 文本（`IniFile` 用 `BTreeMap`，顺序稳定），忽略
@@ -3911,6 +4037,44 @@ pub fn processing_size(w: usize, h: usize, cap_h: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 预览版面完全由导出页的三个勾选决定：勾掉的层不出现，剩下的铺满画布。
+    #[test]
+    fn preview_layers_follow_export_selection() {
+        let mut base = Settings::default();
+        base.map.image_file_path = "map.png".into();
+        base.map.relative_width = 0.3;
+        // 三勾全开：版面就是设置里的样子。
+        let all = preview_layers(base.clone());
+        assert_eq!(all.map.relative_width, 0.3);
+        assert!(all.hud.layout.as_ref().is_some_and(|l| !l.widgets.is_empty()));
+        // 不导地图：左边不留黑带，视频铺满。
+        let mut no_map = base.clone();
+        no_map.encode.include_map = false;
+        assert_eq!(preview_layers(no_map).map.relative_width, 0.0);
+        // 不导视频：地图铺满整帧（只导地图+HUD 的场景）。
+        let mut no_video = base.clone();
+        no_video.encode.include_video = false;
+        assert_eq!(preview_layers(no_video).map.relative_width, 1.0);
+        // 不导 HUD：布局清空，画面上不再有 HUD。
+        let mut no_hud = base.clone();
+        no_hud.encode.include_hud = false;
+        assert!(preview_layers(no_hud)
+            .hud
+            .layout
+            .as_ref()
+            .is_some_and(|l| l.widgets.is_empty()));
+    }
+
+    /// 预览出声要同时满足「有视频段」和「导出页勾了视频」：没勾视频时预览里
+    /// 根本没有视频轨，声音也就没有了（用户 m01139 的原话）。
+    #[test]
+    fn preview_audio_needs_the_video_layer() {
+        assert!(preview_audio_wanted(true, true));
+        assert!(!preview_audio_wanted(true, false));
+        assert!(!preview_audio_wanted(false, true));
+        assert!(!preview_audio_wanted(false, false));
+    }
 
     /// `.qrt` 路径识别：只认扩展名，大小写不敏感，且拒绝空路径。
     #[test]

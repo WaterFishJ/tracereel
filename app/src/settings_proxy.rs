@@ -251,13 +251,15 @@ pub struct SettingsProxy {
     encode_bitrate: qt_property!(QString),
     encode_preset: qt_property!(QString),
     encode_audio_codec: qt_property!(QString),
+    /// 「自定义时间」自己填的起止（毫秒；0 = 开头 / 到末尾）。读写的是 `encode.range_*`，
+    /// 不是在导出时按模式推导的 `clip_*`，所以切到别的挡位再切回来值还在。
     encode_clip_start_ms: qt_property!(f64),
     encode_clip_end_ms: qt_property!(f64),
-    /// Friendly seconds aliases for the export time range (backed by the ms fields).
     encode_start_seg: qt_property!(i32),
     encode_end_seg: qt_property!(i32),
-    /// 「分段导出」下拉：`none`（不分段）/ `all`（逐段导出）/ `custom`（自定义 xx-xx）。
-    /// UI 的唯一真源，落盘时推导成底层的 `seg_enabled` / `all_seg`（.orv 格式不变）。
+    /// 「导出范围」下拉：`none`（全部）/ `all`（逐段导出）/ `custom`（自定义分段 xx-xx）/
+    /// `time`（自定义时间）。UI 的唯一真源，落盘成 `clipMode` 并推导底层的
+    /// `seg_enabled` / `all_seg`（.orv 向后兼容）。
     encode_seg_mode: qt_property!(QString),
     encode_seg_enabled: qt_property!(bool),
     /// 「全部逐段导出」：勾选后忽略开始/结束分段，导出每个分段各一个文件。
@@ -273,7 +275,7 @@ pub struct SettingsProxy {
 
     // ---- hud ----
     hud_layout: qt_property!(QString),
-    hud_preview: qt_property!(bool),
+    hud_scope: qt_property!(QString),
     hud_gpx_offset: qt_property!(f64),
     hud_theme: qt_method!(
         fn hud_theme(&self, name: QString) -> QString {
@@ -541,13 +543,17 @@ impl SettingsProxy {
         self.encode_bitrate = QString::from(s.encode.bitrate.as_str());
         self.encode_preset = QString::from(s.encode.preset.as_str());
         self.encode_audio_codec = QString::from(s.encode.audio_codec.as_str());
-        self.encode_clip_start_ms = s.encode.clip_start_ms;
-        self.encode_clip_end_ms = s.encode.clip_end_ms;
+        self.encode_clip_start_ms = s.encode.range_start_ms;
+        self.encode_clip_end_ms = s.encode.range_end_ms;
         self.encode_start_seg = s.encode.start_seg;
         self.encode_end_seg = s.encode.end_seg;
         self.encode_seg_enabled = s.encode.seg_enabled;
         self.encode_all_seg = s.encode.all_seg_enabled;
-        self.encode_seg_mode = QString::from(if !s.encode.seg_enabled {
+        // 「导出范围」的四种取值以 clip_mode 为准（"time" 无法从两个旧开关反推）。
+        let mode = s.encode.clip_mode.trim().to_ascii_lowercase();
+        self.encode_seg_mode = QString::from(if matches!(mode.as_str(), "none" | "all" | "custom" | "time") {
+            mode.as_str()
+        } else if !s.encode.seg_enabled {
             "none"
         } else if s.encode.all_seg_enabled {
             "all"
@@ -563,7 +569,7 @@ impl SettingsProxy {
         self.encode_include_hud = s.encode.include_hud;
         self.encode_output_path = QString::from(s.encode.output_file_path.as_str());
 
-        self.hud_preview = s.hud.preview_enabled;
+        self.hud_scope = QString::from(s.hud.scope.as_str());
         self.hud_gpx_path = QString::from(s.hud.gpx_file_path.as_str());
         self.hud_layout = QString::from(
             s.hud
@@ -730,10 +736,15 @@ impl SettingsProxy {
         s.encode.bitrate = self.encode_bitrate.to_string();
         s.encode.preset = self.encode_preset.to_string();
         s.encode.audio_codec = self.encode_audio_codec.to_string();
+        // 「自定义时间」的那两个框：存到 range_*（clip_* 是导出时按模式推导的，会被归零）。
+        s.encode.range_start_ms = self.encode_clip_start_ms;
+        s.encode.range_end_ms = self.encode_clip_end_ms;
         s.encode.start_seg = self.encode_start_seg;
         s.encode.end_seg = self.encode_end_seg;
         // 分段导出：下拉模式是唯一真源，由它推出底层两个开关（老工程按开关推出模式，见 apply_settings）。
-        match self.encode_seg_mode.to_string().as_str() {
+        let seg_mode = self.encode_seg_mode.to_string().to_ascii_lowercase();
+        s.encode.clip_mode = seg_mode.clone();
+        match seg_mode.as_str() {
             "none" => {
                 s.encode.seg_enabled = false;
                 s.encode.all_seg_enabled = false;
@@ -741,6 +752,11 @@ impl SettingsProxy {
             "all" => {
                 s.encode.seg_enabled = true;
                 s.encode.all_seg_enabled = true;
+            }
+            // 「自定义时间」不走分段推导：起止时间就是 encode_clip_start_ms/end_ms（上面已写入）。
+            "time" => {
+                s.encode.seg_enabled = false;
+                s.encode.all_seg_enabled = false;
             }
             _ => {
                 s.encode.seg_enabled = true;
@@ -756,7 +772,7 @@ impl SettingsProxy {
         s.encode.map_only = !s.encode.include_video;
         s.encode.output_file_path = self.encode_output_path.to_string();
 
-        s.hud.preview_enabled = self.hud_preview;
+        s.hud.scope = self.hud_scope.to_string();
         s.hud.gpx_file_path = self.hud_gpx_path.to_string();
         s.hud.layout = crate::hud::Layout::parse(&self.hud_layout.to_string()).ok();
         s.hud.gpx_time_offset = self.hud_gpx_offset;

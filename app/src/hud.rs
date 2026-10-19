@@ -267,6 +267,28 @@ impl Layout {
     }
 }
 
+/// 总用时的封顶时刻（秒，出发后经过的秒数）：**最后一个分段点**。
+///
+/// 视频通常比比赛长（跑完还举着相机走一段、或录到收工），总用时若一直跟着视频涨，
+/// 冲线之后画面上的「总用时」就变成没有意义的时长，回放时也看不出最终成绩。
+/// 所以总用时的读数到最后一个分段点为止，之后冻结在终点成绩上。
+///
+/// 分段列表为空（没填分段点）时没有终点可依，返回 `None`，总用时按原样跟随视频时刻。
+/// 扫描 GPX / 轨迹末点来决定终点是不对的：那两份数据往往一边多录了几秒、
+/// 或者终点之后还在走，真正的终点成绩只有分段表说得清楚。
+pub fn elapsed_freeze_s(settings: &Settings) -> Option<f64> {
+    let info = tracereel_core::splits::build_runner_info(
+        &settings.splits.split_times,
+        settings.splits.is_relative,
+    );
+    // splits[0] 是隐式起点(t=0)，至少要有一个真实分段点才谈得上终点。
+    let last = info.splits.last()?;
+    if info.splits.len() < 2 {
+        return None;
+    }
+    Some(last.absolute_time.max(0.0))
+}
+
 pub fn duration(seconds: f64) -> String {
     let n = (seconds.max(0.0) * 10.0).round() as u64;
     let (h, m, s, d) = (n / 36000, n / 600 % 60, n / 10 % 60, n % 10);
@@ -312,7 +334,11 @@ fn segment(elapsed: f64, s: &Settings) -> String {
 cpp! {{
     #include "hud_painter.h"
 }}
-/// HUD coordinates belong to the fitted video, not the composite map/video canvas.
+/// HUD 的绘制范围（归一化坐标的参考系）。
+///
+/// 默认沿用老规矩：归到「贴合后的视频画面」里，不压地图也不压黑边；`hud.scope = "frame"`
+/// 时改成整幅画面，HUD 就能摆到地图那半边。没有视频面板时（只导地图+HUD，或预览里取消
+/// 勾选「视频」）一律按整幅画面算 —— 那时候视频区宽度是 0，再按老规矩画 HUD 会整块消失。
 pub fn viewport(
     settings: &Settings,
     width: f64,
@@ -326,7 +352,15 @@ pub fn viewport(
             .extra_map_files
             .iter()
             .any(|p| !p.trim().is_empty());
-    let left = if map_configured {
+    if !settings.encode.include_video || settings.hud.scope.eq_ignore_ascii_case("frame") {
+        return QRectF {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+        };
+    }
+    let left = if map_configured && settings.encode.include_map {
         settings.map.relative_width.clamp(0.0, 1.0) * width
     } else {
         0.0
@@ -385,6 +419,16 @@ pub fn hud_track_offset(s: &Settings) -> f64 {
     s.hud.gpx_time_offset - s.video.start_time_offset_s
 }
 
+/// 某一帧上「总用时 / 分段用时」要显示的两个秒数（**HUD 显示的唯一真相**）。
+///
+/// 总用时 = `视频时刻 − 录像-出发时间`，并在最后一个分段点封顶（见 [`elapsed_freeze_s`]）；
+/// 分段用时不受影响，照常跟随视频时刻 —— 冲线后镜头里其他读数不会集体停住。
+pub fn elapsed_values(settings: &Settings, t_ms: f64) -> (f64, f64) {
+    let elapsed = (t_ms / 1000.0 - settings.video.start_time_offset_s).max(0.0);
+    let total = elapsed_freeze_s(settings).map_or(elapsed, |end| elapsed.min(end));
+    (total, elapsed)
+}
+
 pub fn draw(
     p: &mut QPainter,
     settings: &Settings,
@@ -393,7 +437,7 @@ pub fn draw(
     width: f64,
     height: f64,
 ) {
-    let elapsed = (t_ms / 1000.0 - settings.video.start_time_offset_s).max(0.0);
+    let (elapsed_total, elapsed) = elapsed_values(settings, t_ms);
     let gpx_offset = hud_track_offset(settings);
     let sample = track.and_then(|t| t.sample_at(t_ms / 1000.0, gpx_offset));
     let ht = track.and_then(|t| t.hud_at(t_ms / 1000.0, gpx_offset));
@@ -408,7 +452,7 @@ pub fn draw(
         "speed":sample.map(|s|s.speed_kmh), "heading":ht.and_then(|v|v.0),
         "elevation":sample.and_then(|s|s.altitude_m),"heart_rate":sample.and_then(|s|s.heart_rate),
         "distance":sample.map(|s|s.distance_km),"pace":sample.map(|s| if s.pace_min_km>0.0 {format!("{} /km",duration(s.pace_min_km*60.0))} else {"-- /km".into()}),
-        "elapsed":duration(elapsed),"segment":segment(elapsed,settings),
+        "elapsed":duration(elapsed_total),"segment":segment(elapsed,settings),
         "phase":ht.map(|v|v.1).unwrap_or(0.0),"max_speed":track.map(|t|t.hud_max_speed()).unwrap_or(30.0),
         "track_time":t_ms/1000.0+gpx_offset,
         "classic_flags":[settings.hud.show_elapsed_time,settings.hud.show_segment_time,settings.hud.show_speed,
@@ -632,6 +676,37 @@ mod tests {
         s.map.extra_map_files = vec!["second.png".into()];
         assert_eq!(viewport(&s, 1920.0, 1080.0, None).x, 480.0);
     }
+
+    /// 「整幅画面」这一挡：HUD 能压到地图上，坐标从画布左上角起算。
+    /// 以及没有视频面板时（只导地图+HUD）必须自动铺满，否则宽度为 0、HUD 整块看不见。
+    #[test]
+    fn hud_viewport_follows_the_scope_setting_and_needs_a_video_panel() {
+        let mut s = Settings::default();
+        s.map.image_file_path = "map.png".into();
+        s.map.relative_width = 0.25;
+        // 默认还是贴着视频画面。
+        assert_eq!(viewport(&s, 1920.0, 1080.0, Some((1920.0, 1080.0))).x, 480.0);
+        s.hud.scope = "frame".into();
+        let frame = viewport(&s, 1920.0, 1080.0, Some((1920.0, 1080.0)));
+        assert_eq!(
+            (frame.x, frame.y, frame.width, frame.height),
+            (0.0, 0.0, 1920.0, 1080.0)
+        );
+        // 回到「视频区」，但这次不导出视频（地图铺满整帧）：HUD 自动改成整幅画面。
+        s.hud.scope = "video".into();
+        s.encode.include_video = false;
+        s.map.relative_width = 1.0;
+        let map_only = viewport(&s, 1920.0, 1080.0, None);
+        assert_eq!(
+            (map_only.x, map_only.y, map_only.width, map_only.height),
+            (0.0, 0.0, 1920.0, 1080.0)
+        );
+        // 不导出地图时，左边的黑带不该被算进 HUD 的范围（画面占比仍是 0.25）。
+        s.encode.include_video = true;
+        s.encode.include_map = false;
+        s.map.relative_width = 0.0;
+        assert_eq!(viewport(&s, 1920.0, 1080.0, Some((1920.0, 1080.0))).x, 0.0);
+    }
     #[test]
     fn durations_and_segment_boundaries() {
         assert_eq!(duration(7.76), "7.8");
@@ -649,6 +724,74 @@ mod tests {
         s.splits.split_times.clear();
         assert_eq!(segment(15.0, &s), "-- | --");
     }
+    #[test]
+    fn elapsed_freezes_at_the_last_split() {
+        let mut s = Settings::default();
+        // 绝对分段点：最后一个是终点成绩 1304 s（孝德湖实测值）。
+        s.splits.split_times = "10|20|1304".into();
+        s.splits.is_relative = false;
+        assert_eq!(elapsed_freeze_s(&s), Some(1304.0));
+        // 相对分段点按累加：33+63+41 = 137。
+        s.splits.is_relative = true;
+        s.splits.split_times = "33|63|41".into();
+        assert_eq!(elapsed_freeze_s(&s), Some(137.0));
+    }
+
+    #[test]
+    fn elapsed_has_no_freeze_point_without_splits() {
+        let mut s = Settings::default();
+        // 一个分段点都没有：没有终点可依，只能跟着视频走。
+        assert_eq!(elapsed_freeze_s(&s), None);
+        // 只有隐式起点（空串 / 全是分隔符）同样是 None，不能把总用时钉死在 0。
+        s.splits.split_times = "||;".into();
+        assert_eq!(elapsed_freeze_s(&s), None);
+        // 只有一个分段点也是合法的终点成绩。
+        s.splits.split_times = "1304".into();
+        s.splits.is_relative = false;
+        assert_eq!(elapsed_freeze_s(&s), Some(1304.0));
+    }
+
+    /// 总用时冲线即停，同一帧的分段用时（以及其他读数）仍跟着视频时刻走。
+    /// 断言走的是 `draw` 用的同一条路径（`elapsed_values` → `duration`），
+    /// 所以这里验的是画面上的读数，而不只是辅助函数。
+    #[test]
+    fn only_elapsed_freezes_past_the_last_split() {
+        let mut s = Settings::default();
+        s.splits.split_times = "10|20|30".into();
+        s.splits.is_relative = false;
+        // 视频 90 s 处已冲线：总用时停在 30.0 s，分段用时仍是 90.0 s。
+        let (total, segment_s) = elapsed_values(&s, 90_000.0);
+        assert_eq!(duration(total), "30.0");
+        assert_eq!(duration(segment_s), "1:30.0");
+        // 冲线之前两者一致，错过终点线不会提前封顶。
+        let (total, segment_s) = elapsed_values(&s, 25_000.0);
+        assert_eq!(duration(total), "25.0");
+        assert_eq!(duration(segment_s), "25.0");
+        // 恰好落在终点线上还是 30.0。
+        let (total, _) = elapsed_values(&s, 30_000.0);
+        assert_eq!(duration(total), "30.0");
+    }
+
+    /// 孝德湖实测：分段累加 1304 s、录像-出发时间 17 s ⇒ 冲线落在视频 1321 s。
+    /// 视频还要多录一段时（这里取 1400 s），画面上的总用时必须停在 21:44.0。
+    #[test]
+    fn real_project_elapsed_stops_at_the_finish() {
+        let mut s = Settings::default();
+        s.video.start_time_offset_s = 17.0;
+        s.splits.is_relative = true;
+        s.splits.split_times =
+            "0:33|1:03|1:29|0:41|2:05|0:37|1:17|2:19|0:43|1:08|0:25|2:05|0:58|0:45|1:05|0:32|1:07|0:36|0:37|0:24|0:34|0:41"
+                .into();
+        assert_eq!(elapsed_freeze_s(&s), Some(1304.0));
+        // 冲线时刻：视频 1321 s（= 1304 + 17）读到的总用时正好是终点成绩。
+        let (total, _) = elapsed_values(&s, 1_321_000.0);
+        assert_eq!(duration(total), "21:44.0");
+        // 之后视频继续跑到 1400 s，总用时不再增长。
+        let (total, segment_s) = elapsed_values(&s, 1_400_000.0);
+        assert_eq!(duration(total), "21:44.0");
+        assert_eq!(duration(segment_s), "23:03.0");
+    }
+
     #[test]
     fn layout_roundtrip_and_validation() {
         for theme in ["campus", "park", "simple", "modern", "classic", "outdoor"] {

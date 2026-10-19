@@ -224,15 +224,32 @@ ApplicationWindow {
         }
     }
     // A field whose underlying value is a 0..1 fraction but is edited as 0-100% (画面占比).
+    //
+    // `forcedFull` 用在「没有视频」的时候：这时候地图本来就铺满整帧，存着的占比不起作用，
+    // 所以灰掉只读、固定显示 100%，悬停给出原因。注意只改显示，不回写设置 —— 视频再勾回来
+    // 时用户原来调的占比还在。
     component PercentSpin: RowLayout {
+        id: pct
         property string label
         property string prop
+        property bool forcedFull: false
+        property string hint: ""
         width: parent.width
         spacing: 6
-        Label { text: label; Layout.preferredWidth: 150; color: Theme.text; elide: Text.ElideRight; font.pixelSize: 13 }
+        Label {
+            text: pct.label; Layout.preferredWidth: 150
+            color: pct.forcedFull ? Theme.muted : Theme.text
+            elide: Text.ElideRight; font.pixelSize: 13
+        }
         TextField {
             Layout.fillWidth: true; Layout.preferredHeight: 28
-            text: { win.refreshTick; var v = settings[prop]; return v === undefined ? "" : (v * 100).toFixed(1) }
+            enabled: !pct.forcedFull
+            text: {
+                win.refreshTick
+                if (pct.forcedFull) return "100.0"
+                var v = settings[prop]
+                return v === undefined ? "" : (v * 100).toFixed(1)
+            }
             onEditingFinished: {
                 var v = (parseFloat(text) || 0)
                 if (v < 0) v = 0
@@ -241,7 +258,13 @@ ApplicationWindow {
                 win.applyChange(prop, label + " = " + v + "%")
             }
             font.pixelSize: 13
+            // 悬停提示挂在整行上而不是输入框上：输入框灰显时它自己收不到悬停事件，
+            // 那样「为什么灰着」就永远提示不出来。
+            ToolTip.visible: pctHover.hovered && pct.hint.length > 0
+            ToolTip.text: pct.hint
+            ToolTip.delay: 300
         }
+        HoverHandler { id: pctHover }
     }
     component Spin: RowLayout {
         property string label
@@ -738,15 +761,9 @@ ApplicationWindow {
                     onEditingFinished: { trackModel.setProperty(index, "path", text); trackList.writeBack() }
                     onPicked: function (value) {
                         trackModel.setProperty(index, "path", value)
-                        // .qrt 工程文件带分段（Handle）数据时，先问是否导入，再落地路径。
-                        if (item.qrt_has_splits(value)) {
-                            win.appendLog("INFO", "检测到 .qrt 分段，等待确认: " + value)
-                            trackList.pendingQrtIndex = index
-                            trackList.pendingQrtPath = value
-                            qrtSplitDialog.open()
-                            return
-                        }
-                        trackList.writeBack()
+                        // .qrt 工程文件带分段（Handle）数据时按「当前有没有分段」决定：
+                        // 没有就直接导入，有才弹窗问（见 offerQrtSplits）。
+                        win.offerQrtSplits(value, index)
                     }
                 }
                 Label { text: "换图时间"; Layout.preferredWidth: 60; color: Theme.text; elide: Text.ElideRight; font.pixelSize: 13 }
@@ -828,6 +845,7 @@ ApplicationWindow {
         property string prop
         property var values
         property var labels
+        property string hint: ""
         /// 选中后额外通知（例如「分段导出」要联动底层开关、分辨率要刷新预览宽高比）。
         signal picked(int index)
         width: parent.width
@@ -839,6 +857,10 @@ ApplicationWindow {
             currentIndex: { win.refreshTick; var v = String(settings[prop]); var i = values.indexOf(v); return i < 0 ? 0 : i }
             onActivated: { settings[prop] = values[currentIndex]; win.applyChange(prop, label + " = " + labels[currentIndex]); comboV.picked(currentIndex) }
             font.pixelSize: 13
+            HoverHandler { id: comboHover }
+            ToolTip.visible: comboHover.hovered && comboV.hint.length > 0
+            ToolTip.text: comboV.hint
+            ToolTip.delay: 300
         }
     }
     // 滑杆 + 数值框（对应原版 Gyroflow 的 SliderWithField）。
@@ -911,6 +933,38 @@ ApplicationWindow {
         ToolTip.visible: sfHover.hovered && sf.hint.length > 0
         ToolTip.text: sf.hint
         ToolTip.delay: 300
+    }
+    // 导出进度统计（直接导出的「编码」窗口与导出队列里正在导出的那一项共用）：
+    // 只要「已用时 / 剩余用时 / 当前帧 / 总帧数 / 帧/秒」这五项 —— 用户明确要求
+    // 两个弹窗一致，其余的（总用时、视频当前/总长、输出大小）都不再显示。
+    component ExportStats: GridLayout {
+        property int statColumns: 2
+        columns: statColumns
+        columnSpacing: 16
+        rowSpacing: 2
+        Label { text: "已用时"; color: Theme.muted; font.pixelSize: 12 }
+        Label { text: win.fmtClock(item.encode_elapsed_s); color: Theme.text; font.pixelSize: 12 }
+        Label { text: "剩余用时"; color: Theme.muted; font.pixelSize: 12 }
+        Label {
+            text: item.encoding ? win.fmtClock(item.encode_remaining_s) : "--:--:--"
+            color: Theme.text; font.pixelSize: 12
+        }
+        Label { text: "当前帧"; color: Theme.muted; font.pixelSize: 12 }
+        Label { text: "" + win.num(item.encode_frame); color: Theme.text; font.pixelSize: 12 }
+        Label { text: "总帧数"; color: Theme.muted; font.pixelSize: 12 }
+        Label { text: "" + win.num(item.encode_total_frames); color: Theme.text; font.pixelSize: 12 }
+        Label { text: "帧/秒"; color: Theme.muted; font.pixelSize: 12 }
+        Label { text: win.num(item.encode_fps).toFixed(1); color: Theme.text; font.pixelSize: 12 }
+    }
+    // 导出配置（与导出队列每项显示的同一段文字，见 `item.encode_config`）。
+    component ExportConfigText: Label {
+        property string configText: ""
+        text: configText
+        visible: text.length > 0
+        color: Theme.muted
+        wrapMode: Text.Wrap
+        font.pixelSize: 12
+        Layout.fillWidth: true
     }
     // 折叠区「高级选项」（对齐原版 components/AdvancedSection.qml）：
     // 居中的强调色按钮 + 高度/透明度 700ms OutExpo 动画；展开后关掉 height 动画避免常驻开销。
@@ -1387,6 +1441,33 @@ ApplicationWindow {
         win.refreshFields()
         appendLog("INFO", "跳转到分段 " + (rowIndex + 1) + " 的起点（" + win.fmtTime(ms) + "）")
     }
+    // 时间文本 → 毫秒（「导出范围」的自定义时间用）。接受 `时:分:秒`、`分:秒`、纯秒。
+    function parseTimeMs(text) {
+        var s = String(text || "").trim()
+        if (s.length === 0) return NaN
+        var parts = s.split(":")
+        if (parts.length > 3) return NaN
+        var total = 0
+        for (var i = 0; i < parts.length; i++) {
+            var v = Number(parts[i])
+            if (!isFinite(v) || v < 0) return NaN
+            total = total * 60 + v
+        }
+        return total * 1000
+    }
+    // 「导出范围 = 自定义时间」：写回起止毫秒（结束留空/填 0 = 到末尾）。空文本清成 0。
+    function setClipTime(which, text) {
+        var ms = win.parseTimeMs(text)
+        if (!isFinite(ms)) ms = 0
+        if (which === "start") settings.encode_clip_start_ms = ms
+        else settings.encode_clip_end_ms = ms
+        settings.encode_seg_mode = "time"
+        settings.encode_seg_enabled = false
+        settings.encode_all_seg = false
+        win.refreshFields()
+        win.applyChange("encode_clip_start_ms", "导出时间范围 = " + win.fmtTime(settings.encode_clip_start_ms) +
+                        " → " + (settings.encode_clip_end_ms > 0 ? win.fmtTime(settings.encode_clip_end_ms) : "末尾"))
+    }
     // 「分段范围」输入框（xx-xx）→ 起始/结束分段点。
     function setSegRange(text) {
         var parts = String(text || "").split("-")
@@ -1504,6 +1585,30 @@ ApplicationWindow {
         applyNow(prop, note === undefined ? (prop + " = " + value) : note)
         return debugPreviewState()
     }
+    // 读「编码」窗口 / 「导出队列」里的文案（自动化用）：这两个窗口是 gui.qml 的内部对象，
+    // QML 没有「按标题找窗口」的接口，所以由这里把内容摊平后交出去。
+    // which = "encode" | "queue"；返回 { texts: [...], config: "...", stats: N }。
+    function debugExportWindow(which) {
+        var w = (which === "queue") ? queueWindow : encodeWin
+        var out = { texts: [], config: "", stats: 0 }
+        if (w) collectExportTexts(w.contentItem, out)
+        return out
+    }
+    // 自动化用：把握手窗口抓成图片（异步保存到 filePath），返回是否已发起。
+    function debugGrabExportWindow(which, filePath) {
+        var w = (which === "queue") ? queueWindow : encodeWin
+        if (!w || !w.contentItem) return false
+        w.contentItem.grabToImage(function (r) { r.saveToFile(filePath) })
+        return true
+    }
+    function collectExportTexts(node, out) {
+        if (!node) return
+        if (node.configText !== undefined && out.config.length === 0) out.config = String(node.configText)
+        if (node.statColumns !== undefined) out.stats++
+        if (node.text !== undefined && typeof node.text === "string") out.texts.push(String(node.text))
+        var kids = node.children
+        for (var i = 0; i < kids.length; i++) collectExportTexts(kids[i], out)
+    }
     // 设置值的可读描述：布尔→开/关，长字符串截断，空值→(空)。
     function describeValue(prop) {
         var v = settings[prop]
@@ -1596,6 +1701,51 @@ ApplicationWindow {
         var i = p.lastIndexOf(".")
         return i >= 0 ? p.substring(i + 1).toLowerCase() : ""
     }
+    // ---------- .qrt 分段导入 ----------
+    // 当前工程里有没有分段（手动填过的、之前导入的、从成绩条识别出来的都算）。
+    function hasSplitTimes() {
+        return String(settings.split_times || "").trim().length > 0
+    }
+    // 把 .qrt 里的 lap 时间写进 settings.split_times（绝对时间），返回导入的段数，
+    // 0 表示没解析出可用分段（QuickRoute 每个工程都有一个 Start/Stop，没真分段）。
+    function adoptQrtSplits(path) {
+        appendLog("INFO", "读取 .qrt 分段: " + path)
+        var encoded = item.qrt_split_times(path)
+        var count = encoded.length ? encoded.split("|").length : 0
+        if (!count) {
+            appendLog("WARN", "该 .qrt 未解析出可用分段，仅导入地图与轨迹")
+            return 0
+        }
+        settings["split_times"] = encoded
+        settings["split_point_codes"] = ""
+        // QuickRoute 的 lap 是从开始记录算起的绝对时间，所以时间类型固定成绝对时间。
+        settings["split_is_relative"] = false
+        win.applyChange("split_times", "分段时间 = 从 .qrt 导入的 " + count + " 个分段")
+        win.applyChange("split_is_relative", "时间类型 = 绝对时间")
+        win.refreshFields()
+        appendLog("INFO", "已从 .qrt 导入 " + count + " 个分段: " + encoded)
+        return count
+    }
+    // .qrt 落地分段：当前工程还没有分段就直接导入（不用弹窗问），
+    // 已经填过分段才问，免得把用户手输的内容覆盖掉。
+    // `index` 是轨迹列表里的行号，拖放进来时传 -1（路径已经进模型，不用回写）。
+    function offerQrtSplits(path, index) {
+        var writeBack = function () { if (index >= 0) trackRows.writeBack() }
+        if (!item.qrt_has_splits(path)) {
+            writeBack()
+            return
+        }
+        if (!win.hasSplitTimes()) {
+            appendLog("INFO", "检测到 .qrt 分段，当前还没有分段，直接导入: " + path)
+            win.adoptQrtSplits(path)
+            writeBack()
+            return
+        }
+        appendLog("INFO", "检测到 .qrt 分段，当前已有分段，等待确认: " + path)
+        trackRows.pendingQrtIndex = index
+        trackRows.pendingQrtPath = path
+        qrtSplitDialog.open()
+    }
     // ---------- 拖放到预览区：按扩展名导入 ----------
     // .trr / .orv → 打开工程；视频 → 主视频；图片 → 地图/轨迹图（QuickRoute JPEG 自带轨迹）；
     // .gpx → HUD 轨迹；.gyroflow → 防抖预设；.json → 镜头标定。
@@ -1625,16 +1775,11 @@ ApplicationWindow {
                 trackRows.addDroppedPath(p)
                 appendLog("INFO", (asMain ? "拖入地图/轨迹图（主图）: " : "拖入额外地图: ") + p
                           + " · " + win.listCounts())
-                // .qrt 自带分段时同样要问，否则拖进来就只剩地图 + 轨迹。
+                // .qrt 自带分段时同样要处理，否则拖进来就只剩地图 + 轨迹。
                 // 注意用文档级 id `trackRows`：`trackList` 是 TrackList 组件内部的 id，
                 // 在这个作用域里解析不到。
-                // 路径已经进模型，pendingQrtIndex 记 -1 表示弹窗不需要再回写一次。
-                if (e === "qrt" && item.qrt_has_splits(p)) {
-                    appendLog("INFO", "检测到 .qrt 分段，等待确认: " + p)
-                    trackRows.pendingQrtIndex = -1
-                    trackRows.pendingQrtPath = p
-                    qrtSplitDialog.open()
-                }
+                // 路径已经进模型，-1 表示弹窗不需要再回写一次。
+                if (e === "qrt") win.offerQrtSplits(p, -1)
             } else if (e === "gpx") {
                 settings.hud_gpx_path = p
                 win.refreshFields()
@@ -1751,20 +1896,15 @@ ApplicationWindow {
         // 每条改动都记一行：可读描述（组件传进来的 label）优先，否则退化成"属性 = 值"。
         // 这样"勾了什么、改了什么值"在日志里能对上。
         var what = (note !== undefined && note !== "") ? note : (prop + " = " + describeValue(prop))
-        // Encode-page changes only affect the export, never the preview: refresh the
-        // in-memory settings lightly (no re-probe / no seek / no overlay). Still bump
-        // refreshTick so field bindings (no NOTIFY on the proxy) re-read their values —
-        // e.g. the 按分段导出 checkbox's `visible` gating and the browse-filled output path.
-        if (prop === "hud_preview") {
-            item.apply_hud_preview(!!settings.hud_preview)
-            refreshFields()
-            appendLog("INFO", settings.hud_preview ? "HUD 预览已开启" : "HUD 预览已关闭")
-            return
-        }
+        // Encode-page changes also reshape the preview: 预览就是按这三个勾选合成的
+        // （没勾的层不画、剩下的铺满画布），所以这里既要刷新设置也要重画预览。
+        // Still bump refreshTick so field bindings (no NOTIFY on the proxy) re-read their
+        // values — e.g. the 按分段导出 checkbox's `visible` gating and the browse-filled
+        // output path.
         if (isEncodeProp(prop)) {
             item.apply_encode_only(p)
             refreshFields()
-            appendLog("INFO", "编码设置 " + what + "（不影响预览）")
+            appendLog("INFO", "编码设置 " + what + "（预览已同步）")
             return
         }
         // 防抖相关属性（参数或硬输入）都走这条轻量路径：
@@ -1899,7 +2039,7 @@ ApplicationWindow {
                 TButton {
                     text: "开始 / 重试队列"
                     enabled: !item.encoding && !item.queue_running && queueWindow.entries.some(function(e) { return e.status !== "已完成" })
-                    onClicked: { win.encodeTotalWall = 0; item.start_queue() }
+                    onClicked: item.start_queue()
                 }
                 TButton { text: item.encode_paused ? "继续" : "暂停"; enabled: item.queue_running && item.encoding; onClicked: item.pause_encode(!item.encode_paused) }
                 TButton { text: "中止队列"; enabled: item.queue_running || queueWindow.entries.some(function(e) { return e.status === "导出中" }); onClicked: item.stop_queue() }
@@ -1963,6 +2103,9 @@ ApplicationWindow {
                                 text: item.encode_paused ? "已暂停" : (item.encode_segment.length ? item.encode_segment : "导出中…")
                                 color: Theme.text; wrapMode: Text.Wrap; Layout.fillWidth: true
                             }
+                            // 正在导出的这一项显示与「编码」窗口同一套统计（同一个组件，
+                            // 所以两边字眼、顺序、取值完全一致）。
+                            ExportStats { visible: modelData.active; Layout.fillWidth: true }
                         }
                     }
                 }
@@ -2156,7 +2299,18 @@ ApplicationWindow {
                             // visible 里读 refreshTick 是为了改了模式/勾选后立刻重算绑定，
                             // 不用等防抖的 applyChange。
                             // 画面占比：无轨迹图片时视频自动铺满整帧，这个值没有意义 → 隐藏。
-                            PercentSpin { label: "画面占比 (%)"; prop: "relative_width"; visible: trackRows.hasMap }
+                            // 没有视频（没选视频文件，或「导出」页没勾视频）时地图铺满整帧，
+                            // 占比恒为 100% → 灰显只读，别让人白填一个不起作用的数。
+                            PercentSpin {
+                                label: "画面占比 (%)"; prop: "relative_width"
+                                visible: trackRows.hasMap
+                                forcedFull: {
+                                    win.refreshTick
+                                    var hasVideo = String(settings.video_path || "").length > 0
+                                    return !hasVideo || !settings.encode_include_video
+                                }
+                                hint: "没有视频时地图铺满整帧，画面占比固定 100%；选好视频（并在「导出」页勾上「视频」）之后才能调"
+                            }
                             SubSection {
                                 title: "路线"
                                 // 只留原版的 0=无 / 1=简洁 / 3=配速；2 是原版的「高亮」，本程序不提供，
@@ -2537,7 +2691,13 @@ ApplicationWindow {
                         spacing: 10
                         GroupBox {
                             title: "HUD"
-                            Check { label: "预览"; prop: "hud_preview" }
+                            // 预览画不画 HUD、怎么排版，全看「导出」页那三个勾选；
+                            // 这里只决定 HUD 归到哪块区域。
+                            ComboV {
+                                label: "显示范围"; prop: "hud_scope"
+                                values: ["video", "frame"]; labels: ["视频区", "整幅画面"]
+                                hint: "「视频区」只铺在视频画面上（不压地图）；「整幅画面」可以摆到地图那半边。没有视频时（只导地图+HUD）自动按整幅画面画"
+                            }
                             Field { label: "GPX 文件"; prop: "hud_gpx_path"; filter: "*.gpx" }
                             // 时间基准是「比赛出发时刻」：出发时刻在视频时间轴上的位置由「录像」
                             // 页的「录像-出发时间」自动换算；这一栏填的是**这条 GPX 自己**相对
@@ -2576,12 +2736,13 @@ ApplicationWindow {
                             Check { label: "视频"; prop: "encode_include_video" }
                             Check { label: "HUD"; prop: "encode_include_hud" }
                             ComboV {
-                                label: "分段导出"; prop: "encode_seg_mode"
-                                values: ["none", "all", "custom"]
-                                labels: ["不分段", "逐段导出", "自定义"]
+                                label: "导出范围"; prop: "encode_seg_mode"
+                                values: ["none", "all", "custom", "time"]
+                                labels: ["全部", "逐段导出", "自定义分段", "自定义时间"]
+                                hint: "全部：整段导出；逐段导出：每个分段单独一个文件；自定义分段：按分段点编号取一段；自定义时间：自己填起止时间"
                                 // 联动底层开关（落盘时由模式推导；这里同步是为了其它绑定立即刷新）
                                 onPicked: function (idx) {
-                                    settings.encode_seg_enabled = (idx !== 0)
+                                    settings.encode_seg_enabled = (idx === 1 || idx === 2)
                                     settings.encode_all_seg = (idx === 1)
                                     win.refreshFields()
                                 }
@@ -2600,6 +2761,34 @@ ApplicationWindow {
                                     HoverHandler { id: segRangeHover }
                                     ToolTip.visible: segRangeHover.hovered
                                     ToolTip.text: "起始-结束分段点编号（0 = 出发时刻；结束填 0 = 到视频末尾）"
+                                    ToolTip.delay: 400
+                                }
+                            }
+                            // 「自定义时间」：自己填起止时间（结束留空 = 到末尾）。
+                            RowLayout {
+                                width: parent.width
+                                spacing: 6
+                                visible: { win.refreshTick; return String(settings.encode_seg_mode) === "time" }
+                                Label { text: "时间范围"; Layout.preferredWidth: 150; color: Theme.text; elide: Text.ElideRight; font.pixelSize: 13 }
+                                TextField {
+                                    Layout.fillWidth: true; Layout.preferredHeight: 28; font.pixelSize: 13
+                                    placeholderText: "开始，如 0:00"
+                                    text: { win.refreshTick; var v = settings.encode_clip_start_ms; return v > 0 ? win.fmtTime(v) : "" }
+                                    onEditingFinished: win.setClipTime("start", text)
+                                    HoverHandler { id: clipStartHover }
+                                    ToolTip.visible: clipStartHover.hovered
+                                    ToolTip.text: "导出的起始时间，和进度条上的时间一致；留空 = 从开头"
+                                    ToolTip.delay: 400
+                                }
+                                Label { text: "→"; color: Theme.text; font.pixelSize: 13 }
+                                TextField {
+                                    Layout.fillWidth: true; Layout.preferredHeight: 28; font.pixelSize: 13
+                                    placeholderText: "结束，如 5:30（留空 = 到末尾）"
+                                    text: { win.refreshTick; var v = settings.encode_clip_end_ms; return v > 0 ? win.fmtTime(v) : "" }
+                                    onEditingFinished: win.setClipTime("end", text)
+                                    HoverHandler { id: clipEndHover }
+                                    ToolTip.visible: clipEndHover.hovered
+                                    ToolTip.text: "导出的结束时间；留空（或填 0）= 到末尾。填得比开始还早时按到末尾处理"
                                     ToolTip.delay: 400
                                 }
                             }
@@ -2668,8 +2857,17 @@ ApplicationWindow {
         x: item.x+videoRect.x; y: item.y+videoRect.y
         width: videoRect.width; height: videoRect.height
         editor: hudEditor
-        visible: tabs.currentIndex === 3 && !!settings.hud_preview
+        // 预览里有没有 HUD，只由「导出」页的 HUD 勾选决定（proxy 属性没有 NOTIFY，靠 refreshTick 重算）。
+        visible: { win.refreshTick; return tabs.currentIndex === 3 && !!settings.encode_include_hud }
         enabled: visible && hudEditor.enabled
+    }
+    // HUD 页的提示：没勾「导出 → HUD」时画布不显示，别让人以为编辑器坏了。
+    Label {
+        visible: { win.refreshTick; return tabs.currentIndex === 3 && !settings.encode_include_hud }
+        anchors.horizontalCenter: item.horizontalCenter
+        anchors.top: item.top; anchors.topMargin: 16
+        text: "预览里的 HUD 跟随「导出」页的 HUD 勾选：勾上才能在这里编辑位置"
+        color: "#e79832"; font.pixelSize: 13
     }
 
     // ---------- 拖放导入：把文件拖到预览区 ----------
@@ -2783,6 +2981,20 @@ ApplicationWindow {
                 var rates = [0.8, 1.0, 1.5, 2.0, 3.0, 4.0]
                 item.set_speed(rates[currentIndex])
             }
+            // 没勾「导出 → 视频」时预览没有视频轨：不解码、也没有声音，
+            // 只让地图和 HUD 按播放头走（这样倍速不会被解码吞吐拖住）。
+            HoverHandler { id: speedHover }
+            ToolTip {
+                parent: speedSelect
+                visible: speedHover.hovered
+                text: {
+                    win.refreshTick
+                    return settings.encode_include_video
+                        ? "选择后立即生效（音频跟着变速、保持音调）"
+                        : "没勾「导出 → 视频」：预览不解码视频、也没有声音，只有地图和 HUD 在走"
+                }
+                delay: 300
+            }
         }
     }
 
@@ -2834,13 +3046,6 @@ ApplicationWindow {
         var r = String(token).toLowerCase().split("x")
         return r.length === 2 && Number(r[0]) > 0 && Number(r[1]) > 0 ? Number(r[0]) / Number(r[1]) : 0
     }
-    function fmtSize(b) {
-        b = Number(b) || 0
-        if (b < 1024) return b + " B"
-        if (b < 1024 * 1024) return (b / 1024).toFixed(1) + " KB"
-        if (b < 1024 * 1024 * 1024) return (b / (1024 * 1024)).toFixed(1) + " MB"
-        return (b / (1024 * 1024 * 1024)).toFixed(2) + " GB"
-    }
     function startExport() {
         var out = (settings.encode_output_path || "").trim()
         if (!out.length) { appendLog("ERROR", "请先设置输出视频文件路径（导出页）"); return }
@@ -2852,18 +3057,18 @@ ApplicationWindow {
         applyTimer.stop()
         var p = settings.temp_apply_path()
         if (p.length) item.apply_encode_only(p)
-        encodeTotalWall = 0
         encodeWin.visible = true
         item.start_encode(out)
         appendLog("INFO", "开始编码: " + out)
     }
-    property real encodeTotalWall: 0
 
     Window {
         id: encodeWin
         title: "TraceReel - 编码"
-        width: 760
-        height: 360
+        width: 780
+        height: 420
+        minimumWidth: 620
+        minimumHeight: 320
         visible: false
         color: Theme.background
 
@@ -2895,75 +3100,11 @@ ApplicationWindow {
                 }
             }
 
-            // 本次实际使用的编码/解码组合（如「编码：中央处理器（AV1 · libsvtav1）｜解码：显卡硬解」）。
-            // CPU 和 QSV 都靠显卡解码，任务管理器里 GPU 一直在动属正常，这行字说清楚。
-            Label {
-                Layout.fillWidth: true
-                visible: item.encode_encoder_info.length > 0
-                text: item.encode_encoder_info
-                color: Theme.muted
-                wrapMode: Text.Wrap
-                font.pixelSize: 12
-            }
+            // 这次导出用的配置：与「导出队列」里每项显示的是同一套文字（同一个 Rust 函数
+            // 生成，见 export_queue::configuration），导出队列和直接导出的弹窗因此长得一样。
+            ExportConfigText { configText: String(item.encode_config || "") }
 
-            RowLayout {
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                spacing: 10
-
-                component StatRow: RowLayout {
-                    property string k
-                    property string v
-                    Layout.fillWidth: true
-                    spacing: 8
-                    Label { text: k; color: Theme.muted; font.pixelSize: 12 }
-                    Item { Layout.fillWidth: true }
-                    Label { text: v; color: "#222"; font.pixelSize: 12 }
-                }
-                GroupBox {
-                    title: "时间"
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    Layout.preferredWidth: 0
-                    Layout.minimumWidth: 0
-                    ColumnLayout {
-                        Layout.fillWidth: true
-                        spacing: 2
-                        StatRow { k: "已用:"; v: win.fmtClock(item.encode_elapsed_s) }
-                        StatRow { k: "剩余:"; v: item.encoding ? win.fmtClock(item.encode_remaining_s) : "--:--:--" }
-                        StatRow { k: "总用时:"; v: win.fmtClock(win.encodeTotalWall) }
-                        StatRow { k: "视频当前:"; v: win.fmtClock(win.num(item.encode_current_t_ms) / 1000) }
-                        StatRow { k: "视频总长:"; v: win.fmtClock(win.num(item.encode_duration_ms) / 1000) }
-                    }
-                }
-                GroupBox {
-                    title: "帧"
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    Layout.preferredWidth: 0
-                    Layout.minimumWidth: 0
-                    ColumnLayout {
-                        Layout.fillWidth: true
-                        spacing: 2
-                        StatRow { k: "当前帧:"; v: "" + win.num(item.encode_frame) }
-                        StatRow { k: "总帧数:"; v: "" + win.num(item.encode_total_frames) }
-                        StatRow { k: "帧/秒:"; v: win.num(item.encode_fps).toFixed(1) }
-                    }
-                }
-                GroupBox {
-                    title: "大小"
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    Layout.preferredWidth: 0
-                    Layout.minimumWidth: 0
-                    ColumnLayout {
-                        Layout.fillWidth: true
-                        spacing: 2
-                        StatRow { k: "当前大小:"; v: win.fmtSize(item.encode_out_size) }
-                        StatRow { k: "总大小:"; v: item.encode_done ? win.fmtSize(item.encode_out_size) : "--" }
-                    }
-                }
-            }
+            ExportStats { Layout.fillWidth: true }
 
             Label {
                 Layout.fillWidth: true
@@ -3066,7 +3207,8 @@ ApplicationWindow {
         }
     }
 
-    // .qrt 工程文件带分段数据时的确认框。
+    // .qrt 工程文件带分段数据、且当前工程**已经有分段**时的确认框：
+    // 没有分段的情况已经直接导入了，不会走到这里（见 offerQrtSplits）。
     // 「导入分段」把 QuickRoute 的 lap 时间写进 settings.split_times（绝对时间），
     // 路径本身已经落地，所以地图 + 轨迹立刻可用。
     Dialog {
@@ -3080,12 +3222,12 @@ ApplicationWindow {
         Column {
             spacing: 10
             Label {
-                text: "这个 .qrt 工程里带了分段数据（QuickRoute 的 lap 时间）。"
+                text: "这个 .qrt 工程里带了分段数据（QuickRoute 的 lap 时间），当前工程已经填过分段。"
                 wrapMode: Text.Wrap
                 width: 360
             }
             Label {
-                text: "地图和轨迹会立刻导入。是否同时导入分段？"
+                text: "地图和轨迹会立刻导入。是否用 .qrt 里的分段覆盖现在的分段？"
                 wrapMode: Text.Wrap
                 width: 360
                 color: "#555"
@@ -3096,24 +3238,7 @@ ApplicationWindow {
                     text: "导入分段"
                     onClicked: {
                         // `trackRows`（文档级 id）而非组件内的 `trackList`。
-                        var path = trackRows.pendingQrtPath
-                        appendLog("INFO", "读取 .qrt 分段: " + path)
-                        var encoded = item.qrt_split_times(path)
-                        var count = encoded.length ? encoded.split("|").length : 0
-                        if (count > 0) {
-                            settings["split_times"] = encoded
-                            settings["split_point_codes"] = ""
-                            // QuickRoute laps are absolute times measured from the
-                            // start of the recording, so pin the time type no matter
-                            // what the page was set to before.
-                            settings["split_is_relative"] = false
-                            win.applyChange("split_times", "分段时间 = 从 .qrt 导入的 " + count + " 个分段")
-                            win.applyChange("split_is_relative", "时间类型 = 绝对时间")
-                            win.refreshFields()
-                            appendLog("INFO", "已从 .qrt 导入 " + count + " 个分段: " + encoded)
-                        } else {
-                            appendLog("WARN", "该 .qrt 未解析出可用分段，仅导入地图与轨迹")
-                        }
+                        win.adoptQrtSplits(trackRows.pendingQrtPath)
                         qrtSplitDialog.close()
                         // 拖入的路径已经落地，只有从轨迹列表行进来时才需要回写。
                         if (trackRows.pendingQrtIndex >= 0) trackRows.writeBack()
@@ -3203,7 +3328,6 @@ ApplicationWindow {
             timeLabel.text = (scrubbing ? fmtTime(seek.value) : fmtTime(item.t_ms)) + " / " + fmtTime(item.duration_ms)
             playButton.text = item.playing ? "\u23F8" : "\u25B6"
             gyroStatusText = item.gyro_status
-            if (item.encoding && !item.encode_paused) win.encodeTotalWall += 0.016
             if (!scrubbing) seek.value = item.t_ms
         }
     }

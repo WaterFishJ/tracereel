@@ -49,6 +49,9 @@ Item {
         property real route_tail_low_pace: 15
         property real route_tail_high_pace: 5
         property real relative_width: 0.75
+        // 「画面占比」在「没有视频」时灰显恒 100%：这两个键来自代理的同名属性。
+        property string video_path: "clip.mp4"
+        property bool encode_include_video: true
         property string route_color: "#000000"
         property real route_opacity: 80
         property string route_tail_color: "#000000"
@@ -64,7 +67,7 @@ Item {
     component GroupBox: Column { property string title: "" }
     component SectionHeader: Item { property string text: "" }
     component SubSection: Column { property string title: "" }
-    component PercentSpin: Item { property string label: ""; property string prop: "" }
+    component PercentSpin: Item { property string label: ""; property string prop: ""; property bool forcedFull: false; property string hint: "" }
     component Combo: Item { property string label: ""; property string prop: ""; property string hint: ""; property var items: []; property var values: null; signal picked(int index) }
     component DSpin: Item { property string label: ""; property string prop: ""; property string hint: "" }
     component Check: Item { property string label: ""; property string prop: ""; property string hint: ""; property var valueOn: true; property var valueOff: false; signal uncheckedAction() }

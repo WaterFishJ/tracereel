@@ -267,6 +267,17 @@ impl PipeDecoder {
     /// Fetch the RGBA frame nearest t_ms, waiting briefly for live delivery.
     /// Never blocks long: cold start ~40ms, warm ~180ms per call.
     pub fn get(&mut self, t_ms: f64) -> Option<Arc<Vec<u8>>> {
+        self.get_with(t_ms, false)
+    }
+
+    /// 同 [`get`]，但 `accept_lagging` 时允许「不等正好那一帧」：请求已经跑到已解码
+    /// 边缘前面时（加速播放时钟比解码快）直接给最新的那一帧。
+    ///
+    /// 为什么需要：`get` 正常会为请求时刻等最多 180ms；播放头在 2x 以上时每帧都在
+    /// 这种等待里耗掉 180ms，worker 一秒只能服务 5 次，画面就一卡一卡。加速播放本来
+    /// 就要跳帧，这里按播放器的做法「给最新的、丢掉等不到的那几帧」，观感才连续。
+    /// 导出（离线逐帧）必须传 `false`：那里每一帧的内容都必须对得上时刻。
+    pub fn get_with(&mut self, t_ms: f64, accept_lagging: bool) -> Option<Arc<Vec<u8>>> {
         self.last_req.store(t_ms.round() as i64, Ordering::SeqCst);
         let dt = 1000.0 / self.fps;
         let lo = (t_ms - 0.55 * dt) as i64;
@@ -303,6 +314,17 @@ impl PipeDecoder {
                 eprintln!("[pipe] stale ring -> cold respawn at t={t_ms:.0}");
                 self.spawn_at(t_ms);
                 return None;
+            }
+            // 加速播放且请求已经越过已解码边缘：等也等不到（链被 `last_req` 卡着节奏，
+            // 每帧都要现解），直接把最新的一帧交出去。落后 1 s 以上就不认了，交给上面的
+            // 等待/复位逻辑，免得把画面钉在很旧的帧上。
+            if accept_lagging {
+                if let Some((&maxp, f)) = ring.iter().next_back() {
+                    if maxp as f64 <= t_ms && t_ms - maxp as f64 <= 1000.0 {
+                        self.started = true;
+                        return Some(f.clone());
+                    }
+                }
             }
         }
         // QSV-starve watchdog: on some ffmpeg builds the QSV `hwdownload→rgba` chain neither
