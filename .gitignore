@@ -37,3 +37,10 @@ __pycache__/
 .env
 *.log
 /tmp/
+
+# 测试与展示产物（不入库）
+# app/src/gui.rs 的 pace 单测会写 pace_visual/；ovcheck/ 是 app/tests 里 TEMP 不可用时的回退目录；
+# assets/showcase/export-preview.gif 由同目录 .mp4 转出，mp4 是中间产物。
+/app/pace_visual/
+/ovcheck/
+/assets/showcase/*.mp4
