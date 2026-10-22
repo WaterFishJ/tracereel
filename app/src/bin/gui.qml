@@ -3193,9 +3193,23 @@ ApplicationWindow {
                     spacing: 6
                     Label { text: "TraceReel · 迹映"; font.bold: true; font.pixelSize: 22; color: Theme.text }
                     Label { text: "定向视频 · 地图 · 轨迹"; color: Theme.muted }
+                    Label { text: "版本 " + appVersion; color: Theme.muted; font.pixelSize: 12 }
                 }
             }
             Label { text: "Qt6 + qmetaobject + PaintedItem 渲染\n带 Gyroflow 运动防抖与 HUD 功能。"; wrapMode: Text.Wrap; width: 340 }
+            Label {
+                text: "GPL-3.0-or-later（含第 7 条应用商店例外）"
+                color: Theme.muted
+                font.pixelSize: 12
+                wrapMode: Text.Wrap
+                width: 340
+            }
+            Row {
+                spacing: 8
+                TButton { text: "获取源码"; onClicked: Qt.openUrlExternally("https://github.com/WaterFishJ/tracereel") }
+                TButton { text: "许可与源码"; onClicked: Qt.openUrlExternally("https://waterfishj.github.io/tracereel/licensing.html") }
+                TButton { text: "隐私政策"; onClicked: Qt.openUrlExternally("https://waterfishj.github.io/tracereel/privacy.html") }
+            }
             TButton { text: "确定"; onClicked: aboutDialog.close() }
         }
     }

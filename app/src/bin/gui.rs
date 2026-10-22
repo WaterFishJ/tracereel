@@ -42,6 +42,11 @@ fn main() {
 
     // Expose the settings path as a context property the QML can read.
     engine.set_property(QString::from("orvPath"), QString::from(orv.as_str()).into());
+    // 版本号来自 Cargo，供“关于”对话框显示，避免在 QML 里硬编码。
+    engine.set_property(
+        QString::from("appVersion"),
+        QString::from(env!("CARGO_PKG_VERSION")).into(),
+    );
 
     // Deployment ships the application QML next to the executable. In the
     // development tree, QML edits still do not require rebuilding.

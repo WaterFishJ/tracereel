@@ -105,6 +105,9 @@ jobs:
           if ($zip.Count -ne 1) { throw 'Expected exactly one portable ZIP.' }
           ./packaging/verify-package.ps1 -Zip $zip[0].FullName
 
+      - name: Build MSIX package for the Microsoft Store
+        run: ./packaging/msix/build-msix.ps1
+
       - name: Archive corresponding source including Gyroflow
         run: ./packaging/create-source-archive.ps1 -Version '${{ steps.version.outputs.version }}'
 
@@ -115,6 +118,7 @@ jobs:
           path: |
             dist/*-portable.zip
             dist/*-source.zip
+            dist/*.msix
             dist/*.sha256
           if-no-files-found: error
           compression-level: 0

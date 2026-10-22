@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  TraceReel 的 MSIX 清单模板。
+  Identity 三项必须与 Partner Center 的“应用标识”完全一致，否则商店会报包身份错误：
+    Name      = Package/Identity/Name
+    Publisher = Package/Identity/Publisher
+    PublisherDisplayName = Package/Properties/PublisherDisplayName
+  版本占位符由 packaging/msix/build-msix.ps1 替换为四段版本号（例如 0.3.0.0），
+  因此这里不要写死版本号。
+-->
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+         xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+         xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+         xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+         xmlns:desktop2="http://schemas.microsoft.com/appx/manifest/desktop/windows10/2"
+         IgnorableNamespaces="uap rescap uap3 uap10 desktop desktop2">
+  <Identity Name="WaterFishJ.TraceReel"
+            Publisher="CN=619319A3-9814-4581-9290-5F566F256D2B"
+            Version="{{VERSION}}"
+            ProcessorArchitecture="x64" />
+  <Properties>
+    <DisplayName>TraceReel</DisplayName>
+    <PublisherDisplayName>WaterFishJ</PublisherDisplayName>
+    <Description>定向越野视频制作与路线回放</Description>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+  <Resources>
+    <Resource Language="zh-CN" />
+    <Resource uap:Scale="100" />
+    <Resource uap:Scale="200" />
+  </Resources>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+  <Applications>
+    <Application Id="TraceReel"
+                 Executable="TraceReel.exe"
+                 EntryPoint="Windows.FullTrustApplication"
+                 uap10:TrustLevel="mediumIL"
+                 uap10:RuntimeBehavior="packagedClassicApp">
+      <uap:VisualElements
+          DisplayName="TraceReel"
+          Description="定向越野视频制作与路线回放"
+          BackgroundColor="#ff7800"
+          Square150x150Logo="Assets\Square150x150Logo.png"
+          Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png"
+                         Square71x71Logo="Assets\Square71x71Logo.png"
+                         Square310x310Logo="Assets\Square310x310Logo.png" />
+      </uap:VisualElements>
+      <Extensions>
+        <uap:Extension Category="windows.fileTypeAssociation">
+          <uap3:FileTypeAssociation Name="tracereel-project" desktop2:UseUrl="false" Parameters='"%1"'>
+            <uap:DisplayName>TraceReel 工程</uap:DisplayName>
+            <uap:SupportedFileTypes>
+              <uap:FileType>.trr</uap:FileType>
+            </uap:SupportedFileTypes>
+            <uap:Logo>Assets\Square44x44Logo.png</uap:Logo>
+          </uap3:FileTypeAssociation>
+        </uap:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>

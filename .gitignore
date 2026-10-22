@@ -5,6 +5,10 @@
 *.pdb
 *.ilk
 
+# MSIX 打包的中间产物（图标由 make-assets.ps1 生成，staging 是临时目录）
+/packaging/msix/Assets/
+/packaging/msix/staging/
+
 # 需要按文档自行下载的第三方运行时/开发包（不入库）
 # 见 packaging/ffmpeg获取说明.md 与 ocr/README.md
 /tools/ffmpeg/

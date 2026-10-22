@@ -1,9 +1,54 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Locate the Windows SDK resource compiler without adding a new crate.
+fn find_rc() -> PathBuf {
+    if let Some(rc) = env::var_os("RC") {
+        return PathBuf::from(rc);
+    }
+    if Command::new("rc.exe").arg("/?").output().is_ok() {
+        return PathBuf::from("rc.exe");
+    }
+    if let Some(program_files) = env::var_os("ProgramFiles(x86)") {
+        let bin = PathBuf::from(program_files).join("Windows Kits/10/bin");
+        let mut versions: Vec<_> = std::fs::read_dir(bin)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        versions.sort();
+        if let Some(compiler) = versions
+            .into_iter()
+            .rev()
+            .map(|version| version.join("x64/rc.exe"))
+            .find(|path| path.is_file())
+        {
+            return compiler;
+        }
+    }
+    panic!("Windows SDK rc.exe not found; set RC to its path");
+}
+
+fn run_rc(compiler: &Path, manifest_dir: &Path, input: &Path, output: &Path) {
+    let status = Command::new(compiler)
+        .current_dir(manifest_dir)
+        .arg("/nologo")
+        .arg("/fo")
+        .arg(output)
+        .arg(input)
+        .status()
+        .expect("Could not launch the Windows resource compiler");
+    assert!(status.success(), "Windows resource compilation failed");
+}
+
+fn target_is_windows() -> bool {
+    env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+}
+
 fn compile_windows_icon() {
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+    if !target_is_windows() {
         return;
     }
     println!("cargo:rerun-if-env-changed=RC");
@@ -11,47 +56,64 @@ fn compile_windows_icon() {
     println!("cargo:rerun-if-changed=../assets/branding/tracereel.ico");
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("tracereel.res");
-    let mut compiler = env::var_os("RC").map(PathBuf::from);
-    if compiler.is_none() && Command::new("rc.exe").arg("/?").output().is_ok() {
-        compiler = Some(PathBuf::from("rc.exe"));
-    }
-    // Cargo's MSVC compiler discovery does not put the SDK resource compiler
-    // on PATH. Find it in the installed Windows SDK without a new crate.
-    if compiler.is_none() {
-        if let Some(program_files) = env::var_os("ProgramFiles(x86)") {
-            let bin = PathBuf::from(program_files).join("Windows Kits/10/bin");
-            let mut versions: Vec<_> = std::fs::read_dir(bin)
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .collect();
-            versions.sort();
-            compiler = versions
-                .into_iter()
-                .rev()
-                .map(|version| version.join("x64/rc.exe"))
-                .find(|path| path.is_file());
-        }
-    }
-    let compiler = compiler.expect("Windows SDK rc.exe not found; set RC to its path");
-    let status = Command::new(compiler)
-        .current_dir(&manifest)
-        .arg("/nologo")
-        .arg("/fo")
-        .arg(&output)
-        .arg("tracereel.rc")
-        .status()
-        .expect("Could not launch the Windows resource compiler");
-    assert!(status.success(), "Could not compile the TraceReel EXE icon");
+    run_rc(
+        &find_rc(),
+        &manifest,
+        Path::new("tracereel.rc"),
+        &output,
+    );
     println!(
         "cargo:rustc-link-arg-bin=tracereel-gui={}",
         output.display()
     );
 }
 
+/// Embed the application manifest (asInvoker + per-monitor DPI + long paths) and
+/// VERSIONINFO into the GUI executable. The MSIX package gets its version from
+/// AppxManifest.xml, but Explorer and the Store certification tooling read these.
+fn compile_windows_metadata() {
+    if !target_is_windows() {
+        return;
+    }
+    println!("cargo:rerun-if-env-changed=RC");
+    println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
+    println!("cargo:rerun-if-changed=tracereel.manifest");
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let numbers: Vec<u16> = version
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .take(3)
+        .map(|part| part.parse().unwrap_or(0))
+        .collect();
+    let mut parts = [0u16, 0, 0];
+    for (index, number) in numbers.iter().take(3).enumerate() {
+        parts[index] = *number;
+    }
+    let numeric = format!("{}.{}.{}", parts[0], parts[1], parts[2]);
+    let file_version = format!("{}, {}, {}, 0", parts[0], parts[1], parts[2]);
+    let manifest_path = manifest.join("tracereel.manifest");
+    // The resource compiler treats backslashes inside quoted strings as escape
+    // sequences (\t, \a, ...), so hand it a forward-slash path instead.
+    let manifest_rc_path = manifest_path.display().to_string().replace('\\', "/");
+    let rc_source = out.join("tracereel-resources.rc");
+    let rc_output = out.join("tracereel-resources.res");
+    let content = format!(
+        "1 24 \"{manifest}\"\r\n\r\n1 VERSIONINFO\r\nFILEVERSION {file_version}\r\nPRODUCTVERSION {file_version}\r\nFILEOS 0x00040004L\r\nFILETYPE 0x00000001L\r\nBEGIN\r\n  BLOCK \"StringFileInfo\"\r\n  BEGIN\r\n    BLOCK \"040904B0\"\r\n    BEGIN\r\n      VALUE \"FileDescription\", \"TraceReel\"\r\n      VALUE \"FileVersion\", \"{numeric}\"\r\n      VALUE \"InternalName\", \"TraceReel\"\r\n      VALUE \"OriginalFilename\", \"TraceReel.exe\"\r\n      VALUE \"ProductName\", \"TraceReel\"\r\n      VALUE \"ProductVersion\", \"{numeric}\"\r\n      VALUE \"LegalCopyright\", \"TraceReel contributors, GPL-3.0-or-later\"\r\n    END\r\n  END\r\n  BLOCK \"VarFileInfo\"\r\n  BEGIN\r\n    VALUE \"Translation\", 0x409, 0x04B0\r\n  END\r\nEND\r\n",
+        manifest = manifest_rc_path
+    );
+    std::fs::write(&rc_source, content).expect("Could not write the generated resource script");
+    run_rc(&find_rc(), &manifest, &rc_source, &rc_output);
+    println!(
+        "cargo:rustc-link-arg-bin=tracereel-gui={}",
+        rc_output.display()
+    );
+}
+
 fn main() {
     compile_windows_icon();
+    compile_windows_metadata();
     for asset in [
         "tracereel-icon.png",
         "tracereel-mark.png",
