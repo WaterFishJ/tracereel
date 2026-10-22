@@ -11,6 +11,8 @@
 
 相关文档：
 
+- [privacy.md](privacy.md) — 隐私政策（商店列表页与应用内引用）
+- [licensing.md](licensing.md) — 许可与对应源码（商店“其他许可条款”引用）
 - [../packaging/ffmpeg获取说明.md](../packaging/ffmpeg获取说明.md) — ffmpeg 开发包获取与校验
 - [../packaging/打包说明.md](../packaging/打包说明.md) — 便携版打包流程
 - [../ocr/README.md](../ocr/README.md) — OCR 运行时与模型

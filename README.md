@@ -128,7 +128,7 @@ ZIP 旁的 `.sha256` 文件可用于校验下载。硬件编码需要相应显�
 | [ONNX Runtime](https://github.com/microsoft/onnxruntime) | 本地 OCR 推理运行时 |
 | [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) · [RapidOCR](https://github.com/RapidAI/RapidOCR) | OCR 模型与模型分发 |
 
-TraceReel 以 **GPL-3.0-or-later** 发布，见 [LICENSE](LICENSE)。第三方组件、来源与分发要求见 [THIRD-PARTY.md](THIRD-PARTY.md)。分发二进制时，请一并提供完整对应源码，包括主仓库同一标签及 `gyroflow-src` 子模块对应提交。
+TraceReel 以 **GPL-3.0-or-later，附第 7 条应用商店例外** 发布，见 [LICENSE](LICENSE)。第三方组件、来源与分发要求见 [THIRD-PARTY.md](THIRD-PARTY.md)。通过任何渠道（含微软商店）分发二进制时，请一并提供完整对应源码，包括主仓库同一标签及 `gyroflow-src` 子模块对应提交；商店版本的许可与源码获取方式见 [docs/licensing.md](docs/licensing.md)。
 
 ## 💬 联系作者
 
