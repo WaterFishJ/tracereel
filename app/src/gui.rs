@@ -692,8 +692,8 @@ pub struct TraceReelItem {
     seek: qt_method!(
         fn seek(&mut self, t_ms: f64) {
             self.t_ms = t_ms.max(0.0);
-            self.seek_settle = true;
-            self.seek_settle_since = Some(std::time::Instant::now());
+            self.seek_settle = self.video_layer_on();
+            self.seek_settle_since = self.seek_settle.then(std::time::Instant::now);
             // A user seek supersedes any pending seam hold: release it so the post-seek frame
             // (from whatever segment was seeked to) clears the hold immediately.
             self.seam_hold = None;
@@ -1183,10 +1183,8 @@ impl TraceReelItem {
     /// 预览里的「视频层」开着没有：没勾「导出 → 视频」时预览根本不画视频
     /// （见 `preview_layers`），于是解码、防抖、声音全都白干。
     fn video_layer_on(&self) -> bool {
-        self.settings
-            .as_ref()
-            .map(|s| s.encode.include_video)
-            .unwrap_or(true)
+        !self.segs.is_empty()
+            && self.settings.as_ref().map(|s| s.encode.include_video).unwrap_or(true)
     }
 
     /// 把每张地图的路线管理器推进到 `self.t_ms`：运动员位置与镜头取景都在
@@ -1224,9 +1222,11 @@ impl TraceReelItem {
     fn pump_preview_frame(&mut self) {
         if self.video_layer_on() {
             self.request_preview_frame(self.t_ms);
-        }
-        self.poll_preview_frame();
-        if !self.video_layer_on() {
+            self.poll_preview_frame();
+        } else {
+            self.seek_settle = false;
+            self.seek_settle_since = None;
+            self.seam_hold = None;
             // 没有帧落地，就没有人推进运动员/镜头（见 `advance_map_runners`）。
             self.advance_map_runners();
             let this: &dyn QQuickItem = &*self;
@@ -1394,11 +1394,15 @@ impl TraceReelItem {
             self.set_gyro_loading(false);
         }
         self.update_gyro_status();
-        if self.playing {
+        if self.playing && self.video_layer_on() {
             // 播放中重载：把时钟按在当前位置，等第一帧从新链落地再放行（poll 收到帧会
             // 释放并重锚）。否则等待期间播放头会跑走，第一帧回来时画面对不上。
             self.seek_settle = true;
             self.seek_settle_since = Some(std::time::Instant::now());
+            self.seam_hold = None;
+        } else {
+            self.seek_settle = false;
+            self.seek_settle_since = None;
             self.seam_hold = None;
         }
         // 地图/轨迹先按当前位置对齐一次再重画：否则要等第一帧预览到达才刷新，
@@ -2367,6 +2371,9 @@ impl QQuickPaintedItem for TraceReelItem {
 pub fn preview_layers(mut s: Settings) -> Settings {
     if !s.encode.include_map {
         s.map.relative_width = 0.0;
+    }
+    if !s.video.all_paths().iter().any(|p| !p.trim().is_empty()) {
+        s.encode.include_video = false;
     }
     if !s.encode.include_video {
         s.map.relative_width = 1.0;
@@ -3619,7 +3626,19 @@ pub fn resolve_hud_track(
     };
     if !path.is_empty() {
         match tracereel_core::gpx::parse_gpx(&path) {
-            Ok(track) => return Some(track),
+            Ok(track) => {
+                // 手表低功耗/自动暂停会在轨迹里留下 6~35 秒的时间空洞；解析阶段已按原
+                // 采样间隔补齐（见 `gpx::GapRepair`），这里只说一句，免得用户以为程序
+                // 悄悄改了数据。
+                let g = track.gap_repair;
+                if g.filled_gaps > 0 || g.skipped_gaps > 0 {
+                    eprintln!(
+                        "[hud] GPX 轨迹有中断：已补齐 {} 处（+{} 点），跨度过大保持原样 {} 处：{path}",
+                        g.filled_gaps, g.inserted_points, g.skipped_gaps
+                    );
+                }
+                return Some(track);
+            }
             // 指了 GPX 却读不出来：退回轨迹自带的时间轴，同时把原因打出来，别悄悄空着。
             Err(e) => eprintln!("[hud] GPX 读取失败（改用轨迹文件自带的时间轴）：{path}：{e}"),
         }
@@ -3761,7 +3780,7 @@ fn compute_apply(path: &str) -> PendingApply {
             None => eprintln!("[apply] probe video failed: {p}"),
         }
     }
-    let info: VideoInfo = match base {
+    let mut info: VideoInfo = match base {
         Some(mut i) => {
             i.duration_ms = segs.iter().map(|s| s.duration_ms).sum();
             i.frame_count = segs.iter().map(|s| s.frame_count).sum();
@@ -3844,6 +3863,12 @@ fn compute_apply(path: &str) -> PendingApply {
         maps.first().map(|m| &m.rm),
     );
 
+    if segs.is_empty() {
+        info.fps = 30.0;
+        info.duration_ms = track_timeline_duration_ms(maps.iter().map(|m| m.rm.duration_s()), gpx.as_ref());
+        info.frame_count = (info.duration_ms * info.fps / 1000.0).ceil() as usize;
+    }
+
     let processing = {
         // Heavy work now runs in the dedicated preview worker; 720p fits the 16.7ms
         // budget there without blocking QML/painting. preview_perf remains 480p and
@@ -3862,6 +3887,19 @@ fn compute_apply(path: &str) -> PendingApply {
         pace_auto,
         error: None,
     }
+}
+
+/// 无视频时，预览与导出共用路线/GPX 的时间轴；静态地图没有时长。
+pub(crate) fn track_timeline_duration_ms(
+    route_durations_s: impl IntoIterator<Item = f64>,
+    gpx: Option<&GpxTrack>,
+) -> f64 {
+    let route_s = route_durations_s.into_iter()
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .fold(0.0f64, f64::max);
+    let gpx_s = gpx.and_then(|g| g.points.last().map(|p| p.t - g.start_time))
+        .filter(|s| s.is_finite() && *s > 0.0).unwrap_or(0.0);
+    route_s.max(gpx_s) * 1000.0
 }
 
 /// The map jobs on the global timeline: (map bitmap path, QuickRoute track path,
@@ -4043,6 +4081,7 @@ mod tests {
     fn preview_layers_follow_export_selection() {
         let mut base = Settings::default();
         base.map.image_file_path = "map.png".into();
+        base.video.video_path = "video.mp4".into();
         base.map.relative_width = 0.3;
         // 三勾全开：版面就是设置里的样子。
         let all = preview_layers(base.clone());
@@ -4064,6 +4103,30 @@ mod tests {
             .layout
             .as_ref()
             .is_some_and(|l| l.widgets.is_empty()));
+    }
+
+    #[test]
+    fn map_only_preview_fills_frame_without_changing_saved_selection() {
+        let mut s = Settings::default();
+        s.map.image_file_path = "map.png".into();
+        s.map.relative_width = 0.25;
+        s.encode.include_video = true;
+        let preview = preview_layers(s.clone());
+        assert!(!preview.encode.include_video);
+        assert_eq!(preview.map.relative_width, 1.0);
+        assert!(s.encode.include_video);
+    }
+
+    #[test]
+    fn track_timeline_uses_longest_route_or_gpx_and_rejects_invalid_duration() {
+        assert_eq!(track_timeline_duration_ms([12.0, 60.0, f64::NAN, -1.0], None), 60_000.0);
+        assert_eq!(track_timeline_duration_ms([], None), 0.0);
+        let gpx = GpxTrack::from_route_points(&[
+            tracereel_core::route::RoutePoint { time: 100.0, coordinate_x: 120.0, coordinate_y: 30.0, ..Default::default() },
+            tracereel_core::route::RoutePoint { time: 190.0, coordinate_x: 120.001, coordinate_y: 30.0, ..Default::default() },
+        ]).unwrap();
+        assert_eq!(track_timeline_duration_ms([60.0], Some(&gpx)), 90_000.0);
+        assert_eq!(track_timeline_duration_ms([120.0], Some(&gpx)), 120_000.0);
     }
 
     /// 预览出声要同时满足「有视频段」和「导出页勾了视频」：没勾视频时预览里

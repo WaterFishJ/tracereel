@@ -2522,23 +2522,10 @@ fn encode_export_map_only_run(job: EncodeJob, mark_done: bool) {
         }
     };
     // Timeline = route duration (seconds). Clip range from the user's start/end seconds.
-    let route_dur_ms = (prep
-        .maps
-        .iter()
-        .map(|m| m.rm.duration_s())
-        .fold(0.0f64, f64::max)
-        * 1000.0)
-        .max(0.0);
-    let gpx_dur_ms = prep
-        .gpx
-        .as_ref()
-        .and_then(|g| {
-            g.points
-                .last()
-                .map(|p| (p.t - g.start_time).max(0.0) * 1000.0)
-        })
-        .unwrap_or(0.0);
-    let route_dur_ms = route_dur_ms.max(gpx_dur_ms);
+    let route_dur_ms = crate::gui::track_timeline_duration_ms(
+        prep.maps.iter().map(|m| m.rm.duration_s()),
+        prep.gpx.as_ref(),
+    );
     if route_dur_ms <= 0.0 {
         finish(
             false,

@@ -312,6 +312,7 @@ pub struct SettingsProxy {
     hud_show_speed: qt_property!(bool),
     hud_show_pace: qt_property!(bool),
     hud_show_hr: qt_property!(bool),
+    hud_show_cadence: qt_property!(bool),
     hud_show_distance: qt_property!(bool),
     hud_show_azimuth: qt_property!(bool),
     hud_show_elevation: qt_property!(bool),
@@ -585,6 +586,7 @@ impl SettingsProxy {
         self.hud_show_speed = s.hud.show_speed;
         self.hud_show_pace = s.hud.show_pace;
         self.hud_show_hr = s.hud.show_heart_rate;
+        self.hud_show_cadence = s.hud.show_cadence;
         self.hud_show_distance = s.hud.show_distance;
         self.hud_show_azimuth = s.hud.show_azimuth;
         self.hud_show_elevation = s.hud.show_elevation;
@@ -789,6 +791,7 @@ impl SettingsProxy {
         s.hud.show_speed = self.hud_show_speed;
         s.hud.show_pace = self.hud_show_pace;
         s.hud.show_heart_rate = self.hud_show_hr;
+        s.hud.show_cadence = self.hud_show_cadence;
         s.hud.show_distance = self.hud_show_distance;
         s.hud.show_azimuth = self.hud_show_azimuth;
         s.hud.show_elevation = self.hud_show_elevation;
@@ -797,5 +800,27 @@ impl SettingsProxy {
         s.resolve_encode_clip_ms();
 
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cadence_survives_proxy_and_snapshot_roundtrip() {
+        let mut s = Settings::default();
+        s.hud.show_cadence = true;
+        s.hud.layout = Some(crate::hud::Layout { version: 1, widgets: vec![crate::hud::Widget {
+            metric: "cadence".into(), ..Default::default()
+        }] });
+        let mut proxy = SettingsProxy::default();
+        proxy.apply_settings(&s);
+        let collected = proxy.collect_settings();
+        assert!(collected.hud.show_cadence);
+        assert_eq!(collected.hud.layout.as_ref().unwrap().json(), s.hud.layout.as_ref().unwrap().json());
+        let loaded = Settings::from_ini(&crate::settings::IniFile::parse(&collected.to_ini()));
+        assert_eq!(loaded.hud.layout.unwrap().widgets[0].metric, "cadence");
+        assert!(loaded.hud.show_cadence);
     }
 }

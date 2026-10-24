@@ -1,4 +1,4 @@
-﻿# HUD 显示范围 / 「预览跟随导出勾选」的端到端回归。
+# HUD 显示范围 / 「预览跟随导出勾选」的端到端回归。
 #
 # 覆盖两件事：
 #   1) 预览（app/tests/hud_scope_probe.qml 驱动真实 gui.qml）：
@@ -152,6 +152,19 @@ includeHud=true
         if ($code -ne 0 -or $output -notmatch 'HUD_SCOPE_PASS' -or $output -match 'HUD_SCOPE_FAIL') {
             throw ("HUD 显示范围回归失败（{0}，见上面的 [probe] 行）" -f $case.Name)
         }
+    }
+
+    # 没导入视频但保留默认 includeVideo=true：不能等待不存在的视频帧。
+    $noVideoDefault = Join-Path $tmp 'no_video_default.trr'
+    Write-Utf8 $noVideoDefault ([IO.File]::ReadAllText($mapOnly).Replace('includeVideo=false', 'includeVideo=true'))
+    $env:QMLPROBE_FILE = Join-Path $PSScriptRoot 'map_only_playback_probe.qml'
+    $env:QMLPROBE_ORV = $noVideoDefault
+    $logs = & (Join-Path $projectRoot 'target/debug/qmlprobe.exe') 2>&1
+    $code = $LASTEXITCODE
+    $logs | Write-Output
+    $output = $logs -join "`n"
+    if ($code -ne 0 -or $output -notmatch 'MAP_PLAYBACK_PASS' -or $output -match 'MAP_PLAYBACK_FAIL') {
+        throw '纯轨迹播放回归失败'
     }
 
     # ---- 导出侧：只导地图+HUD，HUD 必须真的画进画面 ----

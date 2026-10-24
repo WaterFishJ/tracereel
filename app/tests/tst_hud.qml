@@ -180,10 +180,33 @@ Item {
             compare(JSON.stringify(editor.layout),JSON.stringify(baseline))
             verify(editor.metricEnabled("speed"))
         }
+        function test_cadence_digital_and_classic_persist_reload_and_undo() {
+            verify(editor.metrics.indexOf("cadence")>=0)
+            compare(editor.metricName("cadence"),"步频")
+            editor.setMetricEnabled("cadence",true)
+            compare(editor.current.metric,"cadence")
+            compare(editor.current.variant,"digital")
+            verify(!editor.hasVariantChoice)
+            var saved=source.hud_layout
+            editor.reload()
+            verify(editor.metricEnabled("cadence"))
+            compare(source.hud_layout,saved)
+            editor.setMetricEnabled("cadence",false)
+            verify(!editor.metricEnabled("cadence"))
+            editor.undo()
+            verify(editor.metricEnabled("cadence"))
+            editor.applyTemplate(2)
+            editor.setMetricEnabled("cadence",true)
+            verify(editor.current.fields.indexOf("cadence")>=0)
+            editor.reload()
+            verify(editor.metricEnabled("cadence"))
+            editor.setMetricEnabled("cadence",false)
+            verify(!editor.metricEnabled("cadence"))
+        }
         function test_style_picker_only_when_multiple_variants() {
             var row=findChild(editor,"variantChoiceRow")
             verify(row!==null);
-            ["elapsed","segment","pace","distance","classic"].forEach(function(metric) {
+            ["elapsed","segment","pace","distance","cadence","classic"].forEach(function(metric) {
                 source.hud_layout='{"version":1,"widgets":[]}';editor.reload()
                 if(metric==="classic"){editor.applyTemplate(2);editor.selected=0}
                 else editor.setMetricEnabled(metric,true)

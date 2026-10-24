@@ -37,6 +37,7 @@ fn main() {
                 lon: 113.0 + (i as f64 / 120.0).sin() * 0.0005,
                 ele: 80.0 + (i as f64 / 65.0).sin() * 25.0 + i as f64 / 15.0,
                 hr: Some(145.0 + (i as f64 / 30.0).sin() * 18.0),
+                cadence: Some(115.0),
             })
             .collect(),
     )
@@ -212,6 +213,7 @@ fn main() {
                     lon: 113.0 + angle.sin() * 0.0001,
                     ele: 100.0,
                     hr: Some(90.0 + i as f64 * 1.2),
+                    cadence: None,
                 }
             })
             .collect(),

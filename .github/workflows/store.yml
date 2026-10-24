@@ -1,0 +1,106 @@
+name: Microsoft Store update
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+      submit:
+        required: true
+        type: boolean
+    secrets:
+      PARTNER_CENTER_TENANT_ID:
+        required: true
+      PARTNER_CENTER_SELLER_ID:
+        required: true
+      PARTNER_CENTER_CLIENT_ID:
+        required: true
+      PARTNER_CENTER_CLIENT_SECRET:
+        required: true
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing stable GitHub Release tag (for example v0.3.1)
+        required: true
+        type: string
+      submit:
+        description: Submit for Store certification (false uploads a draft only)
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Serialize Store submissions across tags and manual retries.
+concurrency:
+  group: microsoft-store-production
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Upload released MSIX to Microsoft Store
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      STORE_PRODUCT_ID: ${{ vars.PARTNER_CENTER_PRODUCT_ID }}
+      STORE_SUBMIT: ${{ inputs.submit }}
+      STORE_TENANT_ID: ${{ secrets.PARTNER_CENTER_TENANT_ID }}
+      STORE_SELLER_ID: ${{ secrets.PARTNER_CENTER_SELLER_ID }}
+      STORE_CLIENT_ID: ${{ secrets.PARTNER_CENTER_CLIENT_ID }}
+      STORE_CLIENT_SECRET: ${{ secrets.PARTNER_CENTER_CLIENT_SECRET }}
+    steps:
+      - name: Validate configuration and download released MSIX
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') { throw 'Expected a stable vX.Y.Z tag.' }
+          foreach ($name in @('STORE_PRODUCT_ID', 'STORE_TENANT_ID', 'STORE_SELLER_ID', 'STORE_CLIENT_ID', 'STORE_CLIENT_SECRET')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Missing $name. See packaging/msix/README.md for GitHub configuration."
+            }
+          }
+          $releaseJson = gh release view $env:RELEASE_TAG --json isDraft,isPrerelease
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release was not found.' }
+          $release = $releaseJson | ConvertFrom-Json
+          if ($release.isDraft -or $release.isPrerelease) { throw 'Only published stable releases can be sent to the Store.' }
+          $version = $env:RELEASE_TAG.Substring(1)
+          $package = "TraceReel-$version-windows-x64.msix"
+          gh release download $env:RELEASE_TAG --pattern $package --pattern "$package.sha256" --dir store-package
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download MSIX and checksum from GitHub Release.' }
+          $checksum = (Get-Content -Raw "store-package/$package.sha256").Trim()
+          if ($checksum -notmatch '^([0-9a-fA-F]{64})\s+(.+)$' -or $Matches[2] -cne $package) {
+            throw 'Invalid MSIX checksum file.'
+          }
+          $expected = $Matches[1]
+          $actual = (Get-FileHash -Algorithm SHA256 "store-package/$package").Hash
+          if ($actual -ine $expected) { throw 'MSIX SHA256 mismatch.' }
+          "STORE_PACKAGE=$((Resolve-Path "store-package/$package").Path)" >> $env:GITHUB_ENV
+
+      - name: Install Microsoft Store Developer CLI
+        uses: microsoft/microsoft-store-apppublisher@cc9910a8d59f2eb55cbb83df0a3800cf3b5300e0 # v1.4
+
+      - name: Configure Store credentials
+        run: |
+          msstore reconfigure --tenantId "$env:STORE_TENANT_ID" --sellerId "$env:STORE_SELLER_ID" --clientId "$env:STORE_CLIENT_ID" --clientSecret "$env:STORE_CLIENT_SECRET"
+          if ($LASTEXITCODE -ne 0) { throw 'Microsoft Store authentication configuration failed.' }
+
+      - name: Upload package and optionally submit for certification
+        run: |
+          $arguments = @('publish', $env:STORE_PACKAGE, '--appId', $env:STORE_PRODUCT_ID)
+          if ($env:STORE_SUBMIT -ne 'true') { $arguments += '--noCommit' }
+          & msstore @arguments
+          if ($LASTEXITCODE -ne 0) { throw 'Microsoft Store package submission failed. Inspect Partner Center before retrying.' }
+          $mode = if ($env:STORE_SUBMIT -eq 'true') { 'submitted for certification; Store publication is pending Microsoft processing' } else { 'uploaded as a draft; not submitted for certification' }
+          "### Microsoft Store: $env:RELEASE_TAG`nMSIX SHA256 verified; $mode." >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Report current submission status
+        if: success() && inputs.submit
+        run: |
+          msstore submission status "$env:STORE_PRODUCT_ID"
+          if ($LASTEXITCODE -ne 0) { throw 'Submission was uploaded, but status lookup failed. Inspect Partner Center before retrying.' }

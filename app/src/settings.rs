@@ -387,6 +387,7 @@ pub struct HudSettings {
     pub show_speed: bool,
     pub show_pace: bool,
     pub show_heart_rate: bool,
+    pub show_cadence: bool,
     pub show_distance: bool,
     pub show_azimuth: bool,
     pub show_elevation: bool,
@@ -668,6 +669,8 @@ impl Default for Settings {
                 show_speed: true,
                 show_pace: true,
                 show_heart_rate: true,
+                // New metric is opt-in so old classic panels keep their composition.
+                show_cadence: false,
                 show_distance: true,
                 show_azimuth: true,
                 show_elevation: true,
@@ -1116,7 +1119,7 @@ impl Settings {
         // 旧工程的经典 HUD 开关继续生效；空白启动保留校园村落默认布局。
         if ini.get("hud", "layout").is_some()
             || ["showElapsedTime", "showSegmentTime", "showSpeed", "showPace",
-                "showHeartRate", "showDistance", "showAzimuth", "showElevation"]
+                "showHeartRate", "showDistance", "showAzimuth", "showElevation", "showCadence"]
                 .iter().any(|key| ini.get("hud", key).is_some())
         {
             s.hud.layout = None;
@@ -1140,6 +1143,7 @@ impl Settings {
         s.hud.show_speed = ini.get_bool("hud", "showSpeed", s.hud.show_speed);
         s.hud.show_pace = ini.get_bool("hud", "showPace", s.hud.show_pace);
         s.hud.show_heart_rate = ini.get_bool("hud", "showHeartRate", s.hud.show_heart_rate);
+        s.hud.show_cadence = ini.get_bool("hud", "showCadence", s.hud.show_cadence);
         s.hud.show_distance = ini.get_bool("hud", "showDistance", s.hud.show_distance);
         s.hud.show_azimuth = ini.get_bool("hud", "showAzimuth", s.hud.show_azimuth);
         s.hud.show_elevation = ini.get_bool("hud", "showElevation", s.hud.show_elevation);
@@ -1640,6 +1644,7 @@ impl Settings {
         ini.set("hud", "scope", &self.hud.scope);
         ini.set("hud", "showSpeed", &format!("{}", self.hud.show_speed));
         ini.set("hud", "showPace", &format!("{}", self.hud.show_pace));
+        ini.set("hud", "showCadence", &format!("{}", self.hud.show_cadence));
         ini.set(
             "hud",
             "showHeartRate",
@@ -2034,6 +2039,22 @@ mod tests {
         assert!(!loaded.encode.include_hud);
         assert!(!loaded.encode.map_only);
         assert_eq!(loaded.hud.scope, "frame");
+    }
+
+    #[test]
+    fn cadence_legacy_flag_and_custom_layout_roundtrip() {
+        assert!(!Settings::default().hud.show_cadence);
+        let legacy = Settings::from_ini(&IniFile::parse("[hud]\nshowCadence=true"));
+        assert!(legacy.hud.layout.is_none());
+        assert!(legacy.hud.show_cadence);
+        assert!(crate::hud::Layout::classic(&legacy).widgets[0].fields.as_ref().unwrap().contains(&"cadence".to_string()));
+        let mut s = legacy;
+        s.hud.layout = Some(crate::hud::Layout { version: 1, widgets: vec![crate::hud::Widget {
+            metric: "cadence".into(), ..Default::default()
+        }] });
+        let loaded = Settings::from_ini(&IniFile::parse(&s.to_ini()));
+        assert!(loaded.hud.show_cadence);
+        assert_eq!(loaded.hud.layout.unwrap().json(), s.hud.layout.unwrap().json());
     }
 
     #[test]

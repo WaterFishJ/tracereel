@@ -1,5 +1,64 @@
 # MSIX 打包（微软商店）
 
+## GitHub Actions 自动更新准备
+
+流程：推送正式版本标签（如 `v0.3.1`）→ 构建与验证便携包 → 生成 MSIX 与源码包 →
+发布 GitHub Release →（启用后）上传该 Release 中的同一份 MSIX 并提交微软商店认证。
+提交成功不等于商店已上线，最终状态以 Partner Center 为准。
+
+### Partner Center / Microsoft Entra
+
+1. TraceReel 必须已在商店正式上线，首次提交（包括年龄分级、截图、隐私政策、许可条款及
+   `runFullTrust` 说明）先在 Partner Center 手动完成。
+2. Partner Center → 账户设置 → 租户：关联 Microsoft Entra 租户。
+3. 在该租户注册一个专用于 CI 的应用。在 Partner Center → 账户设置 → 用户管理 →
+   Microsoft Entra 应用程序中添加该应用，授予 **Manager** 角色。
+4. 记录租户 ID、应用（客户端）ID，并在应用的“证书和密码”中创建客户端密码。
+   保存密码的 **Value**（不是 Secret ID），并记录过期时间。
+5. 从 Partner Center 账户标识中取得 Seller ID；从 TraceReel 的产品标识取得 Store Product ID
+   （如 `9…`）。Product ID 与 MSIX 包名 `WaterFishJ.TraceReel`、Publisher GUID 是不同字段。
+6. 核对 `AppxManifest.xml` 中的包名、Publisher、显示名与商店一致；本次版本将是 `0.3.1.0`，
+   必须高于该应用商店内已有的对应包版本。
+
+官方说明：[GitHub Actions 前提条件](https://learn.microsoft.com/en-us/windows/apps/publish/msstore-dev-cli/github-actions)、
+[MSIX CLI 命令](https://learn.microsoft.com/en-us/windows/apps/publish/msstore-dev-cli/commands)。
+
+### GitHub 仓库设置
+
+在仓库 **Settings → Secrets and variables → Actions** 设置以下 Repository secrets：
+
+| Secret 名 | 值 |
+|---|---|
+| `PARTNER_CENTER_TENANT_ID` | Entra 租户 ID |
+| `PARTNER_CENTER_CLIENT_ID` | 专用 CI 应用的 Application (client) ID |
+| `PARTNER_CENTER_CLIENT_SECRET` | 客户端密码的 Value |
+| `PARTNER_CENTER_SELLER_ID` | Partner Center Seller ID |
+
+在同一页面的 **Variables** 标签设置 Repository variables：
+
+| Variable 名 | 值 |
+|---|---|
+| `PARTNER_CENTER_PRODUCT_ID` | TraceReel 的 Store Product ID |
+| `MICROSOFT_STORE_ENABLED` | 准备完成后设为 `true`，后续正式标签发布将自动提交商店审核 |
+
+密码直接填入 GitHub Secrets，不要发到聊天或提交到仓库。仅生成并上传商店 MSIX 不需要自购签名证书。
+
+### 用 0.3.1 测试
+
+即使 GitHub Release 已经发布，也无需重新打标签或重新构建：
+
+1. 配好上述 secrets 与 Product ID，确认商店没有正在审核或需要保留的草稿提交。
+2. GitHub → Actions → **Microsoft Store update** → **Run workflow**，使用 `main`，
+   `release_tag` 填 `v0.3.1`。
+3. `submit` 不勾选：下载 Release 的 MSIX、验证 SHA256、上传并保留草稿。
+   **这会真实创建或更新商店草稿，并非 dry-run。** 不要同时在 Partner Center 编辑 API 创建的草稿。
+4. 要完整测试自动提审，首次运行就勾选 `submit`。如果先上传了草稿，可用已配置凭据的 CLI 执行
+   `msstore submission publish <Product ID>` 提交该草稿；不要盲目重跑包上传。
+5. 在 Actions 日志及 Partner Center 确认认证结果；Actions 成功仅表示上传/提审命令完成。
+   如命令超时或失败，先检查 Partner Center，避免重复提交。
+6. 测试完成后设置 `MICROSOFT_STORE_ENABLED=true`，后续正式版本自动提审。预发布标签和普通 main
+   提交不会自动提交商店；商店步骤失败不撤回已发布的 GitHub Release。
+
 从现有便携包目录生成商店提交用的 `.msix`。**不需要自购代码签名证书**：商店在认证通过后会用微软证书重签；本地安装测试才需要自签（见下）。
 
 ## 生成商店包

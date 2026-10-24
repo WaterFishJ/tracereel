@@ -27,8 +27,8 @@ Column {
         {id:"builtin:park",name:"公园野外",key:"park",builtIn:true},
         {id:"builtin:simple",name:"简单文字",key:"simple",builtIn:true}
     ]
-    property var metrics: ["speed","heading","elevation","heart_rate","elapsed","segment","pace","distance"]
-    property var metricNames: ["速度","航向","海拔","心率","总用时","分段用时","配速","距离"]
+    property var metrics: ["speed","heading","elevation","heart_rate","elapsed","segment","pace","distance","cadence"]
+    property var metricNames: ["速度","航向","海拔","心率","总用时","分段用时","配速","距离","步频"]
     spacing: 7
     function copy(v) { return JSON.parse(JSON.stringify(v)) }
     function reload() {

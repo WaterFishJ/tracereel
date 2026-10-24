@@ -85,6 +85,7 @@ impl Layout {
                 "heading",
                 "elevation",
                 "heart_rate",
+                "cadence",
                 "elapsed",
                 "segment",
                 "pace",
@@ -127,13 +128,14 @@ impl Layout {
             }
             if let Some(fields) = &w.fields {
                 let mut unique = std::collections::HashSet::new();
-                if fields.len() > 8
+                if fields.len() > 9
                     || fields.iter().any(|field| {
                         ![
                             "speed",
                             "heading",
                             "elevation",
                             "heart_rate",
+                            "cadence",
                             "elapsed",
                             "segment",
                             "pace",
@@ -162,6 +164,7 @@ impl Layout {
             ("distance", s.hud.show_distance),
             ("heading", s.hud.show_azimuth),
             ("elevation", s.hud.show_elevation),
+            ("cadence", s.hud.show_cadence),
         ];
         let w = Widget {
             id: "classic".into(),
@@ -449,6 +452,25 @@ pub fn elapsed_values(settings: &Settings, t_ms: f64) -> (f64, f64) {
     (total, elapsed)
 }
 
+/// Shared preview/export telemetry; null metrics render as `--`.
+pub fn telemetry_values(settings: &Settings, track: Option<&GpxTrack>, t_ms: f64) -> serde_json::Value {
+    let (elapsed_total, elapsed) = elapsed_values(settings, t_ms);
+    let gpx_offset = hud_track_offset(settings);
+    let sample = track.and_then(|t| t.sample_at(t_ms / 1000.0, gpx_offset));
+    let ht = track.and_then(|t| t.hud_at(t_ms / 1000.0, gpx_offset));
+    serde_json::json!({
+        "speed":sample.map(|s|s.speed_kmh), "heading":ht.and_then(|v|v.0),
+        "elevation":sample.and_then(|s|s.altitude_m),"heart_rate":sample.and_then(|s|s.heart_rate),
+        "cadence":sample.and_then(|s|s.cadence),
+        "distance":sample.map(|s|s.distance_km),"pace":sample.map(|s| if s.pace_min_km>0.0 {format!("{} /km",duration(s.pace_min_km*60.0))} else {"-- /km".into()}),
+        "elapsed":duration(elapsed_total),"segment":segment(elapsed,settings),
+        "phase":ht.map(|v|v.1).unwrap_or(0.0),"max_speed":track.map(|t|t.hud_max_speed()).unwrap_or(30.0),
+        "track_time":t_ms/1000.0+gpx_offset,
+        "classic_flags":[settings.hud.show_elapsed_time,settings.hud.show_segment_time,settings.hud.show_speed,
+            settings.hud.show_pace,settings.hud.show_heart_rate,settings.hud.show_distance,settings.hud.show_azimuth,settings.hud.show_elevation,settings.hud.show_cadence]
+    })
+}
+
 pub fn draw(
     p: &mut QPainter,
     settings: &Settings,
@@ -457,10 +479,6 @@ pub fn draw(
     width: f64,
     height: f64,
 ) {
-    let (elapsed_total, elapsed) = elapsed_values(settings, t_ms);
-    let gpx_offset = hud_track_offset(settings);
-    let sample = track.and_then(|t| t.sample_at(t_ms / 1000.0, gpx_offset));
-    let ht = track.and_then(|t| t.hud_at(t_ms / 1000.0, gpx_offset));
     let raw = settings
         .hud
         .layout
@@ -468,16 +486,7 @@ pub fn draw(
         .map(|l| l.json())
         .unwrap_or_else(|| Layout::classic(settings).json());
     let layout = QString::from(raw.as_str());
-    let values = serde_json::json!({
-        "speed":sample.map(|s|s.speed_kmh), "heading":ht.and_then(|v|v.0),
-        "elevation":sample.and_then(|s|s.altitude_m),"heart_rate":sample.and_then(|s|s.heart_rate),
-        "distance":sample.map(|s|s.distance_km),"pace":sample.map(|s| if s.pace_min_km>0.0 {format!("{} /km",duration(s.pace_min_km*60.0))} else {"-- /km".into()}),
-        "elapsed":duration(elapsed_total),"segment":segment(elapsed,settings),
-        "phase":ht.map(|v|v.1).unwrap_or(0.0),"max_speed":track.map(|t|t.hud_max_speed()).unwrap_or(30.0),
-        "track_time":t_ms/1000.0+gpx_offset,
-        "classic_flags":[settings.hud.show_elapsed_time,settings.hud.show_segment_time,settings.hud.show_speed,
-            settings.hud.show_pace,settings.hud.show_heart_rate,settings.hud.show_distance,settings.hud.show_azimuth,settings.hud.show_elevation]
-    });
+    let values = telemetry_values(settings, track, t_ms);
     let values = QString::from(values.to_string().as_str());
     let profile = track.map(|t| t.hud_profile()).unwrap_or(&[]);
     let count = profile.len() as i32;
@@ -810,6 +819,49 @@ mod tests {
         let (total, segment_s) = elapsed_values(&s, 1_400_000.0);
         assert_eq!(duration(total), "21:44.0");
         assert_eq!(duration(segment_s), "23:03.0");
+    }
+
+    #[test]
+    fn cadence_payload_and_painter_keep_recorded_units_and_missing_marker() {
+        let track = tracereel_core::gpx::parse_gpx_str(r#"<gpx xmlns:gpxdata="http://www.cluetrust.com/XML/GPXDATA/1/0"><trk><trkseg>
+            <trkpt lat="30" lon="119"><time>2026-10-06T02:00:00Z</time><extensions><gpxdata:cadence>115</gpxdata:cadence></extensions></trkpt>
+            <trkpt lat="30" lon="119"><time>2026-10-06T02:00:01Z</time></trkpt>
+            </trkseg></trk></gpx>"#).unwrap();
+        let mut s = Settings::default();
+        s.video.start_time_offset_s = 17.0;
+        s.hud.gpx_time_offset = -8.0;
+        s.hud.show_cadence = true;
+        let recorded = telemetry_values(&s, Some(&track), 25_000.0);
+        assert_eq!(recorded["cadence"], 115.0);
+        assert_eq!(recorded["classic_flags"][8], true);
+        let painter_value = |values: serde_json::Value| {
+            let data = QString::from(values.to_string().as_str());
+            unsafe { cpp!([data as "QString"] -> QString as "QString" {
+                return ovHudValue(QStringLiteral("cadence"), QJsonDocument::fromJson(data.toUtf8()).object());
+            }) }.to_string()
+        };
+        assert_eq!(painter_value(recorded), "115 步/分");
+        for values in [telemetry_values(&s, Some(&track), 26_000.0),
+            telemetry_values(&s, Some(&track), 30_000.0), telemetry_values(&s, None, 25_000.0)] {
+            assert!(values["cadence"].is_null());
+            assert_eq!(painter_value(values), "--");
+        }
+        assert_eq!(painter_value(serde_json::json!({"cadence":0})), "0 步/分");
+    }
+
+    #[test]
+    fn cadence_layout_accepts_digital_and_nine_classic_fields() {
+        let mut s = Settings::default();
+        s.hud.show_cadence = true;
+        let classic = Layout::classic(&s);
+        assert_eq!(classic.widgets[0].fields.as_ref().unwrap().len(), 9);
+        assert_eq!(Layout::parse(&classic.json()).unwrap().json(), classic.json());
+        let mut digital = Layout { version: 1, widgets: vec![Widget {
+            metric: "cadence".into(), ..Default::default()
+        }] };
+        assert!(Layout::parse(&digital.json()).is_ok());
+        digital.widgets[0].metric = "unknown_metric".into();
+        assert!(Layout::parse(&digital.json()).is_err());
     }
 
     #[test]

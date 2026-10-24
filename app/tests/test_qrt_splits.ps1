@@ -1,4 +1,4 @@
-﻿param([string]$QtRoot = 'C:\Qt\6.8.2\msvc2022_64')
+param([string]$QtRoot = 'C:\Qt\6.8.2\msvc2022_64')
 $ErrorActionPreference = 'Stop'
 $source = Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot '../src/bin/gui.qml')
 
@@ -14,6 +14,13 @@ import QtQuick
 import QtQuick.Controls
 
 // 被测函数来自 app/src/bin/gui.qml，这里只提供它们用到的宿主接口。
+//
+// ⚠ refreshFields() 必须连同「轨迹列表按 settings 重新同步」一起模拟：
+// 真机上 gui.qml 的 `function refreshFields() { refreshTick++; ... }` 会触发
+// TrackList 的 `onRefreshTickChanged` → `syncFromSettings()`；只要 settings 里的
+// route_path/map_extras 与列表行不一致，行就被当成「外部改动」清掉。
+// 只把 refreshFields 当空函数，就测不出「导入分段把还没落地的地图行冲掉」这类跨组件 bug
+// —— `.qrt` 有分段、当前工程没分段时地图没导入就是这么来的（0.3.0 回归）。
 Item {
     id: win
     width: 400; height: 300
@@ -25,7 +32,7 @@ Item {
     property var applied: []
     property var logs: []
     function applyChange(prop, note) { refreshTick++; applied.push(prop) }
-    function refreshFields() { refreshTick++ }
+    function refreshFields() { refreshTick++; trackRows.syncFromSettings() }
     function appendLog(level, message) { logs.push(level + " " + message) }
 
     QtObject {
@@ -33,14 +40,29 @@ Item {
         property string split_times: ""
         property string split_point_codes: ""
         property bool split_is_relative: true
+        property string route_path: ""
+        property string map_path: ""
     }
-    // 轨迹列表：只要 writeBack 计数、pendingQrt* 两个字段。
+    // 轨迹列表：writeBack 把当前行落地，syncFromSettings 按 settings 重建（未落地的行被清掉）。
     QtObject {
         id: trackRows
-        property int pendingQrtIndex: -1
         property string pendingQrtPath: ""
         property int writeBacks: 0
-        function writeBack() { writeBacks++ }
+        property string mainPath: ""
+        property int syncs: 0
+        property bool wiped: false
+        function writeBack() {
+            writeBacks++
+            settingsObj.route_path = mainPath
+            settingsObj.map_path = mainPath
+        }
+        function syncFromSettings() {
+            syncs++
+            if (String(settingsObj.route_path) !== mainPath) {
+                mainPath = String(settingsObj.route_path)
+                wiped = true
+            }
+        }
     }
     QtObject {
         id: qrtSplitDialog

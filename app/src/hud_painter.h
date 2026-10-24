@@ -17,6 +17,7 @@ static QString ovHudLabel(const QString &metric) {
     if(metric=="speed") return QStringLiteral("速度");
     if(metric=="heading") return QStringLiteral("航向");
     if(metric=="heart_rate") return QStringLiteral("心率");
+    if(metric=="cadence") return QStringLiteral("步频");
     if(metric=="elevation") return QStringLiteral("海拔");
     if(metric=="elapsed") return QStringLiteral("总用时");
     if(metric=="segment") return QStringLiteral("分段用时");
@@ -33,6 +34,7 @@ static QString ovHudValue(const QString &metric,const QJsonObject &v) {
     if(metric=="speed") {unit=" km/h";dp=1;}
     if(metric=="distance") {unit=" km";dp=2;}
     if(metric=="heart_rate") unit=" bpm";
+    if(metric=="cadence") unit=QStringLiteral(" 步/分");
     if(metric=="heading") unit=QStringLiteral("°");
     if(metric=="elevation") unit=" m";
     return QString::number(x.toDouble(),'f',dp)+unit;
@@ -88,7 +90,7 @@ static void ovDrawHud(QPainter *p,const QString &layout,const QString &data,doub
             p->setPen(QPen(accent,2));p->drawLine(QPointF(1,1),QPointF(ww-1,1));
         }
         if(metric=="classic") {
-            QStringList keys={"elapsed","segment","speed","pace","heart_rate","distance","heading","elevation"};
+            QStringList keys={"elapsed","segment","speed","pace","heart_rate","distance","heading","elevation","cadence"};
             auto flags=v["classic_flags"].toArray();
             const bool hasFields=w.contains("fields") && w["fields"].isArray();
             QStringList fields;for(auto f:w["fields"].toArray())fields.push_back(f.toString());
@@ -236,6 +238,28 @@ static void ovDrawHud(QPainter *p,const QString &layout,const QString &data,doub
                 if(metric=="pace") {
                     p->drawLine(QPointF(x-r,y+r),QPointF(x,y-r));QPolygonF flag;
                     flag<<QPointF(x,y-r)<<QPointF(x+r,y-r*.5)<<QPointF(x-r*.3,y);p->setBrush(QColor("#ff6577"));p->drawPolygon(flag);
+                } else if(metric=="cadence") {
+                    // Mirrored soles with an inward arch; left foot leads the right.
+                    p->setPen(Qt::NoPen);p->setBrush(accent);
+                    const double k=r*1.12;
+                    for(int side=0;side<2;++side) {
+                        p->save();
+                        p->translate(x+(side?-1:1)*r*.47,y+(side?-1:1)*r*.34);
+                        p->rotate(side?-10:10);
+                        p->scale(side?-k:k,k);
+                        // Rounded forefoot and heel, with no individual toe details.
+                        QPainterPath sole;
+                        sole.moveTo(-.03,-.64);
+                        sole.cubicTo(-.23,-.64,-.31,-.49,-.30,-.27);
+                        sole.cubicTo(-.30,-.09,-.12,.01,-.14,.20);
+                        sole.cubicTo(-.15,.32,-.22,.40,-.20,.50);
+                        sole.cubicTo(-.18,.67,.13,.69,.19,.51);
+                        sole.cubicTo(.25,.34,.19,.17,.25,-.04);
+                        sole.cubicTo(.31,-.24,.34,-.43,.22,-.56);
+                        sole.cubicTo(.16,-.62,.06,-.65,-.03,-.64);
+                        sole.closeSubpath();p->drawPath(sole);
+                        p->restore();
+                    }
                 } else if(metric=="elapsed" || metric=="segment") {
                     p->drawEllipse(QPointF(x,y),r,r);p->drawLine(QPointF(x,y),QPointF(x,y-r*.6));p->drawLine(QPointF(x,y),QPointF(x+r*.5,y+r*.2));
                 } else {p->drawRoundedRect(QRectF(x-r,y-r,2*r,2*r),3,3);for(int i=0;i<5;++i)p->drawLine(QPointF(x-r*.7+i*r*.35,y-r*.5),QPointF(x-r*.7+i*r*.35,y+r*(i%2?.2:.6)));}

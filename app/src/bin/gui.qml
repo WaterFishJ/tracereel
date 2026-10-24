@@ -629,8 +629,7 @@ ApplicationWindow {
         width: parent.width
         spacing: 4
         property string fileFilter: "*.jpg *.jpeg *.qrt"
-        // .qrt 识别到分段时，暂存待确认的目标行与路径。
-        property int pendingQrtIndex: -1
+        // .qrt 识别到分段且当前工程已有分段时，暂存待确认的路径（路径本身已经落地）。
         property string pendingQrtPath: ""
         // 「按分段设置换图时间」暂存目标行号。
         property int pendingMapRow: -1
@@ -1723,19 +1722,18 @@ ApplicationWindow {
     // 已经填过分段才问，免得把用户手输的内容覆盖掉。
     // `index` 是轨迹列表里的行号，拖放进来时传 -1（路径已经进模型，不用回写）。
     function offerQrtSplits(path, index) {
-        var writeBack = function () { if (index >= 0) trackRows.writeBack() }
-        if (!item.qrt_has_splits(path)) {
-            writeBack()
-            return
-        }
+        // 路径**先**落地，再碰分段：adoptQrtSplits() 会调 refreshFields()，真机上那会让
+        // 轨迹列表按 settings 重建一次 —— 还没写进 settings 的行会被当成外部改动清掉，
+        // 接着 writeBack() 就把空路径写回去，于是「分段导入成功、地图却没导入」（0.3.0 回归）。
+        // 拖放的路径已经由 addDroppedPath() 落过，这里只服务列表行选中。
+        if (index >= 0) trackRows.writeBack()
+        if (!item.qrt_has_splits(path)) return
         if (!win.hasSplitTimes()) {
             appendLog("INFO", "检测到 .qrt 分段，当前还没有分段，直接导入: " + path)
             win.adoptQrtSplits(path)
-            writeBack()
             return
         }
         appendLog("INFO", "检测到 .qrt 分段，当前已有分段，等待确认: " + path)
-        trackRows.pendingQrtIndex = index
         trackRows.pendingQrtPath = path
         qrtSplitDialog.open()
     }
@@ -3216,8 +3214,8 @@ ApplicationWindow {
 
     // .qrt 工程文件带分段数据、且当前工程**已经有分段**时的确认框：
     // 没有分段的情况已经直接导入了，不会走到这里（见 offerQrtSplits）。
-    // 「导入分段」把 QuickRoute 的 lap 时间写进 settings.split_times（绝对时间），
-    // 路径本身已经落地，所以地图 + 轨迹立刻可用。
+    // 路径在打开弹窗前就已经落地（offerQrtSplits 先 writeBack），所以地图 + 轨迹立刻可用；
+    // 这里只决定要不要用 .qrt 的 lap 覆盖现在的分段。
     Dialog {
         id: qrtSplitDialog
         title: "检测到分段数据"
@@ -3244,11 +3242,10 @@ ApplicationWindow {
                 TButton {
                     text: "导入分段"
                     onClicked: {
-                        // `trackRows`（文档级 id）而非组件内的 `trackList`。
+                        // 路径已经在 offerQrtSplits() 里落地（地图与轨迹立刻可用），
+                        // 这里只管把 .qrt 的 lap 写进分段时间。
                         win.adoptQrtSplits(trackRows.pendingQrtPath)
                         qrtSplitDialog.close()
-                        // 拖入的路径已经落地，只有从轨迹列表行进来时才需要回写。
-                        if (trackRows.pendingQrtIndex >= 0) trackRows.writeBack()
                     }
                 }
                 TButton {
@@ -3256,7 +3253,6 @@ ApplicationWindow {
                     onClicked: {
                         appendLog("INFO", "仅导入地图与轨迹: " + trackRows.pendingQrtPath)
                         qrtSplitDialog.close()
-                        if (trackRows.pendingQrtIndex >= 0) trackRows.writeBack()
                     }
                 }            }
         }
