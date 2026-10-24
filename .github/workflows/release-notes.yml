@@ -1,0 +1,46 @@
+name: Update release notes
+
+on:
+  push:
+    branches: [main]
+    paths: ['docs/releases/v*.md']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing GitHub Release tag, for example v0.3.1
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Update descriptions from versioned Markdown
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          BEFORE_SHA: ${{ github.event.before }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            notes=("docs/releases/$RELEASE_TAG.md")
+          else
+            git diff --name-only --diff-filter=AM "$BEFORE_SHA" "$GITHUB_SHA" -- docs/releases/ > changed-notes.txt
+            mapfile -t notes < changed-notes.txt
+          fi
+          for file in "${notes[@]}"; do
+            tag="$(basename "$file" .md)"
+            [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid release tag: $tag" >&2; exit 1; }
+            [[ -s "$file" ]] || { echo "Missing release notes: $file" >&2; exit 1; }
+            gh release view "$tag" >/dev/null
+            gh release edit "$tag" --notes-file "$file"
+            echo "Updated $tag from $file" >> "$GITHUB_STEP_SUMMARY"
+          done
