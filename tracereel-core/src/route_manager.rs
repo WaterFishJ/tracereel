@@ -73,6 +73,9 @@ pub struct RouteStyle {
     pub tail_color: (f64, f64, f64, f64),
     pub route_render_mode: RenderMode,
     pub route_width: f64,
+    /// 渲染范围：0 = 完整（整条路线），1 = 单段（只画当前所在的那一段）。
+    /// 逐地图框独立：固定分段框常配「单段」，跟跑者居中框可配「完整」。
+    pub render_scope: i32,
     pub tail_render_mode: RenderMode,
     pub tail_width: f64,
     pub tail_length: f64,
@@ -112,6 +115,7 @@ impl Default for RouteStyle {
             tail_color: (0.0, 0.0, 0.0, 80.0 / 255.0),
             route_render_mode: RenderMode::Discreet,
             route_width: 10.0,
+            render_scope: 0,
             tail_render_mode: RenderMode::None,
             tail_width: 10.0,
             tail_length: 60.0,
@@ -211,11 +215,20 @@ pub struct RouteManager {
     pub top_bottom_margin: f64,
     pub left_right_margin: f64,
     pub maximum_automatic_zoom: f64,
+    /// 跟跑者居中的两个模式没有「取景边距」的概念（画面始终围着跑者），地图远近由这个
+    /// 缩放倍数决定：1.0 = 地图坐标 1:1 显示。固定分段模式用不到它（缩放由分段取景表算）。
+    pub centered_zoom: f64,
     pub runner_vertical_offset: f64,
     pub runner_averaging_factor: f64,
     pub window_width: f64,
     pub window_height: f64,
     pub map_relative_width: f64,
+    /// 圆形地图框的取景半径（窗口像素，圆心 = 画面中心）；0 = 矩形取景。
+    ///
+    /// 圆形地图的可见区域是内切圆，所以分段取景不能只按窗口宽高来收：那样轨迹会贴到
+    /// 矩形边（= 圆外）被裁掉。这里再按「当前分段所有点到段中点的最远距离」额外收一次，
+    /// 保证整段轨迹（含边距）都落在圆内。
+    pub circular_framing_radius: f64,
 
     pub routes: Vec<Route>,
     pub runner_info: RunnerInfo,
@@ -249,11 +262,13 @@ impl Default for RouteManager {
             top_bottom_margin: 30.0,
             left_right_margin: 10.0,
             maximum_automatic_zoom: 100.0,
+            centered_zoom: 1.0,
             runner_vertical_offset: 0.0,
             runner_averaging_factor: RUNNER_AVERAGING_FACTOR,
             window_width: 1280.0,
             window_height: 720.0,
             map_relative_width: 0.25,
+            circular_framing_radius: 0.0,
             routes: vec![Route::default()],
             runner_info: RunnerInfo::default(),
             full_update_requested: true,
@@ -357,6 +372,7 @@ impl RouteManager {
         );
         route.split_transformations = calc_split_transformations(
             &route.aligned_route_points,
+            &route.route_points,
             &splits,
             route.control_time_offset,
             self.window_width,
@@ -365,6 +381,7 @@ impl RouteManager {
             self.left_right_margin,
             self.top_bottom_margin,
             self.maximum_automatic_zoom,
+            self.circular_framing_radius,
         );
 
         let a = self.runner_averaging_factor / 1000.0;
@@ -376,6 +393,19 @@ impl RouteManager {
 
         // `update()` 里的整表重算负责"第一帧落在分段之外就先按第 0 段取景"。
         self.update(0.0, 0.0);
+    }
+
+    /// Update during playback/export. Following the runner uses content time,
+    /// while a fixed-split camera transition uses presentation time so its
+    /// rotation, pan and zoom keep the same duration at any playback speed.
+    pub fn update_playback(&mut self, current_time: f64, content_step_ms: f64, speed: f64) {
+        let speed = if speed.is_finite() && speed > 0.0 { speed } else { 1.0 };
+        let camera_step = if self.view_mode == ViewMode::FixedSplit {
+            content_step_ms / speed
+        } else {
+            content_step_ms
+        };
+        self.update(current_time, camera_step);
     }
 
     /// Advance the manager to `current_time`, recomputing the camera transform.
@@ -390,6 +420,7 @@ impl RouteManager {
                 );
                 route.split_transformations = calc_split_transformations(
                     &route.aligned_route_points,
+                    &route.route_points,
                     &splits,
                     route.control_time_offset,
                     self.window_width,
@@ -398,6 +429,7 @@ impl RouteManager {
                     self.left_right_margin,
                     self.top_bottom_margin,
                     self.maximum_automatic_zoom,
+                    self.circular_framing_radius,
                 );
             }
             self.full_update_requested = false;
@@ -530,6 +562,8 @@ impl RouteManager {
                 self.current_st.x = self.runner_average_x.get_average();
                 self.current_st.y = self.runner_average_y.get_average();
                 self.current_st.angle = self.runner_average_angle.get_average();
+                // 居中模式不按分段收景：缩放只认用户设置的倍数（取景边距在这里没有意义）。
+                self.current_st.scale = self.centered_zoom.max(1e-4);
             }
         }
     }
@@ -796,6 +830,7 @@ fn calc_control_positions(aligned: &[RoutePoint], splits: &[Split], cto: f64) ->
 #[allow(clippy::too_many_arguments)]
 fn calc_split_transformations(
     aligned: &[RoutePoint],
+    original: &[RoutePoint],
     splits: &[Split],
     cto: f64,
     window_width: f64,
@@ -804,6 +839,7 @@ fn calc_split_transformations(
     left_right_margin: f64,
     top_bottom_margin: f64,
     max_auto_zoom: f64,
+    circular_framing_radius: f64,
 ) -> Vec<SplitTransformation> {
     let mut out = Vec::new();
     if splits.len() < 2 || aligned.is_empty() {
@@ -819,9 +855,11 @@ fn calc_split_transformations(
             ((split2.absolute_time + cto).round() as i64).clamp(0, index_max as i64) as usize;
 
         let mut st = SplitTransformation::default();
-        if start_index != stop_index {
-            let start_rp = aligned[start_index];
-            let stop_rp = aligned[stop_index];
+        if split2.absolute_time > split1.absolute_time {
+            let start_time = split1.absolute_time + cto;
+            let stop_time = split2.absolute_time + cto;
+            let start_rp = interp_route_point(aligned, start_time);
+            let stop_rp = interp_route_point(aligned, stop_time);
             let dx = stop_rp.position_x - start_rp.position_x;
             let dy = stop_rp.position_y - start_rp.position_y;
             let mut angle = (-dy).atan2(dx).to_degrees();
@@ -841,21 +879,27 @@ fn calc_split_transformations(
             let mut max_x = f64::NEG_INFINITY;
             let mut min_y = f64::INFINITY;
             let mut max_y = f64::NEG_INFINITY;
-            for j in start_index..=stop_index {
-                let p = aligned[j];
+            // Include both the displayed interpolated path and the original samples:
+            // sub-second bends must not disappear from the framing calculation.
+            let points: Vec<_> = std::iter::once(start_rp)
+                .chain(std::iter::once(stop_rp))
+                .chain(aligned[start_index..=stop_index].iter().copied())
+                .chain(original.iter().filter(|p| p.time >= start_time && p.time <= stop_time).copied())
+                .collect();
+            for p in &points {
                 let (rx, ry) = rot(p.position_x, p.position_y);
                 min_x = min_x.min(rx);
                 max_x = max_x.max(rx);
                 min_y = min_y.min(ry);
                 max_y = max_y.max(ry);
             }
-            let (start_rx, _start_ry) = rot(start_rp.position_x, start_rp.position_y);
-            let mid_x = (start_rp.position_x + stop_rp.position_x) / 2.0;
-            let mid_y = (start_rp.position_y + stop_rp.position_y) / 2.0;
-
-            let split_width_left = (min_x - start_rx).abs() * 2.0 + 2.0 * left_right_margin;
-            let split_width_right = (max_x - start_rx).abs() * 2.0 + 2.0 * left_right_margin;
-            let split_width = split_width_left.max(split_width_right);
+            // Center on the whole leg's rotated bounds, rather than its controls'
+            // midpoint. A detour can extend well beyond either control.
+            let center_rx = (min_x + max_x) / 2.0;
+            let center_ry = (min_y + max_y) / 2.0;
+            let mid_x = center_rx * rad.cos() + center_ry * rad.sin();
+            let mid_y = -center_rx * rad.sin() + center_ry * rad.cos();
+            let split_width = (max_x - min_x) + 2.0 * left_right_margin;
             let split_height = (max_y - min_y) + 2.0 * top_bottom_margin;
 
             let scale_x = if split_width > 0.0 {
@@ -869,6 +913,27 @@ fn calc_split_transformations(
                 1.0
             };
             let final_scale = scale_x.min(scale_y).min(max_auto_zoom);
+
+            // 圆形地图框：可见区域是内切圆（圆心 = 画面中心 = 整段轨迹包围盒的中心）。
+            // 只按窗口宽高收景会让轨迹贴到矩形边、被圆裁掉，所以再按「这一段里离取景中心最远
+            // 的点」收一次，让整段轨迹连边距一起留在圆内。旋转 / 镜像不改变到中心的距离，
+            // 直接在路线坐标里量即可。
+            let final_scale = if circular_framing_radius > 0.0 {
+                let mut radius_map = 0.0_f64;
+                for p in &points {
+                    let dx = p.position_x - mid_x;
+                    let dy = p.position_y - mid_y;
+                    radius_map = radius_map.max((dx * dx + dy * dy).sqrt());
+                }
+                if radius_map > 1e-9 {
+                    let margin = left_right_margin.max(top_bottom_margin);
+                    final_scale.min(circular_framing_radius / (radius_map + margin))
+                } else {
+                    final_scale
+                }
+            } else {
+                final_scale
+            };
 
             st.x = -mid_x;
             st.y = mid_y;
@@ -964,12 +1029,276 @@ mod tests {
             },
         ];
         let sts = calc_split_transformations(
-            &aligned, &splits, 0.0, 1280.0, 720.0, 0.25, 10.0, 30.0, 100.0,
+            &aligned, &[a, b], &splits, 0.0, 1280.0, 720.0, 0.25, 10.0, 30.0, 100.0, 0.0,
         );
         assert_eq!(sts.len(), 1);
         let st = sts[0];
         assert!((st.x - -50.0).abs() < 1e-6, "x {}", st.x);
         assert!((st.y - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn split_camera_contains_detours_and_subsecond_points_with_margins() {
+        for rotation in [0.0_f64, 0.6, 1.8, -2.4] {
+            let (sin, cos) = rotation.sin_cos();
+            let original: Vec<_> = [(0.0, 0.0, 0.0), (0.0, -250.0, 2.0),
+                (180.0, 320.0, 3.5), (-90.0, 30.0, 6.0), (100.0, 0.0, 10.0)]
+                .iter().map(|&(x, y, t)| RoutePoint::new(x*cos-y*sin, x*sin+y*cos, t)).collect();
+            let aligned = calc_aligned_route_points(&original);
+            let splits = [Split {position: 0, absolute_time: 0.0},
+                Split {position: 1, absolute_time: 10.0}];
+            for radius in [0.0, 120.0] {
+                let st = calc_split_transformations(&aligned, &original, &splits, 0.0,
+                    480.0, 720.0, 0.5, 20.0, 40.0, 100.0, radius)[0];
+                let (s, c) = (-st.angle.to_radians()).sin_cos();
+                for p in original.iter().chain(aligned.iter()) {
+                    let dx = p.position_x + st.x;
+                    let dy = p.position_y - st.y;
+                    let x = dx*c-dy*s;
+                    let y = dx*s+dy*c;
+                    assert!((x.abs()+20.0)*st.scale <= 120.0+1e-6, "horizontal detour clipped");
+                    assert!((y.abs()+40.0)*st.scale <= 360.0+1e-6, "vertical detour clipped");
+                    if radius > 0.0 {
+                        assert!((dx.hypot(dy)+40.0)*st.scale <= radius+1e-6);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 圆形地图框：分段取景要按内切圆再收一次，整段轨迹（含边距）都得落在圆内。
+    ///
+    /// 复现用户反馈：竖长地图框里矩形高度大于内切圆直径，矩形取景会把轨迹撑到上下边，
+    /// 圆形框就把贴边的部分裁掉了。这里用 120x210 的窗口（圆半径 60）验证两件事：
+    /// ①矩形取景确实会让轨迹越出半径 60；②给了取景圆之后整段都在圆内。
+    #[test]
+    fn circular_framing_pulls_the_whole_leg_inside_the_circle() {
+        // 一条直线轨迹：每段 300 个路线单位。
+        let points: Vec<RoutePoint> = (0..=30)
+            .map(|i| RoutePoint::new(i as f64 * 30.0, 0.0, i as f64))
+            .collect();
+        let mut style = RouteStyle::default();
+        style.route_render_mode = RenderMode::Discreet;
+        style.tail_render_mode = RenderMode::None;
+        style.show_controls = false;
+        style.show_runner = false;
+
+        let fresh = || {
+            let mut rm = RouteManager::default();
+            rm.window_width = 120.0; // 竖长窗口：高 210 > 内切圆直径 120
+            rm.window_height = 210.0;
+            rm.map_relative_width = 1.0;
+            rm.left_right_margin = 10.0;
+            rm.top_bottom_margin = 30.0;
+            rm.initialize_from_points(
+                points.clone(),
+                "0:10|0:20",
+                false,
+                style.clone(),
+                ViewMode::FixedSplit,
+                1.0,
+            );
+            rm
+        };
+
+        // 取景把段中点放到画面中心（st.x = -mid_x、st.y = mid_y），所以到中心的距离
+        // 就是 |p - mid| * scale。逐段量「最远点画出来离中心多远」。
+        let drawn_radius = |rm: &RouteManager| -> Vec<f64> {
+            let route = &rm.routes[0];
+            route
+                .split_transformations
+                .iter()
+                .enumerate()
+                .map(|(i, st)| {
+                    let (mid_x, mid_y) = (-st.x, st.y);
+                    let mut max_radius = 0.0_f64;
+                    for p in &route.aligned_route_points {
+                        if p.time >= (i * 10) as f64 && p.time <= ((i + 1) * 10) as f64 {
+                            max_radius = max_radius.max(
+                                ((p.position_x - mid_x).powi(2)
+                                    + (p.position_y - mid_y).powi(2))
+                                .sqrt(),
+                            );
+                        }
+                    }
+                    max_radius * st.scale
+                })
+                .collect()
+        };
+
+        let mut rect = fresh();
+        rect.request_full_update();
+        rect.update(0.0, 0.0);
+        let rect_radii = drawn_radius(&rect);
+        assert_eq!(rect_radii.len(), 2, "测试前提：两段取景");
+        assert!(
+            rect_radii.iter().any(|r| *r > 60.0),
+            "测试前提不成立：矩形取景没有让轨迹越过半径 60：{rect_radii:?}"
+        );
+
+        let mut circle = fresh();
+        circle.circular_framing_radius = 60.0; // 120x120 内切圆
+        circle.request_full_update();
+        circle.update(0.0, 0.0);
+        for (i, r) in drawn_radius(&circle).iter().enumerate() {
+            assert!(*r < 60.0, "第 {i} 段有轨迹越出取景圆：{r:.1} > 60");
+        }
+    }
+
+    /// 跟跑者居中的两个模式没有取景边距：地图远近只由 `centered_zoom` 决定。
+    ///
+    /// 从「固定分段」切过来时也不能沿用分段取景表算出来的缩放（那是旧的错误行为），
+    /// 必须在下一帧就被居中缩放覆盖。
+    #[test]
+    fn runner_centered_modes_use_the_configured_zoom() {
+        let points: Vec<RoutePoint> = (0..=20)
+            .map(|i| RoutePoint::new(i as f64 * 10.0, i as f64 * 5.0, i as f64))
+            .collect();
+        let mut style = RouteStyle::default();
+        style.show_controls = false;
+        style.show_runner = false;
+
+        for mode in [ViewMode::RunnerCentered, ViewMode::RunnerCenteredSplitOriented] {
+            let mut rm = RouteManager::default();
+            rm.window_width = 640.0;
+            rm.window_height = 360.0;
+            // 边距给一个夸张值：居中模式不该受它影响。
+            rm.left_right_margin = 999.0;
+            rm.top_bottom_margin = 999.0;
+            rm.centered_zoom = 0.25;
+            rm.initialize_from_points(
+                points.clone(),
+                "0:10|0:20",
+                false,
+                style.clone(),
+                mode,
+                1.0,
+            );
+            // 跳到 t=5 秒：置 instant 旗让跑者平均位置直接落到新位置（等价于拖动进度条）。
+            rm.instant_split_transition_requested = true;
+            rm.update(5.0, 33.0);
+            assert!(
+                (rm.get_scale() - 0.25).abs() < 1e-9,
+                "{mode:?} 的缩放应等于设置值 0.25，实际 {}",
+                rm.get_scale()
+            );
+            // 画面中心对着跑者：取景 x = -跑者位置 x。
+            assert!(
+                (rm.get_x() + 50.0).abs() < 5.0,
+                "{mode:?} 没把跑者放到画面中心：get_x={}",
+                rm.get_x()
+            );
+
+            // 先按固定分段算出一份缩放，再切到居中：下一帧必须换成居中缩放。
+            rm.set_view_mode(ViewMode::FixedSplit);
+            rm.update(5.0, 0.0);
+            let split_scale = rm.get_scale();
+            rm.set_view_mode(mode);
+            rm.update(5.0, 0.0);
+            assert!(
+                (rm.get_scale() - 0.25).abs() < 1e-9,
+                "{mode:?} 切换后还留着分段取景的缩放 {split_scale}"
+            );
+            // 缩放参数随时改，下一帧就生效。
+            rm.centered_zoom = 0.5;
+            rm.update(5.0, 0.0);
+            assert!((rm.get_scale() - 0.5).abs() < 1e-9);
+        }
+    }
+
+    /// 「灵敏度」（跑者平均因子）的平滑时间常数按**内容时间**算：同样的内容时长里，
+    /// 喂多少次 update（帧率高低/倍速）结果都该一致 —— 这样倍速播放时镜头不会更滞后。
+    ///
+    /// 以前调用方固定按 `1000/帧率` 喂增量：倍速时内容时间按倍速前进、平滑器却按原速
+    /// 积分，等效平滑时间被放大「倍速」倍。这个测试就是拿「同样的内容时间、两种更新
+    /// 频率」对镜头位置，并证明「固定喂小增量」会明显落后（旧写法会被抓出来）。
+    #[test]
+    fn runner_smoothing_depends_on_content_time_not_call_rate() {
+        let points: Vec<RoutePoint> = (0..=400)
+            .map(|i| RoutePoint::new(i as f64 * 10.0, 0.0, i as f64 * 0.1))
+            .collect();
+        // 从 t=0 推进到 t=1000ms（内容时间），每步喂 `step_ms` 增量。
+        let camera_x = |step_ms: f64, feed_ms: f64| {
+            let mut rm = RouteManager::default();
+            rm.window_width = 640.0;
+            rm.window_height = 360.0;
+            rm.centered_zoom = 1.0;
+            rm.set_runner_averaging_factor(2.0); // 时间常数 500ms
+            rm.initialize_from_points(
+                points.clone(),
+                "",
+                false,
+                RouteStyle::default(),
+                ViewMode::RunnerCentered,
+                1.0,
+            );
+            let mut t = 0.0;
+            while t < 1000.0 - 1e-9 {
+                t = (t + step_ms).min(1000.0);
+                rm.update(t / 1000.0, feed_ms);
+            }
+            rm.get_x()
+        };
+        let fine = camera_x(5.0, 5.0); // 200 帧/内容秒
+        let coarse = camera_x(50.0, 50.0); // 20 帧/内容秒（掉帧/低帧率）
+        assert!(
+            (fine - coarse).abs() < 8.0,
+            "更新频率不该改变镜头位置（同样内容时间）：细={fine} 粗={coarse}"
+        );
+        let wrong = camera_x(50.0, 5.0); // 旧写法：内容按 50ms 前进，增量只喂 5ms
+        assert!(
+            (fine - wrong).abs() > 20.0,
+            "固定喂小增量会让镜头明显滞后（正是倍速跟不上跑者的原因）：正确={fine} 旧写法={wrong}"
+        );
+    }
+
+    #[test]
+    fn fixed_split_transition_has_the_same_presentation_duration_at_any_speed() {
+        let points: Vec<_> = (0..=120).map(|i| {
+            if i <= 10 { RoutePoint::new(i as f64 * 10.0, 0.0, i as f64) }
+            else { RoutePoint::new(100.0, (i - 10) as f64 * 3.0, i as f64) }
+        }).collect();
+        let mut base = RouteManager::default();
+        base.window_width = 640.0;
+        base.window_height = 360.0;
+        base.initialize_from_points(points, "10|100", false,
+            RouteStyle::default(), ViewMode::FixedSplit, 1.0);
+        base.update(9.0, 0.0);
+        let sequence = |speed: f64| {
+            let mut rm = base.clone();
+            rm.update_playback(10.01, 0.0, speed);
+            let mut frames = Vec::new();
+            for frame in 1..=60 {
+                rm.update_playback(10.01 + frame as f64 * 0.02 * speed, 20.0 * speed, speed);
+                frames.push((rm.current_st, rm.smooth_split_transition_in_progress));
+            }
+            frames
+        };
+        let normal = sequence(1.0);
+        assert!(normal[24].1, "transition should still be moving at half a second");
+        assert!(!normal[59].1, "transition should finish after about one second");
+        for speed in [0.5, 2.0, 4.0, 8.0] {
+            for ((expected, moving), (actual, actual_moving)) in normal.iter().zip(sequence(speed)) {
+                assert_eq!(*moving, actual_moving, "transition duration changed at {speed}x");
+                for (a, b) in [(expected.x, actual.x), (expected.y, actual.y),
+                    (expected.angle, actual.angle), (expected.scale, actual.scale)] {
+                    assert!((a-b).abs() < 1e-8, "camera transform changed at {speed}x");
+                }
+            }
+        }
+        for mode in [ViewMode::RunnerCentered, ViewMode::RunnerCenteredSplitOriented] {
+            let mut expected = base.clone();
+            expected.set_view_mode(mode);
+            let mut actual = expected.clone();
+            for frame in 1..=60 {
+                let t = 10.01 + frame as f64 * 0.08;
+                expected.update(t, 80.0);
+                actual.update_playback(t, 80.0, 4.0);
+                assert_eq!(expected.current_st.x, actual.current_st.x);
+                assert_eq!(expected.current_st.y, actual.current_st.y);
+                assert_eq!(expected.current_st.angle, actual.current_st.angle);
+            }
+        }
     }
 
     /// Before departure the runner sits at the first track point and does not saw.

@@ -12,3 +12,7 @@ TraceReel — Windows 64 位便携版
 分享时发送整个 portable.zip 文件。
 
 工程默认保存为 .trr（TraceReel 工程）；加载时也支持旧 .orv 工程。
+
+外观等用户偏好保存在 %LOCALAPPDATA%\TraceReel\settings.ini，与工程文件分开。
+更换或覆盖解压新版程序不会覆盖此配置；本便携版默认不把用户配置放在程序目录。
+首次运行会迁移此前注册表中的主题选择；已有 settings.ini 不会被默认配置覆盖。

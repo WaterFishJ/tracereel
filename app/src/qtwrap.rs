@@ -9,6 +9,15 @@ use qmetaobject::qttypes::{QPainter, QPen};
 use qmetaobject::QImage;
 use std::ops::{Deref, DerefMut};
 
+/// Intersect with a rectangle in the painter's current coordinate system.
+pub fn qpainter_clip_rect(p: &mut QPainter, x: f64, y: f64, w: f64, h: f64) {
+    unsafe {
+        cpp!([p as "QPainter*", x as "double", y as "double", w as "double", h as "double"] {
+            p->setClipRect(QRectF(x, y, w, h), Qt::IntersectClip);
+        });
+    }
+}
+
 cpp! {{
     #include <QtGui/QImage>
     #include <QtGui/QPainter>
@@ -20,12 +29,14 @@ cpp! {{
     #include <QtGui/QGuiApplication>
     #include <QtGui/QIcon>
     #include <QtCore/QCoreApplication>
+    #include <QtCore/QSettings>
     #include <cstdlib>
     #include <cmath>
     #include <crtdbg.h>
     #include <windows.h>
     #include <cstdint>
     #include <cstring>
+    #include "user_preferences.h"
 
     // A QPainter that lives at a STABLE heap address. qttypes' by-value return memcpy's
     // the object; text rendering (QPainter::drawText) dereferences internal pointers set
@@ -35,7 +46,116 @@ cpp! {{
     static void ov_painter_delete(QPainter *p) { delete p; }
 
     #include "src/asserts_silent.h"
+    #include "map_mask.h"
 }}
+
+/// Application settings INI, outside both the installation and project folders.
+pub fn user_preferences_path() -> qmetaobject::QString {
+    unsafe {
+        cpp!([] -> qmetaobject::QString as "QString" {
+            return trPreferencesFilePath();
+        })
+    }
+}
+
+pub fn load_theme_preference() -> qmetaobject::QString {
+    unsafe {
+        cpp!([] -> qmetaobject::QString as "QString" {
+            return trLoadThemePreference();
+        })
+    }
+}
+
+pub fn save_theme_preference(name: &qmetaobject::QString) -> bool {
+    unsafe {
+        cpp!([name as "const QString*"] -> bool as "bool" {
+            return trWriteThemePreference(trPreferencesFilePath(), *name);
+        })
+    }
+}
+
+#[cfg(test)]
+mod preferences_tests {
+    use super::*;
+    use qmetaobject::QString;
+
+    fn read_at(path: &QString, legacy: &str) -> String {
+        let legacy = QString::from(legacy);
+        unsafe {
+            cpp!([path as "const QString*", legacy as "QString"] -> QString as "QString" {
+                return trReadThemePreference(*path, legacy);
+            })
+        }.to_string()
+    }
+
+    fn write_at(path: &QString, name: &str) -> bool {
+        let name = QString::from(name);
+        unsafe {
+            cpp!([path as "const QString*", name as "QString"] -> bool as "bool" {
+                return trWriteThemePreference(*path, name);
+            })
+        }
+    }
+
+    #[test]
+    fn ini_preferences_migrate_once_and_preserve_existing_user_settings() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("tracereel-preferences-{}-{nonce}", std::process::id()));
+        let nested = dir.join("user");
+        let file = nested.join("settings.ini");
+        let path = QString::from(file.to_string_lossy().as_ref());
+        // First run creates the file and migrates the previous choice.
+        assert_eq!(read_at(&path, "light"), "light");
+        assert!(std::fs::read_to_string(&file).unwrap().contains("theme=light"));
+        // A fresh process/upgrade reads the INI; registry defaults cannot replace it.
+        std::fs::write(&file, "[appearance]\ntheme=system\n[future]\nkeep=value\n").unwrap();
+        assert_eq!(read_at(&path, "dark"), "system");
+        assert!(write_at(&path, "light"));
+        assert_eq!(read_at(&path, "dark"), "light");
+        assert!(std::fs::read_to_string(&file).unwrap().contains("keep=value"));
+        assert!(!write_at(&path, "invalid"));
+        // An existing file with no theme is not replaced with a legacy/default file.
+        let existing = "[future]\nkeep=value\n";
+        std::fs::write(&file, existing).unwrap();
+        assert_eq!(read_at(&path, "light"), "dark");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), existing);
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(read_at(&path, "invalid"), "dark");
+        // Report write failures rather than treating them as successful persistence.
+        assert!(!write_at(&QString::from(nested.to_string_lossy().as_ref()), "light"));
+        std::fs::remove_file(&file).unwrap();
+        std::fs::remove_dir(&nested).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn preferences_paths_are_outside_the_installation_and_stable_across_updates() {
+        let local = QString::from("C:/Users/test/AppData/Local");
+        let family = QString::from("WaterFishJ.TraceReel_testpublisher");
+        let (portable, store) = unsafe {
+            let portable = cpp!([local as "QString"] -> QString as "QString" {
+                return trPreferencesPathFor(local, QString());
+            });
+            let store = cpp!([local as "QString", family as "QString"] -> QString as "QString" {
+                return trPreferencesPathFor(local, family);
+            });
+            (portable.to_string(), store.to_string())
+        };
+        assert_eq!(portable, "C:/Users/test/AppData/Local/TraceReel/settings.ini");
+        assert_eq!(store, "C:/Users/test/AppData/Local/Packages/WaterFishJ.TraceReel_testpublisher/LocalState/settings.ini");
+    }
+}
+
+/// Apply one mask and one opacity to the complete map/route layer.
+pub fn qpainter_draw_map_layer(p: &mut QPainter, layer: &mut QImage,
+    width: f64, height: f64, shape: i32, feather: f64, corner: f64, opacity: f64) {
+    unsafe {
+        cpp!([p as "QPainter*", layer as "QImage*", width as "double", height as "double",
+              shape as "int", feather as "double", corner as "double", opacity as "double"] {
+            ovDrawMapLayer(p, layer, width, height, shape, feather, corner, opacity);
+        });
+    }
+}
 
 /// Select the customizable controls style before creating the QML engine.
 pub fn configure_gui_style() {
@@ -333,6 +453,25 @@ pub fn qimage_save(img: &QImage, path: &str) -> bool {
     unsafe {
         cpp!([img as "QImage *", ptr as "char *"] -> bool as "bool" {
             return img->save(QString::fromUtf8(ptr));
+        })
+    }
+}
+
+/// Grab the first live QQuickWindow. Used by headless QML probes for visual regression.
+pub fn save_quick_window_screenshot(path: &str) -> bool {
+    let path = std::ffi::CString::new(path).unwrap_or_default();
+    let ptr = path.as_ptr();
+    unsafe {
+        cpp!([ptr as "char *"] -> bool as "bool" {
+            const auto windows = QGuiApplication::allWindows();
+            for (QWindow *window : windows) {
+                if (!window->isVisible()) continue;
+                if (auto *quick = qobject_cast<QQuickWindow*>(window)) {
+                    const QImage image = quick->grabWindow();
+                    return !image.isNull() && image.save(QString::fromUtf8(ptr));
+                }
+            }
+            return false;
         })
     }
 }

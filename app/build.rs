@@ -134,9 +134,11 @@ fn main() {
     // generated rust-cpp metadata stays in sync.
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=src/qtwrap.rs");
+    println!("cargo:rerun-if-changed=src/user_preferences.h");
     println!("cargo:rerun-if-changed=src/gui.rs");
     println!("cargo:rerun-if-changed=src/hud.rs");
     println!("cargo:rerun-if-changed=src/hud_painter.h");
+    println!("cargo:rerun-if-changed=src/map_mask.h");
 
     let mut c = cpp_build::Config::new();
     c.include(&qt_include);

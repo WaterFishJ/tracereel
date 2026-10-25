@@ -60,7 +60,10 @@
             <uap:SupportedFileTypes>
               <uap:FileType>.trr</uap:FileType>
             </uap:SupportedFileTypes>
-            <uap:Logo>Assets\Square44x44Logo.png</uap:Logo>
+            <!-- 必须用大像素图：Windows 把文件关联图标按图片原始像素绘制，不会放大。
+                 这里曾指向 44x44 的 Square44x44Logo.png，结果资源管理器里 .trr 的图标
+                 只有指甲盖大（.prproj 等自带 256 像素图标的才铺满格子）。 -->
+            <uap:Logo>Assets\TraceReelProject.png</uap:Logo>
           </uap3:FileTypeAssociation>
         </uap:Extension>
       </Extensions>

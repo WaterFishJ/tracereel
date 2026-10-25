@@ -25,6 +25,9 @@ use std::process::{Child, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use qmetaobject::qttypes::QPainter;
+use qmetaobject::QImage;
+
 use crate::gyro::Stabilizer;
 use crate::process::background_command;
 use crate::settings::{EncodeSettings, Settings};
@@ -232,20 +235,16 @@ pub fn encode_output_size(enc: &EncodeSettings, src_w: usize, src_h: usize) -> (
 /// 从 720p 级放大出来的（地图/路线/HUD 不受影响，它们按输出画布绘制）。现在按面板实际
 /// 像素解码：1080p 输出从 1080p 源解码，4K 输出顶到源尺寸为止，既不放大也不多解码。
 ///
-/// 与 `draw_scene` 用同一套版面算式（面板宽 = 画布宽 ×(1−地图占比)、面板高 = 画布高；
-/// 缩放系数 = min(面板宽/源宽, 面板高/源高) × 用户缩放），导出内容不含地图时地图占比按 0。
+/// 与 `draw_scene` 共用四侧固定/自由摆放的版面计算：
+/// 缩放系数 = min(面板宽/源宽, 面板高/源高) × 用户缩放；自由地图叠在完整视频面板上。
 /// 注意：gyroflow 的稳定化器与帧尺寸强绑定，尺寸变了必须重新加载（见
 /// [`reload_export_stabs_if_needed`]）。
 pub fn export_decode_size(settings: &Settings, src_w: usize, src_h: usize) -> (usize, usize) {
     let src = (src_w.max(2), src_h.max(2));
     let (out_w, out_h) = encode_output_size(&settings.encode, src.0, src.1);
-    let rel_w = if settings.encode.include_map && crate::gui::map_configured(settings) {
-        settings.map.relative_width
-    } else {
-        0.0
-    };
-    let vp_w = (1.0 - rel_w).max(0.05) * out_w as f64;
-    let vp_h = out_h as f64;
+    let panel = crate::gui::scene_panels(settings, out_w as f64, out_h as f64).video;
+    let vp_w = panel.width.max(1.0);
+    let vp_h = panel.height.max(1.0);
     let base = (vp_w / src.0 as f64).min(vp_h / src.1 as f64);
     // 视频被画成的像素尺寸 = 源尺寸 × base × 用户缩放；超过源尺寸没有意义（k 上限 1）。
     let k = (base * settings.video.scale).clamp(0.05, 1.0);
@@ -1676,10 +1675,12 @@ impl EncodePrep {
                 w: 0,
                 h: 0,
                 start_ms: 0.0,
+                rms: Vec::new(),
                 rm: Default::default(),
             });
         }
-        let gpx = if settings.encode.include_hud {
+        // Map-only exports also need the GPX clock when the bitmap has no embedded route.
+        let gpx = if settings.encode.include_hud || !settings.encode.include_video {
             // 与预览/离屏渲染同一条解析路径：GPX → 视频同名 .gpx → 轨迹自带的时间轴。
             crate::gui::resolve_hud_track(
                 &settings.hud.gpx_file_path,
@@ -1691,6 +1692,47 @@ impl EncodePrep {
         };
         Ok(Self { maps, gpx })
     }
+}
+
+/// 画「当前活动地图」的全部地图框（普通导出与 map_only 导出共用）。
+///
+/// - 图层顺序 = `PreparedMap.rms` 顺序（= `gui::effective_placements` 的框顺序，数组先画的在下层）；
+/// - 每个框的画布矩形 / 旋转 / 视频区都由 `gui::draw_scene_layers` 内部按
+///   `composition::scene_layout` 统一计算，这里**不自己算几何**；
+/// - 没有地图层（没勾地图 / 没配地图 / 这块地图没有位图）时传空图层，
+///   画面只剩视频（或黑底）+ HUD，与单框时代行为一致；
+/// - `rms` 长度由地图框数决定（现在是 1，多框后是 N），按长度遍历、不假设 1。
+#[allow(clippy::too_many_arguments)]
+fn draw_active_map_layers(
+    p: &mut QPainter,
+    settings: &Settings,
+    video: Option<&QImage>,
+    prep: &EncodePrep,
+    map_index: usize,
+    map_img: Option<&QImage>,
+    out_w: f64,
+    out_h: f64,
+    t_ms: f64,
+) {
+    let map = &prep.maps[map_index];
+    let mut layers: Vec<crate::gui::SceneLayer<'_>> = Vec::new();
+    if let Some(map_img) = map_img.filter(|_| settings.encode.include_map) {
+        let placements = crate::gui::effective_placements(settings);
+        layers.reserve(map.rms.len().min(placements.len()));
+        for (i, rm) in map.rms.iter().enumerate() {
+            // 框数比取景器少/多都不会崩：只画两者都有的那些框。
+            let Some(placement) = placements.get(i).copied() else {
+                break;
+            };
+            layers.push(crate::gui::SceneLayer {
+                rm,
+                map: map_img,
+                placement,
+                route_start_ms: map.start_ms,
+            });
+        }
+    }
+    crate::gui::draw_scene_layers(p, settings, video, &layers, out_w, out_h, t_ms, prep.gpx.as_ref());
 }
 
 /// Everything a full export run needs, moved onto the encode thread. Pure data + the
@@ -2048,9 +2090,9 @@ fn encode_export_attempt(job: EncodeJob, publish_done: bool) -> Option<String> {
         mut stabs,
         segs,
     } = job;
-    if !settings.encode.include_map {
-        settings.map.relative_width = 0.0;
-    }
+    // 版面只由 `include_map` / `include_video` 两个标志决定（`composition::scene_layout`）。
+    // 旧单框时代这里用 `map.relative_width = 0.0` 模拟「没有地图层、视频铺满」；新版面已经
+    // 按标志算，再改 relative_width 反而会把多框工程里第 1 框的贴边量算错，故删除该补丁。
     if !settings.encode.include_hud {
         settings.hud.layout = Some(crate::hud::Layout {
             version: 1,
@@ -2119,6 +2161,9 @@ fn encode_export_attempt(job: EncodeJob, publish_done: bool) -> Option<String> {
     let total =
         (((((clip_end - clip_start) / 1000.0) * out_fps) / speed_n).round() as usize).max(1);
     let dt_out = 1000.0 / out_fps;
+    // 跟随跑者按内容时间平滑；update_playback 会将固定分段的转图动画
+    // 换算成输出帧时间，避免倍速时动画也加速。
+    let cam_dt = dt_out * speed_n;
     // Optional per-stage profiling (TRACEREEL_TIME=1): decode / stabilize / draw / pack / write.
     let prof = std::env::var("TRACEREEL_TIME").is_ok();
     let mut t_dec = 0.0f64;
@@ -2169,12 +2214,15 @@ fn encode_export_attempt(job: EncodeJob, publish_done: bool) -> Option<String> {
         let preroll_s = 10.0f64;
         let warm_end = clip_start / 1000.0;
         let mut wt = (warm_end - preroll_s).max(0.0);
-        let step = dt_out / 1000.0;
+        let step = cam_dt / 1000.0;
         while wt < warm_end {
             // Warm up EVERY map's runner-smoothing, not just the one active at
             // clip_start: a later map switch must not "settle" on its first frame.
+            // 每个地图 × 每个地图框各有一套取景器（rms），全部预热。
             for m in &mut prep.maps {
-                m.rm.update(wt, dt_out);
+                for rm in &mut m.rms {
+                    rm.update_playback(wt, cam_dt, speed_n);
+                }
             }
             wt += step;
         }
@@ -2361,33 +2409,29 @@ fn encode_export_attempt(job: EncodeJob, publish_done: bool) -> Option<String> {
         let mut canvas = crate::qtwrap::qimage_new_argb32(out_w as i32, out_h as i32);
         {
             let mut p = crate::qtwrap::qpainter_on_image(&mut canvas);
-            // Advance EVERY map's runner/camera (state must be live at a switch),
-            // render the one active on the global timeline.
+            // Advance EVERY map's runner/camera (state must be live at a switch), and
+            // every map box's camera; render the map active on the global timeline.
             for m in &mut prep.maps {
-                m.rm.update(t_global / 1000.0, dt_out);
+                for rm in &mut m.rms {
+                    rm.update_playback(t_global / 1000.0, cam_dt, speed_n);
+                }
             }
             let mi = crate::gui::locate_map(&map_starts, t_global);
-            let map_layer = if settings.encode.include_map {
-                map_imgs[mi].clone()
-            } else {
-                None
-            };
             let video_layer = if settings.encode.include_video {
-                Some(video_img)
+                Some(&video_img)
             } else {
                 None
             };
-            crate::gui::draw_scene(
+            draw_active_map_layers(
                 &mut p,
-                &prep.maps[mi].rm,
                 &settings,
-                map_layer,
                 video_layer,
+                &prep,
+                mi,
+                map_imgs[mi].as_ref(),
                 out_w as f64,
                 out_h as f64,
                 t_global,
-                prep.maps[mi].start_ms,
-                prep.gpx.as_ref(),
             );
         }
         if prof {
@@ -2490,7 +2534,9 @@ fn encode_export_map_only_run(job: EncodeJob, mark_done: bool) {
         }
     };
     // A route-driven export has no video panel; map and HUD remain independent layers.
-    settings.map.relative_width = 1.0;
+    settings.encode.include_video = false;
+    // 不再用 `relative_width = 1.0` 模拟「地图铺满整幅」：新版面由 scene_layout 决定 ——
+    // 无视频时贴边的第 1 框自动铺满整幅，自由框保持自己的矩形（多框就叠在黑底上）。
     settings.encode.audio_codec = "none".into();
     if !settings.encode.include_hud {
         settings.hud.layout = Some(crate::hud::Layout {
@@ -2542,6 +2588,8 @@ fn encode_export_map_only_run(job: EncodeJob, mark_done: bool) {
     // Export speed applies to map-only too: sample the route timeline N× faster.
     let speed_n = encode_speed_ratio(&settings.encode);
     let dt_out = 1000.0 / out_fps;
+    // 与普通导出共用双时间轴：跟随跑者用内容时间，固定分段转图用成片时间。
+    let cam_dt = dt_out * speed_n;
     let total =
         (((((clip_end - clip_start) / 1000.0) * out_fps) / speed_n).round() as usize).max(1);
     handle.set_progress(EncodeProgress {
@@ -2587,10 +2635,13 @@ fn encode_export_map_only_run(job: EncodeJob, mark_done: bool) {
     if clip_start > 0.0 {
         let warm_end = clip_start / 1000.0;
         let mut wt = (warm_end - 10.0).max(0.0);
-        let step = dt_out / 1000.0;
+        let step = cam_dt / 1000.0;
         while wt < warm_end {
+            // 每个地图 × 每个地图框的取景器都要预热（见普通导出的同一段说明）。
             for m in &mut prep.maps {
-                m.rm.update(wt, dt_out);
+                for rm in &mut m.rms {
+                    rm.update_playback(wt, cam_dt, speed_n);
+                }
             }
             wt += step;
         }
@@ -2618,24 +2669,21 @@ fn encode_export_map_only_run(job: EncodeJob, mark_done: bool) {
             let mut p = crate::qtwrap::qpainter_on_image(&mut canvas);
             let secs = t_ms / 1000.0;
             for m in &mut prep.maps {
-                m.rm.update(secs, dt_out);
+                for rm in &mut m.rms {
+                    rm.update_playback(secs, cam_dt, speed_n);
+                }
             }
             let mi = crate::gui::locate_map(&map_starts, t_ms);
-            crate::gui::draw_scene(
+            draw_active_map_layers(
                 &mut p,
-                &prep.maps[mi].rm,
                 &settings,
-                if settings.encode.include_map {
-                    map_imgs[mi].clone()
-                } else {
-                    None
-                },
                 None,
+                &prep,
+                mi,
+                map_imgs[mi].as_ref(),
                 out_w as f64,
                 out_h as f64,
                 t_ms,
-                prep.maps[mi].start_ms,
-                prep.gpx.as_ref(),
             );
         }
         let frame = crate::qtwrap::qimage_to_bgra(&canvas);
@@ -2783,6 +2831,411 @@ mod tests {
         s.video.scale = 1.0;
         s.encode.include_map = false;
         assert_eq!(export_decode_size(&s, 2688, 2016), (1440, 1080));
+    }
+
+    #[test]
+    fn export_decode_size_respects_docks_and_overlay() {
+        let mut s = Settings::default();
+        s.encode.resolution = "1920x1080".into();
+        s.map.image_file_path = "map.png".into();
+        s.map.relative_width = 0.5;
+        for mode in [0, 1] {
+            s.map.placement = mode;
+            assert_eq!(export_decode_size(&s, 1920, 1080), (960, 540));
+        }
+        s.map.placement = 4;
+        assert_eq!(export_decode_size(&s, 1920, 1080), (1920, 1080));
+        s.encode.include_map = false;
+        s.map.placement = 2;
+        assert_eq!(export_decode_size(&s, 1920, 1080), (1920, 1080));
+    }
+
+    /// 多地图框（自由叠加）不改变导出解码尺寸：视频区仍是整幅画布。
+    ///
+    /// `export_decode_size` 只读 `scene_panels().video`，而 `composition::scene_layout`
+    /// 规定「只有第 1 个框可以贴边，第 2 个及以后的框一律自由叠加」——自由框不挤压视频区。
+    /// 所以多框工程的导出解码尺寸必须与「没有地图层」完全一致；这里同时用两个自由框的
+    /// `scene_layout` 钉住这条真相（多框落地后 `effective_placements` 返回 N 个框时，
+    /// `export_decode_size` 无需改动）。
+    #[test]
+    fn export_decode_size_is_unchanged_by_free_overlay_boxes() {
+        let mut s = Settings::default();
+        s.encode.resolution = "1920x1080".into();
+        let without_map = export_decode_size(&s, 2688, 2016);
+
+        s.map.image_file_path = "map.png".into();
+        s.map.placement = 4; // 自由叠加
+        assert_eq!(export_decode_size(&s, 2688, 2016), without_map);
+
+        // 两个自由框：视频区仍是整幅（上面「解码尺寸不变」的依据）。
+        let first = s.map.placement();
+        let mut second = first;
+        second.frame.x = 0.6;
+        second.frame.y = 0.5;
+        let layout = crate::composition::scene_layout(&[first, second], 1920.0, 1080.0, true, true);
+        assert_eq!(
+            layout.video,
+            crate::composition::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0
+            }
+        );
+
+        // 对照：第 1 框贴边（单框 docked）会挤压视频区 → 解码尺寸变小。
+        // 说明多框时只有「不能贴边的多余框」是免费叠加的。
+        s.map.placement = 0;
+        s.map.relative_width = 0.5;
+        assert_eq!(export_decode_size(&s, 1920, 1080), (960, 540));
+    }
+
+    /// 占位（无地图位图 / 无取景器）时导出帧仍能正常合成：不 panic、保持黑底。
+    /// 覆盖 `draw_active_map_layers` 的空图层与空 `rms` 分支（只导视频、或地图加载失败的工程）。
+    #[test]
+    fn draw_active_map_layers_tolerates_placeholder_maps() {
+        let mut s = Settings::default();
+        s.hud.layout = Some(crate::hud::Layout {
+            version: 1,
+            widgets: Vec::new(),
+        });
+        s.encode.include_map = true;
+        s.encode.include_video = false;
+        let prep = EncodePrep {
+            maps: vec![crate::gui::PreparedMap {
+                rgba: Vec::new(),
+                w: 0,
+                h: 0,
+                start_ms: 0.0,
+                rm: Default::default(),
+                rms: Vec::new(),
+            }],
+            gpx: None,
+        };
+        let mut img = crate::qtwrap::qimage_new_argb32(64, 36);
+        {
+            let mut p = crate::qtwrap::qpainter_on_image(&mut img);
+            draw_active_map_layers(&mut p, &s, None, &prep, 0, None, 64.0, 36.0, 0.0);
+        }
+        let rgba = crate::qtwrap::qimage_to_rgba(&img);
+        assert_eq!(&rgba[..4], &[0, 0, 0, 255], "占位地图应画成黑底");
+    }
+
+    /// 多框导出路径像素回归：`EncodePrep::build` → `draw_active_map_layers`。
+    ///
+    /// 用真实的小地图文件（临时纯红 PNG）跑 build，确保「每张地图解析一次 → 每框一套
+    /// 取景器（rms）→ 逐框绘制」这条导出链路是通的：两个自由框各自画出地图，
+    /// 两框之间的空白保持黑底。
+    #[test]
+    fn multi_box_export_paints_every_box() {
+        let dir = std::env::temp_dir().join(format!(
+            "tracereel-multibox-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let map_path = dir.join("map.png");
+        let map_src =
+            crate::qtwrap::qimage_from_rgba(1000, 1000, &[220, 60, 40, 255].repeat(1_000_000));
+        assert!(crate::qtwrap::qimage_save(
+            &map_src,
+            map_path.to_str().unwrap()
+        ));
+
+        let mut s = Settings::default();
+        s.map.image_file_path = map_path.to_string_lossy().into_owned();
+        s.map.layout = crate::settings::MapLayout {
+            version: crate::settings::MAP_LAYOUT_VERSION,
+            boxes: vec![
+                crate::settings::MapBox {
+                    mode: 4,
+                    x: 0.05,
+                    y: 0.1,
+                    w: 0.35,
+                    h: 0.7,
+                    rotation: 15.0,
+                    ..Default::default()
+                },
+                crate::settings::MapBox {
+                    mode: 4,
+                    x: 0.55,
+                    y: 0.15,
+                    w: 0.35,
+                    h: 0.7,
+                    rotation: -25.0,
+                    ..Default::default()
+                },
+            ],
+        };
+        s.map.sync_legacy_from_layout(&mut s.route);
+        s.encode.include_video = false;
+        s.encode.map_only = true;
+        s.encode.include_hud = false;
+        s.hud.layout = Some(crate::hud::Layout {
+            version: 1,
+            widgets: Vec::new(),
+        });
+
+        let (w, h) = (400usize, 240usize);
+        let prep = EncodePrep::build(&s, w, h).expect("EncodePrep::build 失败");
+        assert_eq!(prep.maps.len(), 1, "只配了一张地图");
+        assert_eq!(prep.maps[0].rms.len(), 2, "两个框应各自有一套取景器");
+        let map_img =
+            crate::qtwrap::qimage_from_rgba(prep.maps[0].w, prep.maps[0].h, &prep.maps[0].rgba);
+        let mut canvas = crate::qtwrap::qimage_new_argb32(w as i32, h as i32);
+        {
+            let mut p = crate::qtwrap::qpainter_on_image(&mut canvas);
+            draw_active_map_layers(
+                &mut p,
+                &s,
+                None,
+                &prep,
+                0,
+                Some(&map_img),
+                w as f64,
+                h as f64,
+                0.0,
+            );
+        }
+        let rgba = crate::qtwrap::qimage_to_rgba(&canvas);
+        let boxes = crate::composition::scene_layout(
+            &crate::gui::effective_placements(&s),
+            w as f64,
+            h as f64,
+            true,
+            false,
+        )
+        .boxes;
+        assert_eq!(boxes.len(), 2);
+        for (i, b) in boxes.iter().enumerate() {
+            let cx = ((b.rect.x + b.rect.width / 2.0) as usize).min(w - 1);
+            let cy = ((b.rect.y + b.rect.height / 2.0) as usize).min(h - 1);
+            let k = (cy * w + cx) * 4;
+            assert!(
+                rgba[k] > 200 && rgba[k + 1] < 70 && rgba[k + 2] < 70,
+                "第 {i} 框中心 ({cx},{cy}) 不是地图红: {:?}",
+                &rgba[k..k + 4]
+            );
+        }
+        // 两框之间（x 方向中间、y 居中）没有框覆盖 → 黑底。
+        let k = (h / 2 * w + w / 2) * 4;
+        assert!(
+            rgba[k] < 60 && rgba[k + 1] < 60 && rgba[k + 2] < 60,
+            "两框之间应为黑底: {:?}",
+            &rgba[k..k + 4]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 多框导出使用**逐框轨迹样式**：`EncodePrep::build`（真实读图）+ 生产
+    /// `gui::build_frame_managers`（每框样式写进对应 RM）→ `draw_active_map_layers`。
+    ///
+    /// 两个自由框：框0 红路线/线宽 12/完整渲染，框1 绿路线/线宽 6/单段渲染；
+    /// 时间校准（按表-出发 3s、录像-出发 1s → runner 偏移 2s）必须保持全局一致。
+    #[test]
+    fn multi_box_export_uses_per_box_styles() {
+        let dir = std::env::temp_dir().join(format!(
+            "tracereel-multibox-style-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let map_path = dir.join("map.png");
+        let map_src =
+            crate::qtwrap::qimage_from_rgba(1000, 1000, &[60, 60, 60, 255].repeat(1_000_000));
+        assert!(crate::qtwrap::qimage_save(
+            &map_src,
+            map_path.to_str().unwrap()
+        ));
+
+        let mut s = Settings::default();
+        let mut red = crate::settings::MapBoxStyle::from_route(&s.route);
+        red.render_mode = 1;
+        red.render_scope = 0;
+        red.width = 12.0;
+        red.tail_render_mode = 0;
+        red.show_controls = false;
+        red.show_runner = false;
+        red.route_color = "#ff0000".into();
+        red.route_opacity = 255.0;
+        red.pace_auto = false;
+        red.tail_pace_auto = false;
+        let mut green = red.clone();
+        green.render_scope = 1;
+        green.width = 6.0;
+        green.route_color = "#00ff00".into();
+
+        s.map.image_file_path = map_path.to_string_lossy().into_owned();
+        s.map.layout = crate::settings::MapLayout {
+            version: crate::settings::MAP_LAYOUT_VERSION,
+            boxes: vec![
+                crate::settings::MapBox {
+                    mode: 4,
+                    x: 0.02,
+                    y: 0.03,
+                    w: 0.3,
+                    h: 0.94,
+                    view_mode: 1,
+                    view_zoom: 0.5,
+                    style: Some(red),
+                    ..Default::default()
+                },
+                crate::settings::MapBox {
+                    mode: 4,
+                    x: 0.68,
+                    y: 0.03,
+                    w: 0.3,
+                    h: 0.94,
+                    view_mode: 1,
+                    view_zoom: 0.5,
+                    style: Some(green),
+                    ..Default::default()
+                },
+            ],
+        };
+        s.map.sync_legacy_from_layout(&mut s.route);
+        s.route.control_time_offset = 3.0;
+        s.video.start_time_offset_s = 1.0;
+        s.encode.include_video = false;
+        s.encode.map_only = true;
+        s.encode.include_hud = false;
+        s.hud.layout = Some(crate::hud::Layout {
+            version: 1,
+            widgets: Vec::new(),
+        });
+
+        let (w, h) = (900usize, 300usize);
+        let mut prep = EncodePrep::build(&s, w, h).expect("EncodePrep::build 失败");
+        assert_eq!(prep.maps.len(), 1, "只配了一张地图");
+        // 生产路径：每框一套取景器，且每框自己的样式写进对应 RM。
+        let mut base = tracereel_core::route_manager::RouteManager::default();
+        let points: Vec<tracereel_core::route::RoutePoint> = (0..=60)
+            .map(|i| {
+                let mut p = tracereel_core::route::RoutePoint::new(
+                    100.0 + i as f64 * 10.0,
+                    300.0 + (i % 10) as f64 * 4.0,
+                    i as f64,
+                );
+                p.pace = 5.0 + (i % 7) as f64;
+                p
+            })
+            .collect();
+        base.initialize_from_points(
+            points,
+            "0:10|0:20|0:40",
+            false,
+            crate::gui::route_style_from_settings(&s),
+            tracereel_core::route_manager::ViewMode::RunnerCentered,
+            1.0,
+        );
+        prep.maps[0].rms = crate::gui::build_frame_managers(&s, &base, w as f64, h as f64);
+        assert_eq!(prep.maps[0].rms.len(), 2, "两个框应各自有一套取景器");
+
+        let st0 = prep.maps[0].rms[0].routes[0].style.clone();
+        let st1 = prep.maps[0].rms[1].routes[0].style.clone();
+        assert!(
+            (st0.route_width - 12.0).abs() < 1e-9 && (st1.route_width - 6.0).abs() < 1e-9,
+            "逐框线宽未生效: {} / {}",
+            st0.route_width,
+            st1.route_width
+        );
+        assert_eq!(
+            (st0.render_scope, st1.render_scope),
+            (0, 1),
+            "逐框渲染范围未生效"
+        );
+        assert!(
+            st0.route_color.0 > 0.9 && st0.route_color.1 < 0.1,
+            "框0 路线应红: {:?}",
+            st0.route_color
+        );
+        assert!(
+            st1.route_color.1 > 0.9 && st1.route_color.0 < 0.1,
+            "框1 路线应绿: {:?}",
+            st1.route_color
+        );
+        // 校准时间保持全局：逐框样式不得改它。
+        for (i, rm) in prep.maps[0].rms.iter().enumerate() {
+            let route = &rm.routes[0];
+            assert!(
+                (route.control_time_offset - 3.0).abs() < 1e-9,
+                "框{i} control_time_offset 被逐框样式改掉"
+            );
+            assert!(
+                (route.runner_time_offset - 2.0).abs() < 1e-9,
+                "框{i} runner_time_offset 被逐框样式改掉"
+            );
+            assert!((route.style.control_time_offset - 3.0).abs() < 1e-9);
+            assert!((route.style.runner_time_offset - 2.0).abs() < 1e-9);
+        }
+
+        // 渲染 t=15s（第 2 段）：框0 红（完整渲染）、框1 绿（单段渲染）。
+        for rm in prep.maps[0].rms.iter_mut() {
+            rm.instant_split_transition_requested = true;
+            rm.update(15.0, 0.0);
+        }
+        let map_img =
+            crate::qtwrap::qimage_from_rgba(prep.maps[0].w, prep.maps[0].h, &prep.maps[0].rgba);
+        let mut canvas = crate::qtwrap::qimage_new_argb32(w as i32, h as i32);
+        {
+            let mut p = crate::qtwrap::qpainter_on_image(&mut canvas);
+            draw_active_map_layers(
+                &mut p,
+                &s,
+                None,
+                &prep,
+                0,
+                Some(&map_img),
+                w as f64,
+                h as f64,
+                15_000.0,
+            );
+        }
+        let rgba = crate::qtwrap::qimage_to_rgba(&canvas);
+        let boxes = crate::composition::scene_layout(
+            &crate::gui::effective_placements(&s),
+            w as f64,
+            h as f64,
+            true,
+            false,
+        )
+        .boxes;
+        assert_eq!(boxes.len(), 2);
+        let in_box = |x: usize, y: usize, b: &crate::composition::SceneBox| {
+            let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+            px >= b.rect.x
+                && px <= b.rect.x + b.rect.width
+                && py >= b.rect.y
+                && py <= b.rect.y + b.rect.height
+        };
+        let (mut red0, mut green0, mut red1, mut green1) = (0usize, 0usize, 0usize, 0usize);
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let (r, g, b) = (rgba[i], rgba[i + 1], rgba[i + 2]);
+                let is_red = r > 150 && g < 100 && b < 100;
+                let is_green = g > 150 && r < 100 && b < 100;
+                if in_box(x, y, &boxes[0]) {
+                    if is_red {
+                        red0 += 1;
+                    }
+                    if is_green {
+                        green0 += 1;
+                    }
+                }
+                if in_box(x, y, &boxes[1]) {
+                    if is_red {
+                        red1 += 1;
+                    }
+                    if is_green {
+                        green1 += 1;
+                    }
+                }
+            }
+        }
+        assert!(red0 > 150, "框0 没画出红路线（{red0} px）");
+        assert!(green1 > 30, "框1 没画出绿路线（{green1} px）");
+        assert_eq!(green0, 0, "框0 出现绿像素：逐框样式串了");
+        assert_eq!(red1, 0, "框1 出现红像素：逐框样式串了");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

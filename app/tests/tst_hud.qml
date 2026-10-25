@@ -55,6 +55,30 @@ Item {
             keyClick(Qt.Key_Right)
             verify(editor.current.x>x)
         }
+        function test_preview_selection_shows_matching_config_and_blank_dismisses() {
+            editor.setMetricEnabled("speed",true)
+            editor.setMetricEnabled("heading",true)
+            editor.selected=-1
+            var panel=findChild(editor,"hudWidgetConfig")
+            var title=findChild(editor,"hudWidgetConfigTitle")
+            verify(panel!==null)
+            verify(title!==null)
+            // Keep the panel visible in the test window so effective visibility can be checked.
+            editor.visible=true
+            wait(20)
+            verify(!panel.visible)
+            var speed=editor.layout.widgets[0],heading=editor.layout.widgets[1]
+            mouseClick(canvas,(speed.x+speed.w/2)*canvas.width,(speed.y+speed.h/2)*canvas.height,Qt.LeftButton)
+            compare(editor.selected,0)
+            verify(panel.visible)
+            compare(title.text,"速度 · 半圆码表")
+            mouseClick(canvas,(heading.x+heading.w/2)*canvas.width,(heading.y+heading.h/2)*canvas.height,Qt.LeftButton)
+            compare(editor.selected,1)
+            compare(title.text,"航向 · 指南针")
+            mouseClick(canvas,canvas.width*.9,canvas.height*.9,Qt.LeftButton)
+            compare(editor.selected,-1)
+            verify(!panel.visible)
+        }
         function test_resize_rotate_visibility_and_snap() {
             editor.setMetricEnabled("speed",true);wait(20)
             var w=editor.current.w

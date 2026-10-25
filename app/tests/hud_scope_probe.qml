@@ -89,6 +89,15 @@ Item {
         }
         return null
     }
+    function findByName(node, name) {
+        if (!node) return null
+        if (node.objectName === name) return node
+        if (node.children) for (var i = 0; i < node.children.length; i++) {
+            var found = findByName(node.children[i], name)
+            if (found) return found
+        }
+        return null
+    }
     function findComboBox(node) {
         if (!node || !node.children) return null
         var kids = node.children
@@ -217,22 +226,14 @@ Item {
             var noVideo = win.debugGet("encode_include_video") === false
             say("工程已加载: " + state() + " includeVideo=" + win.debugGet("encode_include_video")
                 + " includeHud=" + win.debugGet("encode_include_hud") + " hud_viewport=" + vpText())
-            // 「画面占比」：没有视频时地图铺满整帧，这一行必须灰显只读、恒显 100%，并带悬停提示。
-            var shareRow = findByLabel(win.contentItem, "画面占比 (%)")
-            if (!shareRow) { finish(false, "轨迹页找不到「画面占比」行"); return }
-            var shareField = null
-            for (var si = 0; si < shareRow.children.length; ++si) {
-                var sc = shareRow.children[si]
-                // 输入框有 readOnly，Label 没有；靠这个把两者分开。
-                if (sc && sc.readOnly !== undefined && typeof sc.enabled === "boolean") shareField = sc
-            }
-            if (!shareField) { finish(false, "「画面占比」行里找不到输入框"); return }
+            // Fixed layouts now expose width/height in the map layout editor.
+            var shareField = findByName(win.contentItem, "mapStripShare")
+            if (!shareField) { finish(false, "轨迹页找不到地图布局的占比输入框"); return }
             if (noVideo) {
                 if (shareField.enabled) { finish(false, "没有视频时「画面占比」应灰显只读"); return }
                 if (String(shareField.text) !== "100.0") {
                     finish(false, "没有视频时「画面占比」应固定显示 100.0，实际 " + shareField.text); return
                 }
-                if (String(shareRow.hint).length === 0) { finish(false, "「画面占比」灰显时缺少悬停提示"); return }
             } else {
                 if (!shareField.enabled) { finish(false, "有视频时「画面占比」不该灰显"); return }
                 var wantShare = (mapShare * 100).toFixed(1)

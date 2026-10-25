@@ -62,7 +62,12 @@ try {
         @('Square310x310Logo.png', 310, 310, $transparent),
         @('Square310x310Logo.scale-200.png', 620, 620, $transparent),
         @('Wide310x150Logo.png', 310, 150, $brand),
-        @('Wide310x150Logo.scale-200.png', 620, 300, $brand)
+        @('Wide310x150Logo.scale-200.png', 620, 300, $brand),
+        # `.trr` 文件关联图标（AppxManifest.xml 里 FileTypeAssociation 的 Logo）。
+        # 资源管理器不会放大位图：图小于请求尺寸时会被原尺寸塞进目标格子里（44 像素的
+        # 方块图在大图标视图里只有指甲盖大）。所以这里直接给 512 像素，覆盖 100%~200%
+        # 缩放下的最大图标（256 逻辑像素），小尺寸由系统缩小。
+        @('TraceReelProject.png', 512, 512, $transparent)
     )
     foreach ($asset in $assets) {
         $path = Join-Path $Destination $asset[0]

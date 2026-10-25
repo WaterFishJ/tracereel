@@ -11,11 +11,21 @@ ApplicationWindow {
     height: 900
     title: "TraceReel · 迹映"
     font.pixelSize: 13
-    font.family: Theme.font_family
+    // Resolve an installed sans-serif family instead of letting Qt choose an
+    // arbitrary fallback when the preferred Windows font is unavailable.
+    readonly property string uiFontFamily: {
+        var available = Qt.fontFamilies()
+        var preferred = [Theme.font_family, "Microsoft YaHei", "Noto Sans SC", "Segoe UI"]
+        for (var i = 0; i < preferred.length; ++i)
+            if (available.indexOf(preferred[i]) >= 0) return preferred[i]
+        return "sans-serif"
+    }
+    font.family: uiFontFamily
     color: Theme.background
     ReceiptImport {
         id: receiptImport
         parent: Overlay.overlay
+        warningColor: Theme.warning
         onImported: function(times, codes, relative) {
             settings.split_is_relative = relative
             settings.split_times = times
@@ -29,8 +39,8 @@ ApplicationWindow {
     // （文本框/下拉框/菜单/弹层/滚动条/工具提示/进度条/数字框…）就都跟着主题走了。
     palette.window: Theme.background
     palette.windowText: Theme.text
-    palette.base: Theme.background2
-    palette.alternateBase: Theme.background
+    palette.base: Theme.field
+    palette.alternateBase: Theme.surface
     palette.text: Theme.text
     palette.button: Theme.button
     palette.buttonText: Theme.text
@@ -38,62 +48,85 @@ ApplicationWindow {
     palette.highlightedText: Theme.text_on_accent
     palette.mid: Theme.popup_border
     palette.dark: Theme.hr
+    palette.disabled.text: Theme.disabled
+    palette.disabled.buttonText: Theme.disabled
+    palette.disabled.windowText: Theme.disabled
 
-    // ---------- 复用控件：外观全部对齐原版 Gyroflow（Theme 令牌 + 原版尺寸/动画） ----------
-    // 分区：原版设置面板是「加粗标题 + 1px 分隔线」，没有灰底标题条。
-    component GroupBox: Column {
+    // ---------- 复用控件：专业创作工具的紧凑卡片与明确层级 ----------
+    // 配置分区使用真正的容器，而不再只是标题加分隔线。默认属性仍落在内容 Column，
+    // 因此各页原有的字段、可见性联动与写回逻辑无需调整。
+    component GroupBox: Rectangle {
+        id: group
         property string title
+        property alias spacing: contentColumn.spacing
+        default property alias content: contentColumn.data
         width: parent ? (parent.width - 2 * (parent.padding ? parent.padding : 0)) : 0
-        spacing: 6
+        implicitHeight: contentColumn.implicitHeight + 58
+        height: implicitHeight
+        color: Theme.surface
+        radius: Theme.radius_panel * Theme.dpi_scale
+        border.width: 1
+        border.color: Theme.hr
         Label {
-            width: parent.width
-            text: title
+            x: 12; y: 10; width: parent.width - 24; height: 22
+            text: group.title
             font.bold: true
             font.pixelSize: 14
             color: Theme.text
+            verticalAlignment: Text.AlignVCenter
         }
-        Rectangle { width: parent.width; height: 1; color: Theme.hr }
+        Rectangle { x: 12; y: 38; width: parent.width - 24; height: 1; color: Theme.hr }
+        Column {
+            id: contentColumn
+            x: 12; y: 48
+            width: parent.width - 24
+            spacing: 8
+        }
     }
     // 按钮（对齐原版 components/Button.qml：圆角 6、浅色描边、hover 提亮、按下 0.97 缩放动画）
     component TButton: Button {
         id: tb
+        font.family: win.uiFontFamily
         property bool small: false
+        property bool primary: false
         implicitHeight: small ? 24 * Theme.dpi_scale : 32 * Theme.dpi_scale
         leftPadding: (small ? 8 : 14) * Theme.dpi_scale
         rightPadding: (small ? 8 : 14) * Theme.dpi_scale
         font.pixelSize: small ? 12 : 13
+        font.bold: primary
         background: Rectangle {
-            color: (tb.flat && !tb.hovered && !tb.down) ? "transparent"
-                 : ((tb.hovered || tb.down || tb.activeFocus) ? Qt.lighter(Theme.button, 1.2) : Theme.button)
-            radius: 6 * Theme.dpi_scale
-            border.width: Theme.dark ? 0 : 1
-            border.color: Theme.popup_border
+            color: !tb.enabled ? Theme.surface
+                 : (tb.flat && !tb.hovered && !tb.down) ? "transparent"
+                 : tb.primary ? (tb.down ? Qt.darker(Theme.accent, 1.12) : tb.hovered ? Qt.lighter(Theme.accent, 1.08) : Theme.accent)
+                 : ((tb.hovered || tb.down) ? Theme.surface_hover : Theme.button)
+            radius: Theme.radius_control * Theme.dpi_scale
+            border.width: tb.primary || tb.flat ? 0 : 1
+            border.color: tb.activeFocus ? Theme.focus : Theme.popup_border
             Behavior on color { ColorAnimation { duration: 100; easing.type: Easing.OutExpo } }
         }
         contentItem: Text {
             text: tb.text
             font: tb.font
-            color: Theme.text
+            color: !tb.enabled ? Theme.disabled : tb.primary ? Theme.text_on_accent : Theme.text
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
             elide: Text.ElideRight
-            opacity: tb.enabled ? 1.0 : 0.6
         }
-        scale: tb.down ? 0.97 : 1.0
+        scale: tb.down ? 0.98 : 1.0
         Behavior on scale { NumberAnimation { duration: 100; easing.type: Easing.OutExpo } }
     }
     // 滑杆（对齐原版 components/Slider.qml：4·dpi 圆角轨道 + 强调色已选段 + 圆形手柄，
     // 手柄内圈 hover/按下时 0.9/1.1 缩放，200ms OutExpo）
     component TSlider: Slider {
         id: ts
-        implicitHeight: 22 * Theme.dpi_scale
-        opacity: enabled ? 1.0 : 0.5
+        implicitHeight: 24 * Theme.dpi_scale
+        opacity: enabled ? 1.0 : 0.45
         background: Rectangle {
-            x: ts.leftPadding
+            x: ts.leftPadding + ts.handle.width / 2
             y: ts.topPadding + ts.availableHeight / 2 - height / 2
-            width: ts.availableWidth
+            width: Math.max(0, ts.availableWidth - ts.handle.width)
             height: 4 * Theme.dpi_scale
-            radius: height
+            radius: height / 2
             color: Theme.slider_background
             Rectangle {
                 width: ts.visualPosition * parent.width
@@ -103,47 +136,211 @@ ApplicationWindow {
             }
         }
         handle: Rectangle {
-            x: ts.leftPadding + ts.visualPosition * ts.availableWidth - width / 2
+            x: ts.leftPadding + ts.visualPosition * (ts.availableWidth - width)
             y: ts.topPadding + ts.availableHeight / 2 - height / 2
             width: height
-            height: Math.max(12, ts.height * 0.85)
-            radius: width
+            height: Math.max(14, ts.height * 0.72)
+            radius: width / 2
             color: Theme.slider_handle
+            border.width: Theme.dark ? 0 : 2
+            border.color: Theme.accent
+            scale: ts.pressed ? 1.12 : (ts.hovered ? 1.06 : 1.0)
+            Behavior on scale { NumberAnimation { duration: 140; easing.type: Easing.OutExpo } }
+        }
+    }
+
+    // 统一输入控件：背景、文字、边框和焦点均使用语义令牌，避免 Fusion 默认样式混入。
+    component TTextField: TextField {
+        id: tf
+        font.family: win.uiFontFamily
+        implicitHeight: 34 * Theme.dpi_scale
+        color: tf.enabled ? Theme.text : Theme.disabled
+        placeholderTextColor: Theme.muted
+        selectionColor: Theme.accent
+        selectedTextColor: Theme.text_on_accent
+        selectByMouse: true
+        leftPadding: 10 * Theme.dpi_scale
+        rightPadding: 10 * Theme.dpi_scale
+        background: Rectangle {
+            color: tf.enabled ? Theme.field : Theme.surface
+            radius: Theme.radius_control * Theme.dpi_scale
+            border.width: tf.activeFocus ? 2 : 1
+            border.color: tf.activeFocus ? Theme.focus : tf.hovered ? Theme.accent : Theme.popup_border
+            Behavior on border.color { ColorAnimation { duration: 100 } }
+        }
+    }
+
+    component TComboBox: ComboBox {
+        id: comboControl
+        font.family: win.uiFontFamily
+        font.pixelSize: 13
+        leftPadding: 10 * Theme.dpi_scale
+        rightPadding: 30 * Theme.dpi_scale
+        background: Rectangle {
+            color: comboControl.enabled ? (comboControl.hovered ? Theme.surface_hover : Theme.field) : Theme.surface
+            radius: Theme.radius_control * Theme.dpi_scale
+            border.width: comboControl.activeFocus ? 2 : 1
+            border.color: comboControl.activeFocus ? Theme.focus : comboControl.hovered ? Theme.accent : Theme.popup_border
+        }
+        contentItem: Text {
+            text: comboControl.displayText
+            font: comboControl.font
+            color: comboControl.enabled ? Theme.text : Theme.disabled
+            verticalAlignment: Text.AlignVCenter
+            elide: Text.ElideRight
+        }
+        indicator: Text {
+            x: comboControl.width - width - 10 * Theme.dpi_scale
+            anchors.verticalCenter: parent.verticalCenter
+            text: "∨"
+            color: Theme.muted
+            font.pixelSize: 12
+        }
+        delegate: ItemDelegate {
+            width: comboControl.width
+            highlighted: comboControl.highlightedIndex === index
+            contentItem: Text {
+                text: modelData
+                color: Theme.text
+                font: comboControl.font
+                verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
+            }
+            background: Rectangle {
+                color: highlighted ? Theme.highlight : Theme.surface
+                radius: Theme.radius_control * Theme.dpi_scale
+            }
+        }
+        popup: Popup {
+            y: comboControl.height + 3
+            width: comboControl.width
+            implicitHeight: contentItem.implicitHeight + 2
+            padding: 1
+            contentItem: ListView {
+                clip: true
+                implicitHeight: contentHeight
+                model: comboControl.popup.visible ? comboControl.delegateModel : null
+                currentIndex: comboControl.highlightedIndex
+                ScrollIndicator.vertical: ScrollIndicator {}
+            }
+            background: Rectangle {
+                color: Theme.surface
+                radius: Theme.radius_panel * Theme.dpi_scale
+                border.width: 1
+                border.color: Theme.popup_border
+            }
+        }
+    }
+
+    component TSpinBox: SpinBox {
+        id: spinControl
+        font.family: win.uiFontFamily
+        font.pixelSize: 13
+        editable: true
+        background: Rectangle {
+            color: spinControl.enabled ? Theme.field : Theme.surface
+            radius: Theme.radius_control * Theme.dpi_scale
+            border.width: spinControl.activeFocus ? 2 : 1
+            border.color: spinControl.activeFocus ? Theme.focus : Theme.popup_border
+        }
+        contentItem: TextInput {
+            text: spinControl.displayText
+            font: spinControl.font
+            color: spinControl.enabled ? Theme.text : Theme.disabled
+            selectedTextColor: Theme.text_on_accent
+            selectionColor: Theme.accent
+            horizontalAlignment: Text.AlignLeft
+            verticalAlignment: Text.AlignVCenter
+            readOnly: !spinControl.editable
+            validator: spinControl.validator
+            inputMethodHints: spinControl.inputMethodHints
+        }
+        up.indicator: Rectangle {
+            x: spinControl.width - width - 2
+            y: 2
+            width: 24 * Theme.dpi_scale
+            height: parent.height / 2 - 3
+            radius: 2
+            color: spinControl.up.pressed ? Theme.highlight : "transparent"
+            Text { anchors.centerIn: parent; text: "+"; color: Theme.muted; font.pixelSize: 13 }
+        }
+        down.indicator: Rectangle {
+            x: spinControl.width - width - 2
+            y: parent.height / 2 + 1
+            width: 24 * Theme.dpi_scale
+            height: parent.height / 2 - 3
+            radius: 2
+            color: spinControl.down.pressed ? Theme.highlight : "transparent"
+            Text { anchors.centerIn: parent; text: "−"; color: Theme.muted; font.pixelSize: 13 }
+        }
+    }
+
+    component TProgressBar: ProgressBar {
+        id: progressControl
+        background: Rectangle {
+            implicitWidth: 160
+            implicitHeight: 5
+            width: progressControl.width
+            height: 5
+            radius: 2.5
+            color: Theme.slider_background
+        }
+        contentItem: Item {
+            implicitHeight: 5
             Rectangle {
-                anchors.centerIn: parent
-                width: parent.width * 0.7
-                height: width
-                radius: width
+                visible: !progressControl.indeterminate
+                width: progressControl.visualPosition * parent.width
+                height: parent.height
+                radius: 2.5
                 color: Theme.accent
-                scale: ts.pressed ? 1.1 : (ts.hovered ? 0.9 : 1.0)
-                Behavior on scale { NumberAnimation { duration: 200; easing.type: Easing.OutExpo } }
+            }
+            Rectangle {
+                id: indeterminateChunk
+                visible: progressControl.indeterminate
+                x: 0
+                width: Math.max(36, parent.width * 0.28)
+                height: parent.height
+                radius: 2.5
+                color: Theme.accent
+                SequentialAnimation on x {
+                    running: progressControl.indeterminate && progressControl.visible
+                    loops: Animation.Infinite
+                    NumberAnimation { to: progressControl.width - indeterminateChunk.width; duration: 850; easing.type: Easing.InOutCubic }
+                    NumberAnimation { to: 0; duration: 850; easing.type: Easing.InOutCubic }
+                }
             }
         }
     }
     // 文件路径输入框：末尾内置一个 "…" 按钮，点它弹文件选择框（不再单独占一列放「浏览」按钮）。
     // settingProp 非空 → 选中的路径写回 settings[settingProp] 并触发应用；
     // 为空 → 发出 picked(value)，由父级（列表行）自己写回。
-    component FileInput: TextField {
+    component FileInput: TTextField {
         id: fileInput
         property string settingProp: ""
         property string filter: "*.*"
         property bool saveMode: false
         property bool browse: true
         signal picked(string value)
-        Layout.preferredHeight: 28
+        Layout.preferredHeight: 32
         font.pixelSize: 13
-        rightPadding: browse ? 26 : 8
+        rightPadding: browse ? 40 : 10
         TButton {
+            objectName: "fileBrowseButton"
             visible: fileInput.browse
             anchors.right: parent.right
             anchors.rightMargin: 2
             anchors.verticalCenter: parent.verticalCenter
-            width: 22
-            height: Math.max(18, fileInput.height - 8)
+            width: 32
+            height: Math.max(18, fileInput.height - 4)
             text: "…"
-            flat: true
-            padding: 0
-            font.pixelSize: 14
+            // TButton explicitly sets horizontal padding; padding: 0 alone does not
+            // override it and leaves no room for the label in this compact button.
+            leftPadding: 0
+            rightPadding: 0
+            topPadding: 0
+            bottomPadding: 0
+            font.pixelSize: 18
+            Accessible.name: fileInput.saveMode ? "选择输出文件" : "选择文件"
             ToolTip.visible: hovered
             ToolTip.text: "选择文件"
             ToolTip.delay: 300
@@ -183,8 +380,8 @@ ApplicationWindow {
         width: parent.width
         spacing: 6
         Label { text: label; Layout.preferredWidth: 150; color: Theme.text; elide: Text.ElideRight; font.pixelSize: 13 }
-        TextField {
-            Layout.fillWidth: true; Layout.preferredHeight: 28
+        TTextField {
+            Layout.fillWidth: true; Layout.preferredHeight: 32
             text: { win.refreshTick; return settings[prop] === undefined ? "" : settings[prop].toFixed(2) }
             onEditingFinished: {
                 settings[prop] = parseFloat(text) || 0
@@ -205,8 +402,8 @@ ApplicationWindow {
         width: parent.width
         spacing: 6
         Label { text: label; Layout.preferredWidth: 150; color: Theme.text; elide: Text.ElideRight; font.pixelSize: 13 }
-        TextField {
-            Layout.fillWidth: true; Layout.preferredHeight: 28
+        TTextField {
+            Layout.fillWidth: true; Layout.preferredHeight: 32
             validator: IntValidator { bottom: 0 }
             text: { win.refreshTick; var v = settings[prop]; return (v === undefined ? 0 : Math.round(v)).toString() }
             // Commit live while focused: clicking the 导出 button may not blur the field,
@@ -238,11 +435,11 @@ ApplicationWindow {
         spacing: 6
         Label {
             text: pct.label; Layout.preferredWidth: 150
-            color: pct.forcedFull ? Theme.muted : Theme.text
+            color: pct.forcedFull ? Theme.disabled : Theme.text
             elide: Text.ElideRight; font.pixelSize: 13
         }
-        TextField {
-            Layout.fillWidth: true; Layout.preferredHeight: 28
+        TTextField {
+            Layout.fillWidth: true; Layout.preferredHeight: 32
             enabled: !pct.forcedFull
             text: {
                 win.refreshTick
@@ -275,68 +472,73 @@ ApplicationWindow {
         width: parent.width
         spacing: 6
         Label { text: label; Layout.preferredWidth: 150; color: Theme.text; elide: Text.ElideRight; font.pixelSize: 13 }
-        SpinBox {
+        TSpinBox {
             from: min; to: max; stepSize: step
             value: { win.refreshTick; return settings[prop] }
             onValueModified: { settings[prop] = value; win.applyChange(prop, label + " = " + value) }
-            Layout.fillWidth: true; Layout.preferredHeight: 28; font.pixelSize: 13
+            Layout.fillWidth: true; Layout.preferredHeight: 32; font.pixelSize: 13
         }
     }
-    // 勾选框行：标签在左（150px），方块对齐输入框的左边缘（156）。
-    // 末尾的 Item 吸收 RowLayout 的剩余宽度 —— 没有可拉伸项时 RowLayout 会把控件推向右边，
-    // 导致勾选框/色块「不左不右」；加上这个填充项后控件就固定贴着标签列右端。
+    // 布尔配置统一使用开关。标签占满可读宽度，开关固定在行尾；
+    // valueOn/valueOff、uncheckedAction 与自动应用流程保持原样。
     component Check: RowLayout {
         id: chk
         property string label
         property string prop
         property string hint: ""
-        /// 勾选 / 取消时写回的值：默认 true / false（开关型设置）；给 0/1 这类整数型设置
-        /// （例如「显示控制点」这类真的只有开/关两态的量）传 `valueOn: 1; valueOff: 0`，
-        /// 一个勾选框就能直接控制它，不必再多一个只有单项可选的模式下拉。
         property var valueOn: true
         property var valueOff: false
-        /// 取消勾选时的额外处理（例如关掉「配速色带自适应」时，要把手动滑杆对齐到当前
-        /// 实际生效的色带）。用信号而不是 `onXxx` 属性，免得和 QML 的处理器命名规则打架。
         signal uncheckedAction()
         width: parent.width
-        spacing: 6
-        Label { text: label; Layout.preferredWidth: 150; color: Theme.text; elide: Text.ElideRight; font.pixelSize: 13 }
-        CheckBox {
+        spacing: 8
+        Label {
+            text: chk.label
+            Layout.fillWidth: true
+            Layout.preferredHeight: 30
+            color: chk.enabled ? Theme.text : Theme.disabled
+            elide: Text.ElideRight
+            font.pixelSize: 13
+            verticalAlignment: Text.AlignVCenter
+        }
+        Switch {
             id: cb
             checked: { win.refreshTick; return settings[prop] === chk.valueOn }
             onToggled: {
                 settings[prop] = checked ? chk.valueOn : chk.valueOff
                 if (!checked) chk.uncheckedAction()
                 win.refreshFields()
-                win.applyChange(prop, label + " = " + (checked ? "勾选" : "取消"))
+                win.applyChange(prop, label + " = " + (checked ? "开启" : "关闭"))
             }
-            font.pixelSize: 13
+            Layout.preferredWidth: 40
+            Layout.preferredHeight: 30
+            Accessible.name: chk.label
             HoverHandler { id: cbHover }
-            ToolTip.visible: cbHover.hovered && parent.hint.length > 0
-            ToolTip.text: parent.hint
+            ToolTip.visible: cbHover.hovered && chk.hint.length > 0
+            ToolTip.text: chk.hint
             ToolTip.delay: 400
+            contentItem: Item {}
             indicator: Rectangle {
-                implicitWidth: 20 * Theme.dpi_scale; implicitHeight: 20 * Theme.dpi_scale
-                x: 0; y: (parent.height - height) / 2
-                radius: 5 * Theme.dpi_scale
-                color: cb.checked ? Theme.accent : "transparent"
-                border.color: cb.checked ? Theme.accent : "#999999"
-                border.width: 1
-                opacity: cb.down || cb.activeFocus ? 0.8 : 1.0
-                Behavior on color { ColorAnimation { duration: 300; easing.type: Easing.OutExpo } }
-                Behavior on opacity { NumberAnimation { duration: 100; easing.type: Easing.OutExpo } }
-                Text {
-                    anchors.centerIn: parent
-                    text: cb.checked ? "\u2713" : ""
-                    color: Theme.text_on_accent
-                    font.pixelSize: 13
-                    font.bold: true
-                    scale: cb.checked ? 1.0 : 0.0
-                    Behavior on scale { NumberAnimation { duration: 200; easing.type: Easing.InOutCubic } }
+                implicitWidth: 38 * Theme.dpi_scale
+                implicitHeight: 22 * Theme.dpi_scale
+                x: 0
+                y: (cb.height - height) / 2
+                radius: height / 2
+                color: cb.checked ? Theme.accent : Theme.surface_hover
+                border.color: cb.activeFocus ? Theme.focus : cb.checked ? Theme.accent : Theme.popup_border
+                border.width: cb.activeFocus ? 2 : 1
+                opacity: cb.enabled ? 1.0 : 0.45
+                Behavior on color { ColorAnimation { duration: 140 } }
+                Rectangle {
+                    x: cb.checked ? parent.width - width - 3 : 3
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 16 * Theme.dpi_scale
+                    height: width
+                    radius: width / 2
+                    color: cb.checked ? "#ffffff" : Theme.muted
+                    Behavior on x { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
                 }
             }
         }
-        Item { Layout.fillWidth: true; Layout.fillHeight: true }
     }
     // Edit split times as rows, always keeping one empty row at the end.
     component SplitList: Column {
@@ -455,7 +657,7 @@ ApplicationWindow {
                 width: splitList.width
                 spacing: 6
                 Label { text: "分段 " + (index + 1); Layout.preferredWidth: 65; color: Theme.text; elide: Text.ElideRight; font.pixelSize: 13 }
-                TextField {
+                TTextField {
                     objectName: "splitPointCodeInput"
                     Layout.preferredWidth: 85; Layout.preferredHeight: 28
                     text: code
@@ -465,7 +667,7 @@ ApplicationWindow {
                     onAccepted: timeInput.forceActiveFocus()
                     font.pixelSize: 13
                 }
-                TextField {
+                TTextField {
                     id: timeInput
                     objectName: "splitTimeInput"
                     Layout.fillWidth: true; Layout.preferredWidth: 160; Layout.minimumWidth: 90; Layout.preferredHeight: 28
@@ -478,14 +680,6 @@ ApplicationWindow {
                     onTextEdited: splitList.setRowValue(index, text)
                     onAccepted: splitList.focusNextRow(index)
                     font.pixelSize: 13
-                }
-                TButton {
-                    text: "跳转"; small: true
-                    Layout.preferredHeight: 28; Layout.preferredWidth: 52; font.pixelSize: 12
-                    ToolTip.visible: hovered
-                    ToolTip.text: "把视频定位到该分段的起点（按视频时间轴计算，与导出的边界一致）"
-                    ToolTip.delay: 400
-                    onClicked: win.jumpToSplit(index)
                 }
                 TButton {
                     text: "\u2715"; small: true
@@ -768,7 +962,7 @@ ApplicationWindow {
                 Label { text: "换图时间"; Layout.preferredWidth: 60; color: Theme.text; elide: Text.ElideRight; font.pixelSize: 13 }
                 Item {
                     Layout.preferredWidth: 88; Layout.preferredHeight: 28
-                    TextField {
+                    TTextField {
                         anchors.fill: parent
                         // 行 0 是主图，从出发时刻开始显示，换图时间恒为 0。
                         enabled: index > 0
@@ -819,7 +1013,7 @@ ApplicationWindow {
         /// 选中后额外通知（例如「缩放方式」变化时要联动补默认的缩放速度）。
         signal picked(int index)
         Label { text: label; Layout.preferredWidth: 150; color: Theme.text; elide: Text.ElideRight; font.pixelSize: 13 }
-        ComboBox {
+        TComboBox {
             model: items
             currentIndex: {
                 win.refreshTick
@@ -831,7 +1025,7 @@ ApplicationWindow {
                 settings[prop] = combo.values === null ? currentIndex : combo.values[currentIndex]
                 win.applyChange(prop, label + " = " + items[currentIndex]); win.refreshFields(); combo.picked(currentIndex)
             }
-            Layout.fillWidth: true; Layout.preferredHeight: 28; font.pixelSize: 13
+            Layout.fillWidth: true; Layout.preferredHeight: 32; font.pixelSize: 13
             HoverHandler { id: comboHover }
             ToolTip.visible: comboHover.hovered && combo.hint.length > 0
             ToolTip.text: combo.hint
@@ -850,8 +1044,8 @@ ApplicationWindow {
         width: parent.width
         spacing: 6
         Label { text: label; Layout.preferredWidth: 150; color: Theme.text; elide: Text.ElideRight; font.pixelSize: 13 }
-        ComboBox {
-            Layout.fillWidth: true; Layout.preferredHeight: 28
+        TComboBox {
+            Layout.fillWidth: true; Layout.preferredHeight: 32
             model: labels
             currentIndex: { win.refreshTick; var v = String(settings[prop]); var i = values.indexOf(v); return i < 0 ? 0 : i }
             onActivated: { settings[prop] = values[currentIndex]; win.applyChange(prop, label + " = " + labels[currentIndex]); comboV.picked(currentIndex) }
@@ -868,7 +1062,7 @@ ApplicationWindow {
     // `alphaPercent`：透明度专用。存储里透明度仍是原版的 0..255（QColor alpha），
     // 界面上按百分比显示与输入（0% = 完全透明，100% = 完全不透明）；不能用 `scale: 2.55`
     // 糊弄，因为那样滑杆的取值网格是 2.55 的倍数、数值框还会露出小数。
-    component SliderField: RowLayout {
+    component SliderField: Item {
         id: sf
         property string label
         property string prop
@@ -878,11 +1072,12 @@ ApplicationWindow {
         property real scale: 1
         property bool alphaPercent: false
         property string unit: ""
+        property string displayUnit: alphaPercent ? "%" : unit
         property string hint: ""
         width: parent.width
-        spacing: 6
-        /// 初始化完成前不写回：Slider 建立时会把 value 夹到 [from,to]（比如 from=-1000），
-        /// 那次 valueChanged 若写回就会把设置改成 from，必须在 onCompleted 之后才允许写。
+        implicitHeight: 66
+        height: implicitHeight
+        /// 初始化完成前不写回，保留原有的防绑定环与外部刷新协议。
         property bool ready: false
         function dv() {
             var v = Number(settings[sf.prop])
@@ -891,30 +1086,59 @@ ApplicationWindow {
         }
         function store(display) {
             if (!sf.ready) return
-            // 透明度：百分比 → 原版 0..255（四舍五入，255/100 = 2.55 不是整数）。
             var v = sf.alphaPercent ? Math.round(display * 255 / 100) : display / sf.scale
             var cur = Number(settings[sf.prop])
-            // 值没变就直接返回：绑定回写/重复输入不会触发应用，也避免递归。
             if (isFinite(cur) && Math.abs(cur - v) < 1e-9) return
             settings[sf.prop] = v
-            // 不要在这里调 refreshFields()：那会让 `value` 绑定依赖的 refreshTick 反过来依赖
-            // value 本身，Qt 会报 “Binding loop detected for property value”。
-            // applyChange 自带 350ms 防抖，随后的 doApply 会 refreshFields，数值框那时刷新。
             win.applyChange(sf.prop, sf.label + " = " + display.toFixed(sf.decimals) + (sf.alphaPercent ? "%" : sf.unit))
         }
-        Label { text: sf.label; Layout.preferredWidth: 150; color: Theme.text; elide: Text.ElideRight; font.pixelSize: 13 }
+        Label {
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.right: valueBox.left
+            anchors.rightMargin: 10
+            height: 30
+            text: sf.label
+            color: sf.enabled ? Theme.text : Theme.disabled
+            elide: Text.ElideRight
+            font.family: win.uiFontFamily
+            font.pixelSize: 13
+            verticalAlignment: Text.AlignVCenter
+        }
+        TTextField {
+            id: valueBox
+            anchors.right: parent.right
+            anchors.top: parent.top
+            width: sf.displayUnit.length > 0 ? 94 : 74
+            height: 30
+            rightPadding: sf.displayUnit.length > 0 ? Math.min(46, 12 + sf.displayUnit.length * 8) : 10
+            font.family: win.uiFontFamily
+            font.pixelSize: 13
+            text: { win.refreshTick; return sf.dv().toFixed(sf.decimals) }
+            onEditingFinished: sf.store(parseFloat(text) || 0)
+            Label {
+                visible: sf.displayUnit.length > 0
+                anchors.right: parent.right
+                anchors.rightMargin: 9
+                anchors.verticalCenter: parent.verticalCenter
+                text: sf.displayUnit
+                color: Theme.muted
+                font.pixelSize: 11
+            }
+        }
         TSlider {
             id: sfSlider
-            Layout.fillWidth: true
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            height: 28
             from: sf.from; to: sf.to
             live: false
-            // 刻意**不写** `value: 绑定`：绑定读 settings[prop]，而 onValueChanged 又写回它，
-            // Qt 会报 “Binding loop detected for property value”。改成命令式同步（见 sliderSync）。
+            // 刻意**不写** `value: 绑定`：继续使用命令式同步，避免设置回写形成绑定环。
             onValueChanged: sf.store(value)
         }
         Connections {
             target: win
-            // 外部变化（加载工程 / 导入预设 / 重置）时把滑杆位置同步过来。
             function onRefreshTickChanged() { sf.sliderSync() }
         }
         function sliderSync() {
@@ -922,12 +1146,6 @@ ApplicationWindow {
             if (Math.abs(sfSlider.value - v) > 1e-9) sfSlider.value = v
         }
         Component.onCompleted: { sliderSync(); sf.ready = true }
-        TextField {
-            Layout.preferredWidth: 74; Layout.preferredHeight: 28; font.pixelSize: 12
-            text: { win.refreshTick; return sf.dv().toFixed(sf.decimals) }
-            onEditingFinished: sf.store(parseFloat(text) || 0)
-        }
-        Label { visible: sf.unit.length > 0; text: sf.unit; color: Theme.muted; font.pixelSize: 11; Layout.preferredWidth: 30 }
         HoverHandler { id: sfHover }
         ToolTip.visible: sfHover.hovered && sf.hint.length > 0
         ToolTip.text: sf.hint
@@ -965,34 +1183,46 @@ ApplicationWindow {
         font.pixelSize: 12
         Layout.fillWidth: true
     }
-    // 折叠区「高级选项」（对齐原版 components/AdvancedSection.qml）：
-    // 居中的强调色按钮 + 高度/透明度 700ms OutExpo 动画；展开后关掉 height 动画避免常驻开销。
-    component AdvancedSection: Column {
+    // 概念图中的轻量文字入口：左侧加减号，无常驻背景或嵌套卡片。
+    component AdvancedSection: Item {
         id: adv
         property string label: "高级选项"
         property bool opened: false
         default property alias content: inner.data
+        readonly property real expandedHeight: inner.implicitHeight + 38
         width: parent.width
-        spacing: parent.spacing !== undefined ? parent.spacing : 6
+        implicitHeight: opened ? expandedHeight : 30
+        height: implicitHeight
+        clip: true
+        Behavior on implicitHeight { NumberAnimation { duration: 240; easing.type: Easing.OutCubic } }
         TButton {
-            anchors.horizontalCenter: parent.horizontalCenter
-            text: (adv.opened ? "▴  " : "▾  ") + adv.label
+            objectName: "advancedOptionsButton"
+            anchors.left: parent.left
+            height: 30
+            implicitWidth: implicitContentWidth + 12
+            leftPadding: 0; rightPadding: 12
+            topPadding: 0; bottomPadding: 0
             flat: true
-            font.pixelSize: 12
-            font.bold: adv.opened
-            Layout.preferredHeight: 26
+            Accessible.name: adv.label
+            Accessible.description: adv.opened ? "已展开" : "已收起"
             onClicked: adv.opened = !adv.opened
+            contentItem: Text {
+                text: (adv.opened ? "−  " : "＋  ") + adv.label
+                font.family: win.uiFontFamily
+                font.pixelSize: 12
+                color: parent.hovered || parent.activeFocus ? Theme.accent : Theme.muted
+                verticalAlignment: Text.AlignVCenter
+            }
         }
         Column {
             id: inner
+            y: adv.opened ? 38 : 30
             width: parent.width
-            spacing: parent.spacing
-            visible: opacity > 0
+            spacing: 10
             opacity: adv.opened ? 1 : 0
-            height: adv.opened ? implicitHeight : 0
-            clip: true
-            Behavior on opacity { NumberAnimation { duration: 700; easing.type: Easing.OutExpo } }
-            Behavior on height { NumberAnimation { duration: 700; easing.type: Easing.OutExpo } }
+            visible: opacity > 0
+            Behavior on y { NumberAnimation { duration: 240; easing.type: Easing.OutCubic } }
+            Behavior on opacity { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
         }
     }
     // 1px 分隔线（原版 components/Hr.qml）
@@ -1031,19 +1261,20 @@ ApplicationWindow {
                 id: subLabel
                 text: sub.title
                 font.pixelSize: 12
-                color: Theme.muted
+                color: Theme.text
             }
         }
     }
     // 平滑参数一行（标签 + 滑杆 + 数值）：基础/高级两个列表共用，spRef 指向 SmoothParams。
     // 两个坑同 SliderField：①初始化时 Slider 会把 value 夹到 from（0.001…）→ 委托 ready 之前不写回；
     // ②不给 value 写绑定，改命令式同步。
-    component SmoothRow: RowLayout {
+    component SmoothRow: Item {
         id: prow
         property var spRef
         property bool adv: false
-        width: prow.spRef ? prow.spRef.width : 0
-        spacing: 6
+        width: parent ? parent.width : 0
+        implicitHeight: 66
+        height: implicitHeight
         property bool ready: false
         property bool syncing: false
         function sliderSync() {
@@ -1055,10 +1286,41 @@ ApplicationWindow {
             }
         }
         Component.onCompleted: { sliderSync(); ready = true }
-        Label { text: model.label; Layout.preferredWidth: 150; color: Theme.text; font.pixelSize: 12; elide: Text.ElideRight }
+        Label {
+            anchors.left: parent.left; anchors.top: parent.top
+            anchors.right: paramValue.left; anchors.rightMargin: 10
+            height: 30
+            text: model.label
+            color: prow.enabled ? Theme.text : Theme.disabled
+            font.family: win.uiFontFamily
+            font.pixelSize: 13
+            elide: Text.ElideRight
+            verticalAlignment: Text.AlignVCenter
+        }
+        TTextField {
+            id: paramValue
+            anchors.right: parent.right; anchors.top: parent.top
+            width: (model.unit || "").length > 0 ? 94 : 76
+            height: 30
+            rightPadding: (model.unit || "").length > 0 ? 32 : 10
+            font.family: win.uiFontFamily
+            font.pixelSize: 13
+            text: Number(model.val).toFixed(model.decimals === undefined ? 3 : model.decimals)
+            onEditingFinished: {
+                var value = parseFloat(text)
+                if (isFinite(value)) prow.spRef.setRow(prow.adv, index, Math.max(model.from, Math.min(model.to, value)))
+            }
+            Label {
+                visible: (model.unit || "").length > 0
+                anchors.right: parent.right; anchors.rightMargin: 9; anchors.verticalCenter: parent.verticalCenter
+                text: model.unit || ""
+                color: Theme.muted; font.family: win.uiFontFamily; font.pixelSize: 11
+            }
+        }
         TSlider {
             id: paramSlider
-            Layout.fillWidth: true
+            anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom
+            height: 28
             from: model.from; to: model.to
             live: false
             onValueChanged: {
@@ -1066,15 +1328,6 @@ ApplicationWindow {
                 if (Math.abs(Number(model.val) - value) < 1e-9) return
                 prow.spRef.setRow(prow.adv, index, value)
             }
-        }
-        Label {
-            text: Number(model.val).toFixed(model.decimals === undefined ? 3 : model.decimals)
-            color: Theme.muted; font.pixelSize: 11; Layout.preferredWidth: 46
-        }
-        Label {
-            visible: (model.unit || "").length > 0
-            text: model.unit || ""
-            color: Theme.muted; font.pixelSize: 11; Layout.preferredWidth: 30
         }
     }
     // ---------- 平滑算法参数（随「平滑方式」变化） ----------
@@ -1283,7 +1536,7 @@ ApplicationWindow {
             width: parent.width
             spacing: 6
             Label { text: ps.label; Layout.preferredWidth: 150; color: Theme.text; elide: Text.ElideRight; font.pixelSize: 13 }
-            TextField {
+            TTextField {
                 id: box
                 Layout.fillWidth: true
                 Layout.preferredHeight: 28
@@ -1338,14 +1591,14 @@ ApplicationWindow {
                             width: parent.width - 76
                             anchors.verticalCenter: parent.verticalCenter
                             text: model.name
-                            color: "#222"
+                            color: Theme.text
                             font.pixelSize: 12
                             elide: Text.ElideRight
                         }
                         Text {
                             anchors.verticalCenter: parent.verticalCenter
                             text: model.note
-                            color: model.kind === "preset" ? Theme.accent : "#8a8a8a"
+                            color: model.kind === "preset" ? Theme.accent : Theme.muted
                             font.pixelSize: 11
                         }
                     }
@@ -1364,7 +1617,7 @@ ApplicationWindow {
             width: parent.width
             spacing: 6
             visible: { win.refreshTick; return String(settings.gyro_lens_profile || "").length > 0 }
-            Label { text: "镜头标定"; Layout.preferredWidth: 150; color: Theme.muted; font.pixelSize: 12 }
+            Label { text: "镜头标定"; Layout.preferredWidth: 150; color: Theme.text; font.pixelSize: 12 }
             Label {
                 Layout.fillWidth: true
                 text: { win.refreshTick; return String(settings.gyro_lens_profile_name || settings.gyro_lens_profile) }
@@ -1399,7 +1652,7 @@ ApplicationWindow {
                 win.refreshTick
                 return win.qtColor(settings[prop], opacityProp === "" ? -1 : Number(settings[opacityProp]))
             }
-            border.color: "#999"; border.width: 1; radius: 2
+            border.color: Theme.popup_border; border.width: 1; radius: Theme.radius_control
         }
         TButton { text: "拾取"; onClicked: win.pickColor(prop, opacityProp); Layout.preferredHeight: 28; Layout.preferredWidth: 64; font.pixelSize: 13 }
         Item { Layout.fillWidth: true; Layout.fillHeight: true }
@@ -1420,9 +1673,9 @@ ApplicationWindow {
     property bool scrubbing: false
     property string gyroStatusText: ""
 
-    // 主题：settings.theme ∈ light|dark|system；system 用 Qt 的配色方案提示解析。
+    // 主题：Theme.preference ∈ light|dark|system；system 用 Qt 的配色方案提示解析。
     function applyTheme() {
-        var t = String(settings.theme || "light")
+        var t = String(Theme.preference || "dark")
         if (t === "system") {
             var dark = false
             try { dark = (Qt.styleHints.colorScheme === Qt.ColorScheme.Dark) } catch (e) { dark = false }
@@ -1430,9 +1683,34 @@ ApplicationWindow {
         }
         Theme.apply_theme(t)
     }
+    Connections {
+        target: Qt.styleHints
+        function onColorSchemeChanged() {
+            if (Theme.preference === "system") win.applyTheme()
+        }
+    }
     // 「分段」页的跳转：把视频定位到该分段的**开始**时刻（视频时间轴，与导出边界同一套换算）。
     // 每行填的时间是「该分段的结束」= 下一个分段点，所以本段的开始 = 上一个分段点：
     // 行 k（0 基）→ 分段点 k。分段点 0 = 出发时刻，因此第 1 段跳到视频开头。
+    // Same split boundaries and video offset as export and the former row buttons.
+    property var splitJumpPoints: {
+        win.refreshTick
+        var starts = String(settings.split_starts() || "")
+        if (!starts.length) return []
+        var times = starts.split("|")
+        var codes = String(settings.split_point_codes || "").split("|")
+        var points = []
+        for (var i = 0; i < times.length; ++i) {
+            var ms = settings.split_video_ms(i)
+            if (!isFinite(ms)) continue
+            var from = i === 0 ? "起点" : (codes[i - 1] || "第 " + i + " 点")
+            var to = codes[i] ? " → " + codes[i] : ""
+            points.push({ index: i, timeMs: ms,
+                tooltip: "分段 " + (i + 1) + " · " + from + to
+                    + "\n视频时间 " + win.fmtTime(ms) + " · 出发后 " + times[i] })
+        }
+        return points
+    }
     function jumpToSplit(rowIndex) {
         var ms = settings.split_video_ms(rowIndex)
         if (!isFinite(ms)) return
@@ -1483,11 +1761,11 @@ ApplicationWindow {
         win.applyChange("encode_seg_mode")
     }
     function setTheme(name) {
-        settings.theme = name
+        Theme.set_preference(name)
         win.applyTheme()
         appendLog("INFO", "已切换外观：" + (name === "light" ? "浅色" : name === "dark" ? "深色" : "跟随系统"))
     }
-    function refreshFields() { refreshTick++; win.applyTheme(); if(hudEditor)hudEditor.sync() }
+    function refreshFields() { refreshTick++; if(hudEditor)hudEditor.sync(); if(mapEditor)mapEditor.sync() }
     function isGyroProp(p) {
         // 「硬」防抖输入：只有这些变了才需要真正重载（重探测视频 + 重读运动数据）。
         var g = ["gyro_enabled", "gyro_preset", "gyro_lens_profile", "video_path"]
@@ -1944,8 +2222,34 @@ ApplicationWindow {
 
     // ---------- menu ----------
     menuBar: MenuBar {
+        id: topMenu
+        objectName: "mainMenuBar"
+        implicitHeight: 40
+        background: Rectangle {
+            color: Theme.background2
+            Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Theme.hr }
+        }
+        delegate: MenuBarItem {
+            id: menuEntry
+            implicitHeight: 40
+            leftPadding: 12; rightPadding: 12
+            font: win.font
+            property string iconName: menu ? menu.navigationIcon : ""
+            contentItem: Row {
+                spacing: 7
+                UiIcon { name: menuEntry.iconName; color: menuEntry.highlighted ? Theme.accent : Theme.text; anchors.verticalCenter: parent.verticalCenter; width: 18; height: 18 }
+                Text {
+                    text: menuEntry.text.replace(/&/g, "")
+                    font: menuEntry.font
+                    color: menuEntry.highlighted ? Theme.accent : Theme.text
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+            }
+            background: Rectangle { color: menuEntry.highlighted ? Theme.surface_hover : "transparent"; radius: Theme.radius_control }
+        }
         Menu {
             title: "加载"
+            property string navigationIcon: "folder"
             // 单击直接弹出工程文件选择框：在 aboutToShow 里 close() 会阻止
             // 空子菜单弹出（Popup.open() 发信号后检查 allowOpen），零闪烁。
             onAboutToShow: {
@@ -1956,12 +2260,14 @@ ApplicationWindow {
         }
         Menu {
             title: "外观"
-            MenuItem { text: "浅色";   onTriggered: win.setTheme("light") }
-            MenuItem { text: "深色";   onTriggered: win.setTheme("dark") }
-            MenuItem { text: "跟随系统"; onTriggered: win.setTheme("system") }
+            property string navigationIcon: "appearance"
+            MenuItem { text: "浅色（Fluent）"; checkable: true; checked: Theme.preference === "light"; onTriggered: win.setTheme("light") }
+            MenuItem { text: "深色（专业剪辑）"; checkable: true; checked: Theme.preference === "dark"; onTriggered: win.setTheme("dark") }
+            MenuItem { text: "跟随系统"; checkable: true; checked: Theme.preference === "system"; onTriggered: win.setTheme("system") }
         }
         Menu {
             title: "日志(&L)"
+            property string navigationIcon: "log"
             onAboutToShow: {
                 close()
                 logWindow.show()
@@ -1971,6 +2277,7 @@ ApplicationWindow {
         }
         Menu {
             title: "导出队列"
+            property string navigationIcon: "queue"
             onAboutToShow: {
                 close()
                 queueWindow.show()
@@ -1980,6 +2287,7 @@ ApplicationWindow {
         }
         Menu {
             title: "帮助(&H)"
+            property string navigationIcon: "help"
             onAboutToShow: {
                 close()
                 if (!aboutDialog.visible) aboutDialog.open()
@@ -2041,7 +2349,7 @@ ApplicationWindow {
                 text: "每项保存添加时的配置，按顺序导出。成功后自动移除；失败或中止后保留任务。"
                 color: Theme.text; wrapMode: Text.Wrap; Layout.fillWidth: true
             }
-            Label { text: item.queue_error; visible: text.length > 0; color: "#d9534f"; wrapMode: Text.Wrap; Layout.fillWidth: true }
+            Label { text: item.queue_error; visible: text.length > 0; color: Theme.danger; wrapMode: Text.Wrap; Layout.fillWidth: true }
             ScrollView {
                 Layout.fillWidth: true; Layout.fillHeight: true
                 clip: true
@@ -2053,7 +2361,7 @@ ApplicationWindow {
                         required property var modelData
                         required property int index
                         width: queueList.width; height: queueRow.implicitHeight + 20
-                        color: "transparent"; border.color: "#888"; radius: 4
+                        color: Theme.surface; border.color: Theme.hr; radius: Theme.radius_panel
                         ColumnLayout {
                             id: queueRow
                             anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 10
@@ -2070,14 +2378,14 @@ ApplicationWindow {
                                 }
                             }
                             Label { text: queueWindow.lengthsText(modelData); color: Theme.text; wrapMode: Text.Wrap; Layout.fillWidth: true }
-                            Label { text: modelData.warning; visible: text.length > 0; color: "#b07800"; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                            Label { text: modelData.warning; visible: text.length > 0; color: Theme.warning; wrapMode: Text.Wrap; Layout.fillWidth: true }
                             GridLayout {
                                 Layout.fillWidth: true
                                 columns: 2
                                 columnSpacing: 5; rowSpacing: 5
-                                TextField { id: queuedOutput; text: modelData.output; Layout.fillWidth: true; enabled: !item.queue_running && !item.encoding; selectByMouse: true }
+                                TTextField { id: queuedOutput; text: modelData.output; Layout.fillWidth: true; enabled: !item.queue_running && !item.encoding; selectByMouse: true }
                                 TButton { text: "修改输出"; enabled: !item.queue_running && !item.encoding; onClicked: item.change_queue_output(index, queuedOutput.text) }
-                                ProgressBar {
+                                TProgressBar {
                                     objectName: "queueEntryProgress"
                                     Layout.fillWidth: true; from: 0; to: 1
                                     value: modelData.active ? item.queue_progress : modelData.progress
@@ -2088,7 +2396,7 @@ ApplicationWindow {
                                     color: Theme.text
                                 }
                             }
-                            Label { text: modelData.error; visible: text.length > 0; color: "#d9534f"; wrapMode: Text.Wrap; Layout.fillWidth: true }
+                            Label { text: modelData.error; visible: text.length > 0; color: Theme.danger; wrapMode: Text.Wrap; Layout.fillWidth: true }
                             Label {
                                 visible: modelData.active
                                 text: item.encode_paused ? "已暂停" : (item.encode_segment.length ? item.encode_segment : "导出中…")
@@ -2111,9 +2419,10 @@ ApplicationWindow {
         width: 680
         height: 420
         visible: false
+        color: Theme.background2
         Column {
             anchors.fill: parent
-            anchors.margins: 6
+            anchors.margins: 12
             Row {
                 spacing: 6
                 Label { text: "日志"; color: Theme.text; font.bold: true; anchors.verticalCenter: parent.verticalCenter }
@@ -2153,10 +2462,10 @@ ApplicationWindow {
                     Label { text: model.time; color: Theme.muted; font.pixelSize: 11; width: 70 }
                     Label {
                         text: "[" + model.level + "]"
-                        color: model.level === "WARN" ? "#a86e00" : (model.level === "ERROR" ? "#b00020" : "#2e7d32")
+                        color: model.level === "WARN" ? Theme.warning : (model.level === "ERROR" ? Theme.danger : Theme.success)
                         font.pixelSize: 11; width: 70
                     }
-                    Label { text: model.message; color: "#222"; font.pixelSize: 11; elide: Text.ElideRight; width: logList.width - 160 }
+                    Label { text: model.message; color: Theme.text; font.pixelSize: 11; elide: Text.ElideRight; width: logList.width - 160 }
                 }
             }
         }
@@ -2177,78 +2486,22 @@ ApplicationWindow {
 
             TabBar {
                 id: tabs
+                objectName: "settingsTabs"
                 Layout.fillWidth: true
+                Layout.preferredHeight: 48
                 background: Rectangle {
                     color: Theme.background2
                     Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Theme.popup_border }
                 }
-                TabButton {
-                    text: "轨迹"
-                    font.pixelSize: 13
-                    background: Rectangle { color: "transparent" }
-                    contentItem: Text {
-                        text: parent.text
-                        font: parent.font
-                        color: parent.checked ? Theme.accent : Theme.text
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                        Behavior on color { ColorAnimation { duration: 150; easing.type: Easing.OutExpo } }
-                    }
-                }
-                TabButton {
-                    text: "分段"
-                    font.pixelSize: 13
-                    background: Rectangle { color: "transparent" }
-                    contentItem: Text {
-                        text: parent.text
-                        font: parent.font
-                        color: parent.checked ? Theme.accent : Theme.text
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                        Behavior on color { ColorAnimation { duration: 150; easing.type: Easing.OutExpo } }
-                    }
-                }
-                TabButton {
-                    text: "视频"
-                    font.pixelSize: 13
-                    background: Rectangle { color: "transparent" }
-                    contentItem: Text {
-                        text: parent.text
-                        font: parent.font
-                        color: parent.checked ? Theme.accent : Theme.text
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                        Behavior on color { ColorAnimation { duration: 150; easing.type: Easing.OutExpo } }
-                    }
-                }
-                TabButton {
-                    text: "HUD"
-                    font.pixelSize: 13
-                    background: Rectangle { color: "transparent" }
-                    contentItem: Text {
-                        text: parent.text
-                        font: parent.font
-                        color: parent.checked ? Theme.accent : Theme.text
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                        Behavior on color { ColorAnimation { duration: 150; easing.type: Easing.OutExpo } }
-                    }
-                }
-                TabButton {
-                    text: "导出"
-                    font.pixelSize: 13
-                    background: Rectangle { color: "transparent" }
-                    contentItem: Text {
-                        text: parent.text
-                        font: parent.font
-                        color: parent.checked ? Theme.accent : Theme.text
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                        Behavior on color { ColorAnimation { duration: 150; easing.type: Easing.OutExpo } }
-                    }
-                }
+                NavTabButton { text: "轨迹"; iconName: "route" }
+                NavTabButton { text: "分段"; iconName: "split" }
+                NavTabButton { text: "视频"; iconName: "video" }
+                NavTabButton { text: "HUD"; iconName: "hud" }
+                NavTabButton { text: "导出"; iconName: "export" }
                 // 选中指示条（跟随选中页滑动）
                 Rectangle {
+                    parent: tabs
+                    z: 1
                     height: 2 * Theme.dpi_scale
                     width: tabs.currentItem ? tabs.currentItem.width : 0
                     y: tabs.height - height
@@ -2272,8 +2525,8 @@ ApplicationWindow {
                     Column {
                         id: colTrack
                         width: svTrack.availableWidth
-                        padding: 10
-                        spacing: 10
+                        padding: 12
+                        spacing: 12
                         GroupBox {
                             title: "轨迹文件"
                             TrackList { id: trackRows }
@@ -2283,182 +2536,28 @@ ApplicationWindow {
                             DSpin { label: "按表-出发时间"; prop: "route_control_time_offset"; hint: "出发时刻在轨迹时间轴上的秒数：出发前几秒开始按表则为正值（例如 3）。分段时间的 0 点就是出发时刻。" }
                         }
                         GroupBox {
-                            title: "显示"
-                            // 每片区域一个二级小标题（SubSection）：路线 / 尾巴 / 控制点 / 运动员，
-                            // 每块自己一个颜色 + 一个独立的「透明度」滑杆。参数项只在真正参与绘制时
-                            // 显示（模式=「无」或没勾选时，宽度/长度/颜色都没有意义——原版是常显）。
-                            // visible 里读 refreshTick 是为了改了模式/勾选后立刻重算绑定，
-                            // 不用等防抖的 applyChange。
-                            // 画面占比：无轨迹图片时视频自动铺满整帧，这个值没有意义 → 隐藏。
-                            // 没有视频（没选视频文件，或「导出」页没勾视频）时地图铺满整帧，
-                            // 占比恒为 100% → 灰显只读，别让人白填一个不起作用的数。
-                            PercentSpin {
-                                label: "画面占比 (%)"; prop: "relative_width"
-                                visible: trackRows.hasMap
-                                forcedFull: {
-                                    win.refreshTick
-                                    var hasVideo = String(settings.video_path || "").length > 0
-                                    return !hasVideo || !settings.encode_include_video
-                                }
-                                hint: "没有视频时地图铺满整帧，画面占比固定 100%；选好视频（并在「导出」页勾上「视频」）之后才能调"
+                            title: "地图布局"
+                            visible: trackRows.hasMap
+                            MapEditor {
+                                id:mapEditor
+                                width:parent.width;source:settings;renderer:item
+                                enabled:!item.busy && !item.encoding
+                                hasVideo: { win.refreshTick; return String(settings.video_path || "").length>0 && !!settings.encode_include_video }
+                                // 主题色/缩放传入编辑器：面板内部不用写死颜色，跟随浅色/深色主题。
+                                textColor: Theme.text
+                                mutedColor: Theme.muted
+                                accentColor: Theme.accent
+                                textOnAccent: Theme.text_on_accent
+                                buttonColor: Theme.button
+                                borderColor: Theme.popup_border
+                                surfaceHoverColor: Theme.surface_hover
+                                fieldColor: Theme.field
+                                uiScale: Theme.dpi_scale
+                                onChanged:win.refreshFields()
+                                // 增/删/复制地图框 = 取景器数量变化 → 必须走完整重载
+                                // （applyNow 会写临时 .trr 并重建每框的 RouteManager）。
+                                onStructureChanged: win.applyNow("map_box_structure", "地图框数量变化")
                             }
-                            SubSection {
-                                title: "路线"
-                                // 只留原版的 0=无 / 1=简洁 / 3=配速；2 是原版的「高亮」，本程序不提供，
-                                // 但编号不挪位，好让同一个 .orv 在原版里打开时模式仍然对得上。
-                                Combo {
-                                    label: "路线渲染模式"; prop: "route_render_mode"
-                                    items: ["无", "简洁", "配速"]; values: [0, 1, 3]
-                                }
-                                // 渲染范围：完整 = 整条路线（默认）；单段 = 只画当前所在的那一段。
-                                // 「当前段」的判定与取景用的完全一致 —— 画面框住哪一段，就只画哪一段。
-                                Combo {
-                                    label: "渲染范围"; prop: "route_render_scope"
-                                    items: ["完整渲染", "单段渲染"]; values: [0, 1]
-                                    hint: "完整渲染 = 整条路线；单段渲染 = 只画当前所在的那一段（判定与取景一致：画面框住哪一段就只画哪一段）。预览与导出都生效。"
-                                    visible: { win.refreshTick; return settings.route_render_mode !== 0 }
-                                }
-                                DSpin {
-                                    label: "路线宽度 (像素)"; prop: "route_width"
-                                    visible: { win.refreshTick; return settings.route_render_mode !== 0 }
-                                }
-                                // 配速模式的颜色由「低/高配速」色带决定，这时给一个不生效的取色器
-                                // 只会让人以为「改了没反应」——所以只在单色（简洁）模式下显示。
-                                // 判断写成「不是无、也不是配速」：老工程里的 2（原版高亮）也是按简洁画的，
-                                // 读盘时虽已归一成 1，这里再兜一层，免得出现「画了却没得改」。
-                                ColorField {
-                                    label: "路线颜色"; prop: "route_color"; opacityProp: "route_opacity"
-                                    visible: { win.refreshTick; return settings.route_render_mode !== 0 && settings.route_render_mode !== 3 }
-                                }
-                                // 透明度三种模式都有效：配速模式下逐段线也用这个不透明度。
-                                SliderField {
-                                    label: "路线透明度 (%)"; prop: "route_opacity"; from: 0; to: 100; decimals: 0; alphaPercent: true
-                                    hint: "0% = 完全透明，100% = 完全不透明"
-                                    visible: { win.refreshTick; return settings.route_render_mode !== 0 }
-                                }
-                                Check {
-                                    label: "配速色带自适应"; prop: "route_pace_auto"
-                                    hint: "按实际轨迹的配速分布自动定色带上下限（掐掉最快/最慢各 10% 的极值）"
-                                    visible: { win.refreshTick; return settings.route_render_mode === 3 }
-                                    // 关掉自适应时，先把手动值对齐到当前**实际生效**的色带，
-                                    // 否则滑杆会跳回工程里存的旧值、画面颜色跟着突变一下。
-                                    onUncheckedAction: {
-                                        if (item.pace_auto_low > 0 && item.pace_auto_high > 0) {
-                                            settings.route_low_pace = item.pace_auto_low
-                                            settings.route_high_pace = item.pace_auto_high
-                                        }
-                                    }
-                                }
-                                // 自适应开着时这两个值由轨迹算出来，手填没有意义 → 不显示。
-                                DSpin {
-                                    label: "低配速 (分钟/公里)"; prop: "route_low_pace"
-                                    hint: "配速达到这个值（更慢）画成红色"
-                                    visible: { win.refreshTick; return (settings.route_render_mode === 3) && !settings.route_pace_auto }
-                                }
-                                DSpin {
-                                    label: "高配速 (分钟/公里)"; prop: "route_high_pace"
-                                    hint: "配速达到这个值（更快）画成绿色"
-                                    visible: { win.refreshTick; return (settings.route_render_mode === 3) && !settings.route_pace_auto }
-                                }
-                            }
-                            SubSection {
-                                title: "尾巴"
-                                // 尾巴和路线一样有「无 / 简洁 / 配速」三种渲染模式，编号同样沿用原版
-                                // 的 0/1/3（2 是原版尾巴的「高亮」，本程序按简洁渲染）。
-                                Combo {
-                                    label: "尾巴渲染模式"; prop: "route_tail_render_mode"
-                                    items: ["无", "简洁", "配速"]; values: [0, 1, 3]
-                                    hint: "无 = 不画尾巴；简洁 = 单色拖尾；配速 = 和路线一样按配速渐变着色"
-                                }
-                                DSpin {
-                                    label: "尾巴宽度 (像素)"; prop: "route_tail_width"
-                                    visible: { win.refreshTick; return settings.route_tail_render_mode !== 0 }
-                                }
-                                DSpin {
-                                    label: "尾巴长度 (秒)"; prop: "route_tail_length"
-                                    visible: { win.refreshTick; return settings.route_tail_render_mode !== 0 }
-                                }
-                                // 配速模式的颜色由「低/高配速」色带决定，取色器同样只在单色（简洁）下显示。
-                                ColorField {
-                                    label: "尾巴颜色"; prop: "route_tail_color"; opacityProp: "route_tail_opacity"
-                                    visible: { win.refreshTick; return settings.route_tail_render_mode !== 0 && settings.route_tail_render_mode !== 3 }
-                                }
-                                SliderField {
-                                    label: "尾巴透明度 (%)"; prop: "route_tail_opacity"; from: 0; to: 100; decimals: 0; alphaPercent: true
-                                    hint: "0% = 完全透明，100% = 完全不透明"
-                                    visible: { win.refreshTick; return settings.route_tail_render_mode !== 0 }
-                                }
-                                Check {
-                                    label: "尾巴配速色带自适应"; prop: "route_tail_pace_auto"
-                                    hint: "按实际轨迹的配速分布自动定色带上下限（掐掉最快/最慢各 10% 的极值）"
-                                    visible: { win.refreshTick; return settings.route_tail_render_mode === 3 }
-                                    // 关掉自适应时，先把手动值对齐到当前**实际生效**的色带，
-                                    // 否则滑杆会跳回工程里存的旧值、画面颜色跟着突变一下。
-                                    onUncheckedAction: {
-                                        if (item.pace_auto_low > 0 && item.pace_auto_high > 0) {
-                                            settings.route_tail_low_pace = item.pace_auto_low
-                                            settings.route_tail_high_pace = item.pace_auto_high
-                                        }
-                                    }
-                                }
-                                // 自适应开着时这两个值由轨迹算出来，手填没有意义 → 不显示。
-                                DSpin {
-                                    label: "尾巴低配速 (分钟/公里)"; prop: "route_tail_low_pace"
-                                    hint: "配速达到这个值（更慢）画成红色"
-                                    visible: { win.refreshTick; return (settings.route_tail_render_mode === 3) && !settings.route_tail_pace_auto }
-                                }
-                                DSpin {
-                                    label: "尾巴高配速 (分钟/公里)"; prop: "route_tail_high_pace"
-                                    hint: "配速达到这个值（更快）画成绿色"
-                                    visible: { win.refreshTick; return (settings.route_tail_render_mode === 3) && !settings.route_tail_pace_auto }
-                                }
-                            }
-                            SubSection {
-                                title: "控制点"
-                                Check { label: "显示控制点"; prop: "route_show_controls" }
-                                DSpin {
-                                    label: "控制点半径"; prop: "route_control_radius"
-                                    visible: { win.refreshTick; return settings.route_show_controls }
-                                }
-                                ColorField {
-                                    label: "控制点颜色"; prop: "route_control_color"; opacityProp: "route_control_opacity"
-                                    visible: { win.refreshTick; return settings.route_show_controls }
-                                }
-                                SliderField {
-                                    label: "控制点透明度 (%)"; prop: "route_control_opacity"; from: 0; to: 100; decimals: 0; alphaPercent: true
-                                    hint: "0% = 完全透明，100% = 完全不透明"
-                                    visible: { win.refreshTick; return settings.route_show_controls }
-                                }
-                            }
-                            SubSection {
-                                title: "运动员"
-                                Check { label: "显示运动员"; prop: "route_show_runner" }
-                                // 箭头会顺着运动方向转；圆形就是原版的行为。
-                                Combo {
-                                    label: "运动员样式"; prop: "route_runner_style"
-                                    items: ["圆形", "箭头"]; values: [0, 1]
-                                    visible: { win.refreshTick; return settings.route_show_runner }
-                                }
-                                DSpin {
-                                    label: "运动员半径"; prop: "route_runner_radius"
-                                    visible: { win.refreshTick; return settings.route_show_runner }
-                                }
-                                ColorField {
-                                    label: "运动员颜色"; prop: "route_runner_color"; opacityProp: "route_runner_opacity"
-                                    visible: { win.refreshTick; return settings.route_show_runner }
-                                }
-                                SliderField {
-                                    label: "运动员透明度 (%)"; prop: "route_runner_opacity"; from: 0; to: 100; decimals: 0; alphaPercent: true
-                                    hint: "0% = 完全透明，100% = 完全不透明"
-                                    visible: { win.refreshTick; return settings.route_show_runner }
-                                }
-                            }
-                        }
-                        GroupBox {
-                            title: "取景"
-                            Combo { label: "视野模式"; prop: "route_view_mode"; items: ["固定分段", "跟跑者居中", "跑者居中+分段定向"] }
-                            DSpin { label: "左右边距"; prop: "route_lr_margin" }
-                            DSpin { label: "上下边距"; prop: "route_tb_margin" }
                         }
                     }
                 }
@@ -2471,8 +2570,8 @@ ApplicationWindow {
                     Column {
                         id: colSplit
                         width: svSplit.availableWidth
-                        padding: 10
-                        spacing: 10
+                        padding: 12
+                        spacing: 12
                         GroupBox {
                             title: "分段"
                             TButton { text: "从成绩条图片导入…"; onClicked: receiptImport.open() }
@@ -2490,8 +2589,8 @@ ApplicationWindow {
                     Column {
                         id: colVid
                         width: svVid.availableWidth
-                        padding: 10
-                        spacing: 10
+                        padding: 12
+                        spacing: 12
                         GroupBox {
                             title: "视频文件"
                             VideoList { id: videoRows }
@@ -2503,167 +2602,183 @@ ApplicationWindow {
                         GroupBox {
                             title: "视频防抖 (Gyroflow)"
                             Check { label: "启用视频防抖"; prop: "gyro_enabled" }
-                            Field { label: "预设文件"; prop: "gyro_preset"; filter: "*.gyroflow" }
-                            ProfileSearch { label: "镜头标定" }
-                            Check { label: "预览关闭防抖"; prop: "preview_perf" }
-                            Label { text: gyroStatusText; color: Theme.accent; wrapMode: Text.Wrap; width: parent.width - 20 }
-                        }
-                        GroupBox {
-                            title: "稳定化"
-                            SmoothParams { id: smoothParams }
-
-                            // ---------- 地平线锁定 ----------
-                            Check { label: "锁定地平线"; prop: "gyro_horizon_enabled" }
-                            SliderField {
-                                label: "锁定量"; prop: "gyro_horizon"; from: 0; to: 100; decimals: 0; scale: 100; unit: "%"
-                                enabled: { win.refreshTick; return !!settings.gyro_horizon_enabled && !settings.gyro_auto_lock }
-                                hint: "地平线锁定的强度：0 = 不锁，100 = 完全锁定水平"
-                            }
-                            SliderField {
-                                label: "横滚角度校正"; prop: "gyro_horizon_roll"; from: -180; to: 180; decimals: 1; unit: "°"
-                                enabled: { win.refreshTick; return !!settings.gyro_horizon_enabled }
-                            }
-                            Check {
-                                label: "锁定俯仰角"; prop: "gyro_horizon_pitch_enabled"
-                                enabled: { win.refreshTick; return !!settings.gyro_horizon_enabled }
-                            }
-                            SliderField {
-                                label: "俯仰角度校正"; prop: "gyro_horizon_pitch"; from: -90; to: 90; decimals: 1; unit: "°"
-                                enabled: { win.refreshTick; return !!settings.gyro_horizon_enabled && !!settings.gyro_horizon_pitch_enabled }
-                            }
-                            Check { label: "使用重力矢量"; prop: "gyro_use_gravity" }
-                            Combo {
-                                label: "积分方法"; prop: "gyro_integration_method"
-                                items: ["互补滤波", "VQF", "陀螺 + 加速度计", "Mahony", "Madgwick"]
-                            }
-                            Check { label: "自动锁定"; prop: "gyro_auto_lock" }
-                            Column {
+                            Item {
+                                id: gyroOptions
+                                objectName: "stabilizationOptions"
+                                property bool expanded: { win.refreshTick; return !!settings.gyro_enabled }
                                 width: parent.width
-                                spacing: 3
-                                visible: { win.refreshTick; return !!settings.gyro_auto_lock }
-                                SliderField {
-                                    label: "转弯阈值"; prop: "gyro_turn_threshold"; from: 0; to: 50; decimals: 1; unit: "°/秒"
-                                    hint: "横滚角速度超过该阈值时，地平线按角速度成比例倾斜"
-                                }
-                                SliderField {
-                                    label: "转弯平滑"; prop: "gyro_turn_smoothing"; from: 0; to: 2000; decimals: 0; unit: "毫秒"
-                                    hint: "转弯检测的平滑时间常数"
-                                }
-                                SliderField {
-                                    label: "转弯倍率"; prop: "gyro_turn_multiplier"; from: 0; to: 2; decimals: 2; unit: "倍"
-                                    hint: "动态倾斜倍率：倾斜角 = 倍率 × 横滚角速度"
-                                }
-                                Check { label: "限制倾斜加速度"; prop: "gyro_limit_tilt_accel" }
-                                SliderField {
-                                    label: "倾斜加速度上限"; prop: "gyro_tilt_accel_limit"; from: 0.1; to: 30; decimals: 1; unit: "°/秒²"
-                                    visible: { win.refreshTick; return !!settings.gyro_limit_tilt_accel }
-                                    hint: "限制倾斜的变化快慢，避免地平线动作发顿"
-                                }
-                            }
+                                implicitHeight: expanded ? gyroOptionsContent.implicitHeight : 0
+                                height: implicitHeight
+                                visible: implicitHeight > 0
+                                enabled: expanded
+                                clip: true
+                                Behavior on implicitHeight { NumberAnimation { duration: 240; easing.type: Easing.OutCubic } }
+                                Column {
+                                    id: gyroOptionsContent
+                                    width: parent.width
+                                    spacing: 8
+                                    opacity: gyroOptions.expanded ? 1 : 0
+                                    Behavior on opacity { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+                                    Field { label: "预设文件"; prop: "gyro_preset"; filter: "*.gyroflow" }
+                                    ProfileSearch { label: "镜头标定" }
+                                    Check { label: "预览关闭防抖"; prop: "preview_perf" }
+                                    Label { text: gyroStatusText; color: Theme.accent; wrapMode: Text.Wrap; width: parent.width - 20 }
+                                    SmoothParams { id: smoothParams }
 
-                            // ---------- 缩放 / 镜头 ----------
-                            SliderField {
-                                label: "缩放限额"; prop: "max_zoom"; from: 110; to: 300; decimals: 0; unit: "%"
-                                hint: "缩放上限：100 = 不放大，130 = 最多放大到 130%（原版：限额为近似值，要更准就加迭代次数）"
-                            }
-                            SliderField {
-                                label: "缩放速度"; prop: "gyro_zoom_window"; from: 0.1; to: 15; decimals: 2; unit: "秒"
-                                enabled: { win.refreshTick; return Number(settings.gyro_zoom_mode) === 1 }
-                                hint: "动态缩放的时间窗口；只有「动态缩放」时有效（原版默认 4 秒）"
-                            }
-                            SliderField {
-                                label: "镜头校正"; prop: "gyro_lens"; from: 0; to: 100; decimals: 0; scale: 100; unit: "%"
-                                hint: "鱼眼去畸变的强度（需要镜头标定）；0 = 不校正"
-                            }
+                                    // ---------- 地平线锁定 ----------
+                                    Check { label: "锁定地平线"; prop: "gyro_horizon_enabled" }
+                                    SliderField {
+                                        label: "锁定量"; prop: "gyro_horizon"; from: 0; to: 100; decimals: 0; scale: 100; unit: "%"
+                                        enabled: { win.refreshTick; return !!settings.gyro_horizon_enabled && !settings.gyro_auto_lock }
+                                        hint: "地平线锁定的强度：0 = 不锁，100 = 完全锁定水平"
+                                    }
+                                    SliderField {
+                                        label: "横滚角度校正"; prop: "gyro_horizon_roll"; from: -180; to: 180; decimals: 1; unit: "°"
+                                        enabled: { win.refreshTick; return !!settings.gyro_horizon_enabled }
+                                    }
+                                    Check {
+                                        label: "锁定俯仰角"; prop: "gyro_horizon_pitch_enabled"
+                                        enabled: { win.refreshTick; return !!settings.gyro_horizon_enabled }
+                                    }
+                                    SliderField {
+                                        label: "俯仰角度校正"; prop: "gyro_horizon_pitch"; from: -90; to: 90; decimals: 1; unit: "°"
+                                        enabled: { win.refreshTick; return !!settings.gyro_horizon_enabled && !!settings.gyro_horizon_pitch_enabled }
+                                    }
+                                    Check { label: "使用重力矢量"; prop: "gyro_use_gravity" }
+                                    Combo {
+                                        label: "积分方法"; prop: "gyro_integration_method"
+                                        items: ["互补滤波", "VQF", "陀螺 + 加速度计", "Mahony", "Madgwick"]
+                                    }
+                                    Check { label: "自动锁定"; prop: "gyro_auto_lock" }
+                                    Column {
+                                        width: parent.width
+                                        spacing: 3
+                                        visible: { win.refreshTick; return !!settings.gyro_auto_lock }
+                                        SliderField {
+                                            label: "转弯阈值"; prop: "gyro_turn_threshold"; from: 0; to: 50; decimals: 1; unit: "°/秒"
+                                            hint: "横滚角速度超过该阈值时，地平线按角速度成比例倾斜"
+                                        }
+                                        SliderField {
+                                            label: "转弯平滑"; prop: "gyro_turn_smoothing"; from: 0; to: 2000; decimals: 0; unit: "毫秒"
+                                            hint: "转弯检测的平滑时间常数"
+                                        }
+                                        SliderField {
+                                            label: "转弯倍率"; prop: "gyro_turn_multiplier"; from: 0; to: 2; decimals: 2; unit: "倍"
+                                            hint: "动态倾斜倍率：倾斜角 = 倍率 × 横滚角速度"
+                                        }
+                                        Check { label: "限制倾斜加速度"; prop: "gyro_limit_tilt_accel" }
+                                        SliderField {
+                                            label: "倾斜加速度上限"; prop: "gyro_tilt_accel_limit"; from: 0.1; to: 30; decimals: 1; unit: "°/秒²"
+                                            visible: { win.refreshTick; return !!settings.gyro_limit_tilt_accel }
+                                            hint: "限制倾斜的变化快慢，避免地平线动作发顿"
+                                        }
+                                    }
 
-                            // ---------- 稳定焦距（只有逐帧焦距的视频才显示，与原版一致） ----------
-                            Check {
-                                label: "稳定焦距"; prop: "gyro_fl_smoothing"
-                                visible: item.gyro_has_focal_length
-                                hint: "对逐帧焦距做平滑（需要视频自带镜头焦距数据）"
-                            }
-                            SliderField {
-                                label: "焦距平滑度"; prop: "gyro_fl_strength"; from: 1; to: 100; decimals: 0; unit: "%"
-                                visible: item.gyro_has_focal_length && !!settings.gyro_fl_smoothing
-                            }
+                                    // ---------- 缩放 / 镜头 ----------
+                                    SliderField {
+                                        label: "缩放限额"; prop: "max_zoom"; from: 110; to: 300; decimals: 0; unit: "%"
+                                        hint: "缩放上限：100 = 不放大，130 = 最多放大到 130%（原版：限额为近似值，要更准就加迭代次数）"
+                                    }
+                                    SliderField {
+                                        label: "缩放速度"; prop: "gyro_zoom_window"; from: 0.1; to: 15; decimals: 2; unit: "秒"
+                                        enabled: { win.refreshTick; return Number(settings.gyro_zoom_mode) === 1 }
+                                        hint: "动态缩放的时间窗口；只有「动态缩放」时有效（原版默认 4 秒）"
+                                    }
+                                    SliderField {
+                                        label: "镜头校正"; prop: "gyro_lens"; from: 0; to: 100; decimals: 0; scale: 100; unit: "%"
+                                        hint: "鱼眼去畸变的强度（需要镜头标定）；0 = 不校正"
+                                    }
 
-                            // ---------- 只读状态（原版 Max rotation / Max zoom） ----------
-                            Label {
-                                width: parent.width - 20
-                                color: Theme.muted; font.pixelSize: 11; wrapMode: Text.Wrap
-                                text: {
-                                    win.refreshTick
-                                    var st = null
-                                    try { st = JSON.parse(String(item.gyro_stats || "{}")) } catch (e) { st = null }
-                                    if (!st || st.pitch === undefined) return "最大旋转：—"
-                                    return "最大旋转：俯仰 " + Number(st.pitch).toFixed(2) + "°，偏航 " + Number(st.yaw).toFixed(2)
-                                         + "°，横滚 " + Number(st.roll).toFixed(2) + "°"
-                                         + "　·　最大缩放：" + Number(st.zoom).toFixed(1) + "%"
-                                }
-                            }
+                                    // ---------- 稳定焦距（只有逐帧焦距的视频才显示，与原版一致） ----------
+                                    Check {
+                                        label: "稳定焦距"; prop: "gyro_fl_smoothing"
+                                        visible: item.gyro_has_focal_length
+                                        hint: "对逐帧焦距做平滑（需要视频自带镜头焦距数据）"
+                                    }
+                                    SliderField {
+                                        label: "焦距平滑度"; prop: "gyro_fl_strength"; from: 1; to: 100; decimals: 0; unit: "%"
+                                        visible: item.gyro_has_focal_length && !!settings.gyro_fl_smoothing
+                                    }
 
-                            // ---------- 高级选项（对齐原版 AdvancedSection） ----------
-                            AdvancedSection {
-                                SliderField {
-                                    label: "视场角"; prop: "fov"; from: 0.1; to: 3; decimals: 3
-                                    hint: "1 = 原始视野；小于 1 裁切放大（更稳），大于 1 可能看到黑边"
-                                }
-                                Check { label: "卷帘快门校正"; prop: "frame_readout_enabled" }
-                                SliderField {
-                                    label: "帧读出时间"; prop: "frame_readout_time"; from: 0; to: 100; decimals: 2; unit: "毫秒"
-                                    enabled: { win.refreshTick; return !!settings.frame_readout_enabled }
-                                    hint: "传感器逐行读出的时间，可从镜头标定得到（DJI Action 4 约 11.09 毫秒）"
-                                }
-                                ComboV {
-                                    label: "帧读出方向"; prop: "gyro_readout_dir"
-                                    values: ["TopToBottom", "BottomToTop"]; labels: ["从上到下", "从下到上"]
-                                    enabled: { win.refreshTick; return !!settings.frame_readout_enabled }
-                                }
-                                SliderField {
-                                    label: "视频速度"; prop: "gyro_video_speed"; from: 10; to: 1000; decimals: 0; scale: 100; unit: "%"
-                                    hint: "100% = 原速；50% = 慢放 2 倍（影响平滑/缩放的等效时间尺度）"
-                                }
-                                Check { label: "链接平滑"; prop: "gyro_vs_smoothing" }
-                                Check { label: "链接缩放速度"; prop: "gyro_vs_zooming" }
-                                Check { label: "链接缩放限额"; prop: "gyro_vs_zoom_limit" }
-                                Combo {
-                                    label: "缩放方式"; prop: "gyro_zoom_mode"
-                                    items: ["无缩放", "动态缩放", "静态缩放"]
-                                    // 联动：切到「动态缩放」时若速度还是 0（核心会当成关闭）就补默认 4 秒；
-                                    // 切回「无缩放」时把中心偏移归零（与 gyroflow 一致）。
-                                    onPicked: function (idx) {
-                                        if (idx === 1 && Number(settings.gyro_zoom_window) < 0.1) settings.gyro_zoom_window = 4.0
-                                        if (idx === 0) { settings.gyro_zoom_center_x = 0; settings.gyro_zoom_center_y = 0 }
-                                        win.refreshFields()
+                                    // ---------- 只读状态（原版 Max rotation / Max zoom） ----------
+                                    Label {
+                                        width: parent.width - 20
+                                        color: Theme.muted; font.pixelSize: 11; wrapMode: Text.Wrap
+                                        text: {
+                                            win.refreshTick
+                                            var st = null
+                                            try { st = JSON.parse(String(item.gyro_stats || "{}")) } catch (e) { st = null }
+                                            if (!st || st.pitch === undefined) return "最大旋转：—"
+                                            return "最大旋转：俯仰 " + Number(st.pitch).toFixed(2) + "°，偏航 " + Number(st.yaw).toFixed(2)
+                                                 + "°，横滚 " + Number(st.roll).toFixed(2) + "°"
+                                                 + "　·　最大缩放：" + Number(st.zoom).toFixed(1) + "%"
+                                        }
+                                    }
+
+                                    // ---------- 高级选项（对齐原版 AdvancedSection） ----------
+                                    AdvancedSection {
+                                        SliderField {
+                                            label: "视场角"; prop: "fov"; from: 0.1; to: 3; decimals: 3
+                                            hint: "1 = 原始视野；小于 1 裁切放大（更稳），大于 1 可能看到黑边"
+                                        }
+                                        Check { label: "卷帘快门校正"; prop: "frame_readout_enabled" }
+                                        SliderField {
+                                            label: "帧读出时间"; prop: "frame_readout_time"; from: 0; to: 100; decimals: 2; unit: "毫秒"
+                                            enabled: { win.refreshTick; return !!settings.frame_readout_enabled }
+                                            hint: "传感器逐行读出的时间，可从镜头标定得到（DJI Action 4 约 11.09 毫秒）"
+                                        }
+                                        ComboV {
+                                            label: "帧读出方向"; prop: "gyro_readout_dir"
+                                            values: ["TopToBottom", "BottomToTop"]; labels: ["从上到下", "从下到上"]
+                                            enabled: { win.refreshTick; return !!settings.frame_readout_enabled }
+                                        }
+                                        SliderField {
+                                            label: "视频速度"; prop: "gyro_video_speed"; from: 10; to: 1000; decimals: 0; scale: 100; unit: "%"
+                                            hint: "100% = 原速；50% = 慢放 2 倍（影响平滑/缩放的等效时间尺度）"
+                                        }
+                                        Check { label: "链接平滑"; prop: "gyro_vs_smoothing" }
+                                        Check { label: "链接缩放速度"; prop: "gyro_vs_zooming" }
+                                        Check { label: "链接缩放限额"; prop: "gyro_vs_zoom_limit" }
+                                        Combo {
+                                            label: "缩放方式"; prop: "gyro_zoom_mode"
+                                            items: ["无缩放", "动态缩放", "静态缩放"]
+                                            // 联动：切到「动态缩放」时若速度还是 0（核心会当成关闭）就补默认 4 秒；
+                                            // 切回「无缩放」时把中心偏移归零（与 gyroflow 一致）。
+                                            onPicked: function (idx) {
+                                                if (idx === 1 && Number(settings.gyro_zoom_window) < 0.1) settings.gyro_zoom_window = 4.0
+                                                if (idx === 0) { settings.gyro_zoom_center_x = 0; settings.gyro_zoom_center_y = 0 }
+                                                win.refreshFields()
+                                            }
+                                        }
+                                        SliderField {
+                                            label: "缩放中心偏移 X"; prop: "gyro_zoom_center_x"
+                                            from: -100; to: 100; decimals: 0; scale: 100; unit: "%"
+                                            enabled: { win.refreshTick; return Number(settings.gyro_zoom_mode) > 0 }
+                                        }
+                                        SliderField {
+                                            label: "缩放中心偏移 Y"; prop: "gyro_zoom_center_y"
+                                            from: -100; to: 100; decimals: 0; scale: 100; unit: "%"
+                                            enabled: { win.refreshTick; return Number(settings.gyro_zoom_mode) > 0 }
+                                        }
+                                        SectionHeader { text: "附加 3D 旋转" }
+                                        SliderField { label: "俯仰"; prop: "gyro_rot_y"; from: -180; to: 180; decimals: 2; unit: "°" }
+                                        SliderField { label: "偏航"; prop: "gyro_rot_x"; from: -180; to: 180; decimals: 2; unit: "°" }
+                                        SliderField { label: "横滚"; prop: "gyro_rot_z"; from: -180; to: 180; decimals: 2; unit: "°" }
+                                        SectionHeader { text: "附加 3D 平移" }
+                                        SliderField { label: "X"; prop: "gyro_tr_x"; from: -1000; to: 1000; decimals: 0; unit: "像素" }
+                                        SliderField { label: "Y"; prop: "gyro_tr_y"; from: -1000; to: 1000; decimals: 0; unit: "像素" }
+                                        SliderField { label: "Z"; prop: "gyro_tr_z"; from: -1000; to: 1000; decimals: 0; unit: "像素" }
+                                        ISpin {
+                                            label: "缩放限额迭代次数"; prop: "max_zoom_iterations"
+                                            hint: "更多的迭代 = 更准确的限额数，但计算速度也更慢（原版默认 5）"
+                                        }
+                                        SliderField {
+                                            label: "陀螺偏移"; prop: "gyro_offset"; from: -1000; to: 1000; decimals: 1; unit: "毫秒"
+                                            hint: "陀螺与视频的时间差；DJI 内嵌同步数据约 0"
+                                        }
+                                        ISpin { label: "陀螺偏移帧数"; prop: "gyro_offset_frames"; hint: "非 0 时优先于上面的毫秒偏移" }
                                     }
                                 }
-                                SliderField {
-                                    label: "缩放中心偏移 X"; prop: "gyro_zoom_center_x"
-                                    from: -100; to: 100; decimals: 0; scale: 100; unit: "%"
-                                    enabled: { win.refreshTick; return Number(settings.gyro_zoom_mode) > 0 }
-                                }
-                                SliderField {
-                                    label: "缩放中心偏移 Y"; prop: "gyro_zoom_center_y"
-                                    from: -100; to: 100; decimals: 0; scale: 100; unit: "%"
-                                    enabled: { win.refreshTick; return Number(settings.gyro_zoom_mode) > 0 }
-                                }
-                                SectionHeader { text: "附加 3D 旋转" }
-                                SliderField { label: "俯仰"; prop: "gyro_rot_y"; from: -180; to: 180; decimals: 2; unit: "°" }
-                                SliderField { label: "偏航"; prop: "gyro_rot_x"; from: -180; to: 180; decimals: 2; unit: "°" }
-                                SliderField { label: "横滚"; prop: "gyro_rot_z"; from: -180; to: 180; decimals: 2; unit: "°" }
-                                SectionHeader { text: "附加 3D 平移" }
-                                SliderField { label: "X"; prop: "gyro_tr_x"; from: -1000; to: 1000; decimals: 0; unit: "像素" }
-                                SliderField { label: "Y"; prop: "gyro_tr_y"; from: -1000; to: 1000; decimals: 0; unit: "像素" }
-                                SliderField { label: "Z"; prop: "gyro_tr_z"; from: -1000; to: 1000; decimals: 0; unit: "像素" }
-                                ISpin {
-                                    label: "缩放限额迭代次数"; prop: "max_zoom_iterations"
-                                    hint: "更多的迭代 = 更准确的限额数，但计算速度也更慢（原版默认 5）"
-                                }
-                                SliderField {
-                                    label: "陀螺偏移"; prop: "gyro_offset"; from: -1000; to: 1000; decimals: 1; unit: "毫秒"
-                                    hint: "陀螺与视频的时间差；DJI 内嵌同步数据约 0"
-                                }
-                                ISpin { label: "陀螺偏移帧数"; prop: "gyro_offset_frames"; hint: "非 0 时优先于上面的毫秒偏移" }
                             }
                         }
                     }
@@ -2678,8 +2793,8 @@ ApplicationWindow {
                     Column {
                         id: colHud
                         width: svHud.availableWidth
-                        padding: 10
-                        spacing: 10
+                        padding: 12
+                        spacing: 12
                         GroupBox {
                             title: "HUD"
                             // 预览画不画 HUD、怎么排版，全看「导出」页那三个勾选；
@@ -2697,7 +2812,23 @@ ApplicationWindow {
                                 label: "GPX 时间偏移（秒）"; prop: "hud_gpx_offset"
                                 hint: "以比赛出发时刻为基准：出发后 8 秒手表才开始记录就填 −8（HUD 用的就是轨迹文件同一条记录时，填成与「按表-出发时间」相同的值）；视频那一段（出发前几秒开录）由「视频」页的「录像-出发时间」自动换算，这里不用重复"
                             }
-                            HudEditor {id:hudEditor;width:parent.width;source:settings;renderer:item;enabled:!item.busy && !item.encoding}
+                            HudEditor {
+                                id: hudEditor
+                                width: parent.width
+                                source: settings
+                                renderer: item
+                                enabled: !item.busy && !item.encoding
+                                textColor: Theme.text
+                                mutedColor: Theme.muted
+                                accentColor: Theme.accent
+                                textOnAccent: Theme.text_on_accent
+                                buttonColor: Theme.button
+                                highlightColor: Theme.highlight
+                                surfaceHoverColor: Theme.surface_hover
+                                fieldColor: Theme.field
+                                borderColor: Theme.popup_border
+                                errorColor: Theme.danger
+                            }
                         }
                     }
                 }
@@ -2710,8 +2841,8 @@ ApplicationWindow {
                     Column {
                         id: colEnc
                         width: svEnc.availableWidth
-                        padding: 10
-                        spacing: 10
+                        padding: 12
+                        spacing: 12
                         GroupBox {
                             title: "编码"
                             ComboV { label: "编码器"; prop: "encode_backend"; values: ["software", "qsv", "nvenc", "amf", "videotoolbox"]; labels: ["CPU", "QSV", "NVENC", "AMF", "VideoToolbox"] }
@@ -2743,8 +2874,8 @@ ApplicationWindow {
                                 spacing: 6
                                 visible: { win.refreshTick; return String(settings.encode_seg_mode) === "custom" }
                                 Label { text: "分段范围"; Layout.preferredWidth: 150; color: Theme.text; elide: Text.ElideRight; font.pixelSize: 13 }
-                                TextField {
-                                    Layout.fillWidth: true; Layout.preferredHeight: 28; font.pixelSize: 13
+                                TTextField {
+                                    Layout.fillWidth: true; Layout.preferredHeight: 32; font.pixelSize: 13
                                     placeholderText: "如 0-1"
                                     text: { win.refreshTick; return String(settings.encode_start_seg) + "-" + String(settings.encode_end_seg) }
                                     validator: RegularExpressionValidator { regularExpression: /^[0-9]{0,3}-[0-9]{0,3}$/ }
@@ -2761,8 +2892,8 @@ ApplicationWindow {
                                 spacing: 6
                                 visible: { win.refreshTick; return String(settings.encode_seg_mode) === "time" }
                                 Label { text: "时间范围"; Layout.preferredWidth: 150; color: Theme.text; elide: Text.ElideRight; font.pixelSize: 13 }
-                                TextField {
-                                    Layout.fillWidth: true; Layout.preferredHeight: 28; font.pixelSize: 13
+                                TTextField {
+                                    Layout.fillWidth: true; Layout.preferredHeight: 32; font.pixelSize: 13
                                     placeholderText: "开始，如 0:00"
                                     text: { win.refreshTick; var v = settings.encode_clip_start_ms; return v > 0 ? win.fmtTime(v) : "" }
                                     onEditingFinished: win.setClipTime("start", text)
@@ -2772,8 +2903,8 @@ ApplicationWindow {
                                     ToolTip.delay: 400
                                 }
                                 Label { text: "→"; color: Theme.text; font.pixelSize: 13 }
-                                TextField {
-                                    Layout.fillWidth: true; Layout.preferredHeight: 28; font.pixelSize: 13
+                                TTextField {
+                                    Layout.fillWidth: true; Layout.preferredHeight: 32; font.pixelSize: 13
                                     placeholderText: "结束，如 5:30（留空 = 到末尾）"
                                     text: { win.refreshTick; var v = settings.encode_clip_end_ms; return v > 0 ? win.fmtTime(v) : "" }
                                     onEditingFinished: win.setClipTime("end", text)
@@ -2805,7 +2936,7 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 Layout.margins: 8
                 spacing: 8
-                TButton { text: "导出"; visible: tabs.currentIndex === 4; onClicked: win.startExport() }
+                TButton { text: "导出"; primary: true; visible: tabs.currentIndex === 4; onClicked: win.startExport() }
                 TButton { text: "添加到导出队列"; visible: tabs.currentIndex === 4; onClicked: win.addExportQueue() }
                 TButton { text: "保存配置"; visible: tabs.currentIndex !== 4; onClicked: saveDialog.open() }
             }
@@ -2819,7 +2950,7 @@ ApplicationWindow {
         anchors.top: parent.top
         anchors.right: settingsPanel.left
         anchors.bottom: parent.bottom
-        color: Theme.dark ? "#101010" : "#111111"
+        color: "#101010"
         border.width: 1
         border.color: Theme.video_border
     }
@@ -2841,12 +2972,26 @@ ApplicationWindow {
         playing: false
     }
     HudCanvas {
+        objectName:"mapFrameCanvas"
+        x:item.x;y:item.y;width:item.width;height:item.height
+        selectionColor: Theme.accent
+        lockedColor: Theme.warning
+        editor:mapEditor;allowDelete:false;allowRedo:false
+        // 多地图框：轨迹页 + 有地图 + 勾了地图 + 打开「在预览中编辑」就显示。
+        // 贴边框在 MapEditor 里 locked（可选中、不可拖），自由框可拖/缩放/旋转/吸附。
+        visible: { win.refreshTick; return tabs.currentIndex===0 && trackRows.hasMap
+            && !!settings.encode_include_map && mapEditor.boxCount > 0 && mapEditor.editing }
+        enabled:visible && mapEditor.enabled
+    }
+    HudCanvas {
         property var videoRect: {
             win.refreshTick; item.busy; item.apply_summary
             return JSON.parse(String(item.hud_viewport(item.width,item.height)))
         }
         x: item.x+videoRect.x; y: item.y+videoRect.y
         width: videoRect.width; height: videoRect.height
+        selectionColor: Theme.accent
+        lockedColor: Theme.warning
         editor: hudEditor
         // 预览里有没有 HUD，只由「导出」页的 HUD 勾选决定（proxy 属性没有 NOTIFY，靠 refreshTick 重算）。
         visible: { win.refreshTick; return tabs.currentIndex === 3 && !!settings.encode_include_hud }
@@ -2858,7 +3003,7 @@ ApplicationWindow {
         anchors.horizontalCenter: item.horizontalCenter
         anchors.top: item.top; anchors.topMargin: 16
         text: "预览里的 HUD 跟随「导出」页的 HUD 勾选：勾上才能在这里编辑位置"
-        color: "#e79832"; font.pixelSize: 13
+        color: Theme.warning; font.pixelSize: 13
     }
 
     // ---------- 拖放导入：把文件拖到预览区 ----------
@@ -2880,7 +3025,7 @@ ApplicationWindow {
             Text {
                 anchors.centerIn: parent
                 text: "松开即导入：" + "\n.trr 工程（兼容 .orv） / 视频 / 图片(地图) / .gpx / .gyroflow 预设 / .json 镜头标定"
-                color: Theme.button
+                color: "#ffffff"
                 font.pixelSize: 15
                 horizontalAlignment: Text.AlignHCenter
             }
@@ -2902,7 +3047,7 @@ ApplicationWindow {
         readonly property string phase: item.gyro_phase.length > 0 ? item.gyro_phase : "读取运动数据"
         Rectangle {
             anchors.fill: parent
-            color: "#b0404040"
+            color: Theme.overlay
         }
         Column {
             anchors.centerIn: parent
@@ -2914,7 +3059,7 @@ ApplicationWindow {
                       : (loadOverlay.indeterminate ? "正在加载防抖数据..." : loadOverlay.phase + " " + loadOverlay.pct + "%")
                 color: "white"; font.pixelSize: 16; horizontalAlignment: Text.AlignHCenter
             }
-            ProgressBar {
+            TProgressBar {
                 width: 280
                 // Real progress: the loader reports how much of the video container has been
                 // scanned for motion data, then the post-passes (see gyro.rs phase bounds).
@@ -2934,39 +3079,94 @@ ApplicationWindow {
         spacing: 6
         TButton {
             id: playButton
-            text: item.playing ? "\u23F8" : "\u25B6"
+            objectName: "previewPlayButton"
+            property bool showingPause: item.playing
+            text: showingPause ? "暂停" : "播放"
+            Accessible.name: text
             onClicked: item.set_playing(!item.playing)
             Layout.preferredHeight: 28
             Layout.preferredWidth: 40
-            font.pixelSize: 14
+            Layout.alignment: Qt.AlignTop
+            background: Rectangle {
+                color: playButton.hovered || playButton.down ? Theme.surface_hover : Theme.button
+                radius: Theme.radius_control * Theme.dpi_scale
+                border.width: 1
+                border.color: playButton.visualFocus ? Theme.focus : Theme.popup_border
+            }
+            // Draw monochrome controls instead of Unicode emoji glyphs, whose
+            // colored backgrounds vary with the operating system's emoji font.
+            contentItem: Item {
+                implicitWidth: 12
+                implicitHeight: 14
+                Canvas {
+                    anchors.centerIn: parent
+                    width: 12; height: 14
+                    visible: !playButton.showingPause
+                    property color iconColor: playButton.enabled ? Theme.text : Theme.disabled
+                    onIconColorChanged: requestPaint()
+                    onVisibleChanged: if (visible) requestPaint()
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.clearRect(0, 0, width, height)
+                        ctx.fillStyle = iconColor
+                        ctx.beginPath()
+                        ctx.moveTo(1, 1); ctx.lineTo(11, 7); ctx.lineTo(1, 13)
+                        ctx.closePath(); ctx.fill()
+                    }
+                }
+                Row {
+                    anchors.centerIn: parent
+                    visible: playButton.showingPause
+                    spacing: 3
+                    Rectangle { width: 3; height: 12; radius: 0.5; color: playButton.enabled ? Theme.text : Theme.disabled }
+                    Rectangle { width: 3; height: 12; radius: 0.5; color: playButton.enabled ? Theme.text : Theme.disabled }
+                }
+            }
         }
-        TSlider {
-            id: seek
+        Item {
             Layout.fillWidth: true
-            from: 0
-            to: item.duration_ms
-            // 拖动时在手柄上方显示目标时间（对齐原版 Slider 拖动时的数值气泡）
-            ToolTip {
-                parent: seek.handle
-                visible: seek.pressed
-                text: win.fmtTime(seek.value)
-                bottomMargin: 6
+            Layout.preferredHeight: splitMarkers.visiblePoints.length > 0 ? 44 : 28
+            TSlider {
+                id: seek
+                width: parent.width
+                height: 28
+                from: 0
+                to: item.duration_ms
+                // 拖动时在手柄上方显示目标时间（对齐原版 Slider 拖动时的数值气泡）
+                ToolTip {
+                    parent: seek.handle
+                    visible: seek.pressed
+                    text: win.fmtTime(seek.value)
+                    bottomMargin: 6
+                }
+                // Do not restart decoding for every mouse movement. Submit only the final
+                // position when the user releases the handle.
+                onPressedChanged: {
+                    scrubbing = pressed
+                    if (!pressed)
+                        item.seek(value)
+                }
             }
-            // Do not restart decoding for every mouse movement. Submit only the final
-            // position when the user releases the handle.
-            onPressedChanged: {
-                scrubbing = pressed
-                if (!pressed)
-                    item.seek(value)
+            SplitMarkers {
+                id: splitMarkers
+                objectName: "previewSplitMarkers"
+                x: seek.leftPadding + seek.handle.width / 2
+                y: 28
+                width: Math.max(0, seek.availableWidth - seek.handle.width)
+                height: 16
+                duration: seek.to
+                points: win.splitJumpPoints
+                accentColor: Theme.accent
+                onActivated: function(index) { win.jumpToSplit(index) }
             }
         }
-        Label { id: timeLabel; text: "00:00 / 00:00"; color: "white"; Layout.alignment: Qt.AlignVCenter; Layout.preferredHeight: 28 }
-        ComboBox {
+        Label { id: timeLabel; text: "00:00 / 00:00"; color: "white"; Layout.alignment: Qt.AlignTop; Layout.preferredHeight: 28 }
+        TComboBox {
             id: speedSelect
             model: ["0.8x", "1x", "1.5x", "2x", "3x", "4x"]
             currentIndex: 1
             Layout.preferredHeight: 28
-            Layout.alignment: Qt.AlignVCenter
+            Layout.alignment: Qt.AlignTop
             // 选择后立即应用到当前播放（含音频保音调变速）。
             onActivated: {
                 var rates = [0.8, 1.0, 1.5, 2.0, 3.0, 4.0]
@@ -3071,7 +3271,7 @@ ApplicationWindow {
             RowLayout {
                 Layout.fillWidth: true
                 spacing: 10
-                ProgressBar {
+                TProgressBar {
                     Layout.fillWidth: true
                     from: 0; to: 1000
                     value: win.num(item.encode_total_frames) > 0 ? win.num(item.encode_frame) / win.num(item.encode_total_frames) * 1000 : 0
@@ -3101,7 +3301,7 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 visible: item.encode_done && item.encode_error.length > 0
                 text: item.encode_error
-                color: item.encode_aborted ? "#a86e00" : "#b00020"
+                color: item.encode_aborted ? Theme.warning : Theme.danger
                 wrapMode: Text.Wrap
                 font.pixelSize: 12
             }
@@ -3110,7 +3310,7 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 visible: item.encode_warning.length > 0
                 text: item.encode_warning
-                color: "#b07800"
+                color: Theme.warning
                 wrapMode: Text.Wrap
             }
 
@@ -3120,7 +3320,7 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 visible: item.encode_notice.length > 0
                 text: "⚠ " + item.encode_notice
-                color: "#b07800"
+                color: Theme.warning
                 wrapMode: Text.Wrap
                 font.pixelSize: 12
             }
@@ -3235,7 +3435,7 @@ ApplicationWindow {
                 text: "地图和轨迹会立刻导入。是否用 .qrt 里的分段覆盖现在的分段？"
                 wrapMode: Text.Wrap
                 width: 360
-                color: "#555"
+                color: Theme.muted
             }
             Row {
                 spacing: 8
@@ -3329,7 +3529,7 @@ ApplicationWindow {
             seek.to = item.duration_ms
             // 拖动进度条时显示拖动位置的时间（否则显示当前播放时间）
             timeLabel.text = (scrubbing ? fmtTime(seek.value) : fmtTime(item.t_ms)) + " / " + fmtTime(item.duration_ms)
-            playButton.text = item.playing ? "\u23F8" : "\u25B6"
+            playButton.showingPause = item.playing
             gyroStatusText = item.gyro_status
             if (!scrubbing) seek.value = item.t_ms
         }

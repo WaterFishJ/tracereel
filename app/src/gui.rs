@@ -20,7 +20,7 @@ use crate::gyro::{
 use crate::pipe::PipeDecoder;
 use crate::probe::VideoInfo;
 use crate::qtwrap;
-use crate::settings::Settings;
+use crate::settings::{MapBoxStyle, Settings};
 use crate::video::SoftDecoder;
 use tracereel_core::gpx::GpxTrack;
 use tracereel_core::route_manager::{RenderMode, RouteManager, RouteStyle, RunnerStyle, ViewMode};
@@ -91,15 +91,17 @@ pub(crate) fn locate_map(starts: &[f64], t_ms: f64) -> usize {
 }
 
 /// GUI-thread state for one active map: the downsampled bitmap, the time (ms on the
-/// global video timeline) at which it takes over, and its own RouteManager (each map
-/// file carries a full-length, time-aligned track of the same run).
+/// global video timeline) at which it takes over, and one RouteManager per map box
+/// (each map file carries a full-length, time-aligned track of the same run).
 struct LiveMap {
     image: QImage,
     start_ms: f64,
-    rm: RouteManager,
+    /// 每个地图框一套取景器（长度 = 有效框数；框数变化走完整重载重建）。
+    rms: Vec<RouteManager>,
 }
 
 struct PreviewFrame {
+    generation: u64,
     request_id: u64,
     t_ms: f64,
     seg_idx: usize,
@@ -257,7 +259,7 @@ pub struct TraceReelItem {
             return QString::default();
         };
         match self.maps.get(i) {
-            Some(m) => match m.rm.routes.first() {
+            Some(m) => match m.rms.first().and_then(|rm| rm.routes.first()) {
                 Some(r) => QString::from(format!(
                     "{:.3},{:.3}",
                     r.runner_position.0, r.runner_position.1
@@ -266,6 +268,166 @@ pub struct TraceReelItem {
             },
             None => QString::default(),
         }
+    }),
+    /// 诊断/回归：当前地图框布局 + 每框取景状态（JSON）。多框取景的自动化断言用它：
+    /// 同一时刻「固定分段框」与「跟跑者居中框」的相机 x/y/scale/angle 必须各自正确。
+    debug_map_frames: qt_method!(fn debug_map_frames(&self) -> QString {
+        let Some(settings) = self.settings.as_ref() else {
+            return QString::default();
+        };
+        let boxes = effective_map_boxes(settings);
+        let map_idx = if self.maps.is_empty() {
+            None
+        } else {
+            let starts: Vec<f64> = self.maps.iter().map(|m| m.start_ms).collect();
+            Some(locate_map(&starts, self.t_ms))
+        };
+        let arr: Vec<serde_json::Value> = boxes
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let rm = map_idx.and_then(|mi| self.maps[mi].rms.get(i));
+                let mut v = serde_json::json!({
+                    "index": i,
+                    "mode": b.mode,
+                    "share": b.share,
+                    "viewMode": b.view_mode,
+                    "viewZoom": b.view_zoom,
+                    "lrMargin": b.lr_margin,
+                    "tbMargin": b.tb_margin,
+                    "sensitivity": b.sensitivity,
+                    "x": b.x, "y": b.y, "w": b.w, "h": b.h,
+                    "rotation": b.rotation,
+                    "opacity": b.opacity,
+                    "shape": b.shape,
+                });
+                if let Some(rm) = rm {
+                    v["camera"] = serde_json::json!({
+                        "x": rm.get_x(),
+                        "y": rm.get_y(),
+                        "scale": rm.get_scale(),
+                        "angle": rm.get_angle(),
+                        "windowWidth": rm.window_width,
+                        "windowHeight": rm.window_height,
+                        "circularFramingRadius": rm.circular_framing_radius,
+                    });
+                    // 取景器里**实际生效**的样式摘要（逐框样式接线的自动化断言用）。
+                    if let Some(route) = rm.routes.first() {
+                        let st = &route.style;
+                        v["appliedStyle"] = serde_json::json!({
+                            "renderMode": match st.route_render_mode {
+                                RenderMode::None => 0,
+                                RenderMode::Discreet => 1,
+                                RenderMode::Pace => 3,
+                            },
+                            "renderScope": st.render_scope,
+                            "routeWidth": st.route_width,
+                            "routeColor": [st.route_color.0, st.route_color.1, st.route_color.2],
+                            "routeOpacity": st.route_color.3,
+                            "showControls": st.show_controls,
+                            "showRunner": st.show_runner,
+                            "runnerStyle": match st.runner_style {
+                                RunnerStyle::Circle => 0,
+                                RunnerStyle::Arrow => 1,
+                            },
+                            "runnerRadius": st.runner_radius,
+                            "controlRadius": st.control_radius,
+                            "tailLength": st.tail_length,
+                            "tailWidth": st.tail_width,
+                            "tailMode": match st.tail_render_mode {
+                                RenderMode::None => 0,
+                                RenderMode::Discreet => 1,
+                                RenderMode::Pace => 3,
+                            },
+                            "lowPace": st.low_pace,
+                            "highPace": st.high_pace,
+                        });
+                    }
+                }
+                // 逐框轨迹显示样式摘要（自动化断言用：改框 2 不能影响框 1）。
+                if let Some(st) = b.style.as_ref() {
+                    v["style"] = serde_json::json!({
+                        "renderMode": st.render_mode,
+                        "renderScope": st.render_scope,
+                        "routeColor": st.route_color,
+                        "routeOpacity": st.route_opacity,
+                        "tailRenderMode": st.tail_render_mode,
+                        "tailColor": st.tail_color,
+                        "tailOpacity": st.tail_opacity,
+                        "controlColor": st.control_color,
+                        "showControls": st.show_controls,
+                        "runnerColor": st.runner_color,
+                        "runnerStyle": st.runner_style,
+                        "showRunner": st.show_runner,
+                        "lowPace": st.low_pace,
+                        "highPace": st.high_pace,
+                        "paceAuto": st.pace_auto,
+                        "tailPaceAuto": st.tail_pace_auto,
+                    });
+                }
+                v
+            })
+            .collect();
+        QString::from(
+            serde_json::json!({ "count": boxes.len(), "boxes": arr })
+                .to_string()
+                .as_str(),
+        )
+    }),
+    /// 交互/诊断：第 `index` 个地图框**当前实际生效**的配速色带端点（JSON：
+    /// `{"low":..,"high":..,"tailLow":..,"tailHigh":..}`，分钟/公里）。
+    ///
+    /// 「配速色带自适应」开着时端点由轨迹算出来、不落进设置；UI 在用户取消自适应时用它
+    /// 把该框的低/高配速滑杆填成当前色带，避免跳回工程里存的旧值。逐框独立。
+    map_box_pace_range: qt_method!(fn map_box_pace_range(&self, index: i32) -> QString {
+        let Ok(i) = usize::try_from(index) else {
+            return QString::default();
+        };
+        let style = if self.maps.is_empty() {
+            None
+        } else {
+            let starts: Vec<f64> = self.maps.iter().map(|m| m.start_ms).collect();
+            let mi = locate_map(&starts, self.t_ms);
+            self.maps[mi]
+                .rms
+                .get(i)
+                .and_then(|rm| rm.routes.first())
+                .map(|r| r.style.clone())
+        };
+        let (low, high, tail_low, tail_high) = match style {
+            Some(st) => (st.low_pace, st.high_pace, st.tail_low_pace, st.tail_high_pace),
+            // 还没有地图（或取景器未建）时退回该框设置里的值（旧多框工程会由
+            // effective_layout 用全局显示设置补齐）。
+            None => {
+                let box_style = self
+                    .settings
+                    .as_ref()
+                    .and_then(|s| effective_map_boxes(s).get(i).and_then(|b| b.style.clone()));
+                match box_style {
+                    Some(st) => (st.low_pace, st.high_pace, st.tail_low_pace, st.tail_high_pace),
+                    None => self
+                        .settings
+                        .as_ref()
+                        .map(|s| {
+                            (
+                                s.route.low_pace,
+                                s.route.high_pace,
+                                s.route.tail_low_pace,
+                                s.route.tail_high_pace,
+                            )
+                        })
+                        .unwrap_or((15.0, 5.0, 15.0, 5.0)),
+                }
+            }
+        };
+        QString::from(
+            serde_json::json!({
+                "low": low, "high": high,
+                "tailLow": tail_low, "tailHigh": tail_high,
+            })
+            .to_string()
+            .as_str(),
+        )
     }),
     queue_json: qt_property!(QString; NOTIFY queue_changed),
     queue_error: qt_property!(QString; NOTIFY queue_changed),
@@ -351,10 +513,7 @@ pub struct TraceReelItem {
             }
             // 预览和导出用同一套勾选（见 `preview_layers`）：不导视频就是「只导地图+HUD」，
             // 走 map-only 那条渲染路径，HUD 铺满整帧。
-            settings.encode.map_only = !settings.encode.include_video;
-            if !settings.encode.include_video {
-                settings.encode.audio_codec = "none".into();
-            }
+            settings.prepare_export_layers();
             settings.resolve_encode_clip_ms();
             let out = crate::settings::decode_path(&out_path);
             if out.is_empty() {
@@ -594,11 +753,11 @@ pub struct TraceReelItem {
             if self.queue_running && !self.encoding { self.advance_queue(); }
             if !self.playing {
                 self.was_playing = false;
-                // While paused, request the frame each tick if none has been shown yet; this
-                // retries a cold decoder. Because poll_preview_frame accepts any current-
-                // generation frame while paused, re-bumping the request id here does not cause
-                // published frames to be rejected (that was the "video never appears" bug).
-                if self.video_layer_on() && self.video_image.is_none() {
+                // Retry initial decoding and pending seeks while retaining the last image.
+                // A cold decoder may need several attempts; the existing image must not
+                // prevent requests for the new target. Same-target retries may publish
+                // despite a newer request id, but never across decoder generations.
+                if self.video_layer_on() && (self.video_image.is_none() || self.seek_settle) {
                     self.request_preview_frame(self.t_ms);
                 }
                 self.poll_preview_frame();
@@ -705,6 +864,9 @@ pub struct TraceReelItem {
             // result and respawns once at the final slider position.
             if let Ok(mut c) = self.preview_control.lock() {
                 c.generation = c.generation.wrapping_add(1);
+            }
+            if let Ok(mut frame) = self.preview_frame.lock() {
+                *frame = None;
             }
             self.pump_preview_frame();
         }
@@ -855,7 +1017,11 @@ pub struct TraceReelItem {
                     self.gyro = None;
                     self.gyro_done = None;
                     self.gyro_load_failed = false;
-                    self.gyro_has_motion = new.gyro.enabled && self.gyro_has_motion;
+                    // Motion data belongs to the video, not to the enabled state.
+                    // Clearing this flag on disable makes the next enable skip
+                    // loading forever because this same-video path never re-probes.
+                    self.gyro_has_motion = self.video_info.as_ref()
+                        .is_some_and(|info| info.has_motion_data);
                     self.last_gyro_sig = hard_gyro_sig(&new);
                     self.set_gyro_loading(false);
                     if new.gyro.enabled && self.gyro_has_motion {
@@ -897,6 +1063,7 @@ pub struct TraceReelItem {
             let p = crate::settings::decode_path(&path);
             self.settings_path = QString::from(p.clone());
             self.settings = Some(Settings::load_orv(&p));
+            self.refresh_map_cameras();
             let this: &dyn QQuickItem = &*self;
             this.update();
         }
@@ -933,43 +1100,46 @@ pub struct TraceReelItem {
                     return self.apply_settings(path, false);
                 }
             };
-            let style = route_style_from_settings(&new);
-            let view = view_mode_from_settings(&new);
+            let styles = effective_route_styles(&new);
             // 影响控制点/分段取景表的项：就地改完必须让 RouteManager 整表重算
             // （表是按窗口尺寸+画面占比+边距+按表-出发时间算出来的）。
             let tables_dirty = old.route.control_time_offset != new.route.control_time_offset
+                || old.route.user_scale != new.route.user_scale
                 || old.route.left_right_margin != new.route.left_right_margin
                 || old.route.top_bottom_margin != new.route.top_bottom_margin
-                || old.route.user_scale != new.route.user_scale
                 || old.map.relative_width != new.map.relative_width;
             self.settings_path = QString::from(p);
             self.settings = Some(new.clone());
-            let ft = if self.fps > 0.0 { 1000.0 / self.fps } else { 16.0 };
             let t_sec = self.t_ms / 1000.0;
+            let views = effective_frame_views(&new);
             for lm in self.maps.iter_mut() {
-                let rm = &mut lm.rm;
-                rm.set_view_mode(view);
-                rm.map_relative_width = new.map.relative_width;
-                rm.left_right_margin = new.route.left_right_margin;
-                rm.top_bottom_margin = new.route.top_bottom_margin;
-                for r in rm.routes.iter_mut() {
-                    r.style = style.clone();
-                    r.control_time_offset = style.control_time_offset;
-                    r.runner_time_offset = style.runner_time_offset;
+                for (i, rm) in lm.rms.iter_mut().enumerate() {
+                    // 逐框取景参数：方式/缩放/边距/灵敏度，滑杆拖动下一帧就生效。
+                    let view = views.get(i).copied().unwrap_or_default();
+                    apply_frame_view(rm, view);
+                    // 逐框轨迹显示样式：路线/尾巴/控制点/运动员各自独立（校准仍全局）。
+                    let style = styles.get(i).cloned().unwrap_or_default();
+                    apply_route_style(rm, &style);
+                    if tables_dirty {
+                        rm.request_full_update();
+                    }
                 }
-                // 自适应配速色带由实际轨迹算出，和完整 apply 走同一个入口。
-                apply_adaptive_pace(rm);
-                if tables_dirty {
-                    rm.request_full_update();
+            }
+            // 逐框重新按画布尺寸/圆形取景半径配置窗口（窗口没变时不会重置镜头）。
+            self.refresh_map_cameras();
+            // 只改显示参数：播放头没动，平滑增量为 0（否则镜头会被多推一小步）。
+            for lm in self.maps.iter_mut() {
+                for rm in lm.rms.iter_mut() {
+                    rm.update(t_sec, 0.0);
                 }
-                rm.update(t_sec, ft);
             }
             // 「自适应」关掉时 QML 用这两个端点把手动滑杆填成当前色带。
             if new.route.pace_auto || new.route.tail_pace_auto {
                 let pace = self
                     .maps
                     .first()
-                    .and_then(|m| m.rm.routes.first())
+                    .and_then(|m| m.rms.first())
+                    .and_then(|rm| rm.routes.first())
                     .and_then(|r| tracereel_core::route_manager::adaptive_pace_range(&r.route_points));
                 if let Some((low, high)) = pace {
                     self.pace_auto_low = low;
@@ -977,6 +1147,50 @@ pub struct TraceReelItem {
                 }
             }
             self.debug_apply_kind = QString::from("就地更新");
+            let this: &dyn QQuickItem = &*self;
+            this.update();
+        }
+    ),
+    /// 地图框布局就地更新：QML 拖动地图框/改取景参数时调它（框数不变）。
+    ///
+    /// 只改内存里的 layout 与旧字段镜像，然后按新布局重配每框取景器（窗口/取景方式/
+    /// 缩放/边距/灵敏度），不重载视频/地图/轨迹、不重置播放位置。框数变化（加/删/复制框）
+    /// 在这里**拒绝**：那种情况 QML 走 `win.applyNow(...)` 触发完整重载，重建每框取景器。
+    apply_map_frames: qt_method!(
+        fn apply_map_frames(&mut self, json: QString) {
+            let Ok(layout) = crate::settings::MapLayout::parse(&json.to_string()) else {
+                eprintln!("[apply] 地图框 JSON 解析失败，忽略本次更新");
+                return;
+            };
+            let Some(s) = self.settings.as_mut() else {
+                return;
+            };
+            let current = s.map.effective_layout(&s.route).boxes.len();
+            if layout.boxes.len() != current
+                || self.maps.iter().any(|m| m.rms.len() != layout.boxes.len())
+            {
+                eprintln!(
+                    "[apply] 地图框数量变化（{} -> {}），需要完整重载",
+                    current,
+                    layout.boxes.len()
+                );
+                return;
+            }
+            s.map.layout = layout;
+            s.map.sync_legacy_from_layout(&mut s.route);
+            // 逐框轨迹显示样式也要即时跟着布局走（路线/尾巴/控制点/运动员；校准仍全局）。
+            let styles = effective_route_styles(s);
+            self.refresh_map_cameras();
+            let t_sec = self.t_ms / 1000.0;
+            for lm in &mut self.maps {
+                for (i, rm) in lm.rms.iter_mut().enumerate() {
+                    if let Some(style) = styles.get(i) {
+                        apply_route_style(rm, style);
+                    }
+                    // 拖框/改取景/改样式不是播放推进：平滑增量为 0，不要多推镜头。
+                    rm.update(t_sec, 0.0);
+                }
+            }
             let this: &dyn QQuickItem = &*self;
             this.update();
         }
@@ -1013,6 +1227,8 @@ pub struct TraceReelItem {
     /// 已落地到画面的预览帧数（只增不减）。自动化回归（`qmlprobe`）用它断言"改设置后
     /// 画面还在更新"——「黑屏」症状的本质就是这个数不再增长。
     debug_frames: qt_property!(f64),
+    /// Timestamp of the frame actually accepted for display, independent of the seek target.
+    debug_frame_ms: qt_property!(f64),
     /// 最近一次设置改动走的是哪条路：「完整重载」还是「就地更新」。排查与自动化回归用
     /// —— 改一个轨迹显示项却看到「完整重载」，就说明白名单漏了键（或代理多写了别的差异）。
     debug_apply_kind: qt_property!(QString),
@@ -1091,6 +1307,10 @@ pub struct TraceReelItem {
     queue_duration_tx: Option<std::sync::mpsc::Sender<(String, Result<Vec<f64>, String>)>>,
     // 预览播放倍速：1.0=原速；0.0（Default 初始值）按 1.0 处理。
     speed: f64,
+    /// 上一帧喂给地图相机的**内容时间**（毫秒）。相机平滑按内容时间积分：倍速播放时
+    /// 每帧内容时间前进 `倍速×帧长`，直接用它算增量，镜头跟随速度就不随倍速变钝；
+    /// 拖动进度/回绕造成的负增量或大跳则让取景瞬间到位。见 `camera_step_ms`。
+    cam_t_ms: f64,
     /// 预览音频引擎（ffmpeg→waveOut，atempo 保音调）；首次播放时创建。
     preview_audio: Option<crate::preview_audio::PreviewAudio>,
     /// 预览音频是否已经因为「没有视频层」被关掉（避免每个 tick 都去 stop 一次）。
@@ -1187,6 +1407,35 @@ impl TraceReelItem {
             && self.settings.as_ref().map(|s| s.encode.include_video).unwrap_or(true)
     }
 
+    /// Refresh framing after a layout edit without advancing playback.
+    fn refresh_map_cameras(&mut self) {
+        let (iw, ih) = (
+            qtwrap::qquick_item_width(self.get_cpp_object()),
+            qtwrap::qquick_item_height(self.get_cpp_object()),
+        );
+        if iw <= 0.0 || ih <= 0.0 {
+            return;
+        }
+        let settings = preview_layers(self.settings.clone().unwrap_or_default());
+        let placements = effective_placements(&settings);
+        let views = effective_frame_views(&settings);
+        let frames = box_frames(&settings, iw, ih);
+        for lm in &mut self.maps {
+            for i in 0..lm.rms.len() {
+                let placement = placements.get(i).copied().unwrap_or_default();
+                let view = views.get(i).copied().unwrap_or_default();
+                let frame = frames
+                    .get(i)
+                    .map(|b| b.rect)
+                    .unwrap_or_else(|| full_frame_rect(iw, ih));
+                // Editing a frame must not advance the camera's animation clock.
+                if configure_frame_camera(&mut lm.rms[i], placement, view, frame) {
+                    lm.rms[i].update(self.t_ms / 1000.0, 0.0);
+                }
+            }
+        }
+    }
+
     /// 把每张地图的路线管理器推进到 `self.t_ms`：运动员位置与镜头取景都在
     /// `RouteManager::update` 里算。
     ///
@@ -1204,15 +1453,32 @@ impl TraceReelItem {
         } else {
             16.0
         };
+        let step = camera_step_ms(self.playing, ft, self.cam_t_ms, self.t_ms);
+        let snap = step.is_none();
+        let dt = step.unwrap_or(0.0);
+        let camera_speed = if self.playing { self.play_speed() } else { 1.0 };
+        self.cam_t_ms = self.t_ms;
+        let settings = preview_layers(self.settings.clone().unwrap_or_default());
+        let placements = effective_placements(&settings);
+        let views = effective_frame_views(&settings);
+        let frames = box_frames(&settings, iw, ih);
         for lm in &mut self.maps {
-            if iw > 0.0
-                && ih > 0.0
-                && ((lm.rm.window_width - iw).abs() > 1.0
-                    || (lm.rm.window_height - ih).abs() > 1.0)
-            {
-                lm.rm.window_resized(iw, ih);
+            for i in 0..lm.rms.len() {
+                if iw > 0.0 && ih > 0.0 {
+                    let placement = placements.get(i).copied().unwrap_or_default();
+                    let view = views.get(i).copied().unwrap_or_default();
+                    let frame = frames
+                        .get(i)
+                        .map(|b| b.rect)
+                        .unwrap_or_else(|| full_frame_rect(iw, ih));
+                    configure_frame_camera(&mut lm.rms[i], placement, view, frame);
+                }
+                if snap {
+                    // 跳转：让取景器把跑者平均位置/分段过渡直接置到目标时刻，不拖一段过渡。
+                    lm.rms[i].instant_split_transition_requested = true;
+                }
+                lm.rms[i].update_playback(self.t_ms / 1000.0, dt, camera_speed);
             }
-            lm.rm.update(self.t_ms / 1000.0, ft);
         }
     }
 
@@ -1327,7 +1593,7 @@ impl TraceReelItem {
             .map(|m| LiveMap {
                 image: qtwrap::qimage_from_rgba(m.w, m.h, &m.rgba),
                 start_ms: m.start_ms,
-                rm: m.rm,
+                rms: m.rms,
             })
             .collect();
         self.video_info = Some(res.info.clone());
@@ -1407,11 +1673,16 @@ impl TraceReelItem {
         }
         // 地图/轨迹先按当前位置对齐一次再重画：否则要等第一帧预览到达才刷新，
         // 期间地图停在建链时的 t=0 机位 —— 看起来就是"地图显示不正确、也不动"。
+        // 重新载入是跳转：让取景直接置到目标时刻，不从 t=0 的机位慢慢平滑过来
+        // （尤其「跟跑者居中」：平滑时间常数按内容时间算，慢慢追会拖好几秒）。
         {
-            let ft = if self.fps > 0.0 { 1000.0 / self.fps } else { 16.0 };
             let t_sec = self.t_ms / 1000.0;
+            self.cam_t_ms = self.t_ms;
             for lm in &mut self.maps {
-                lm.rm.update(t_sec, ft);
+                for rm in &mut lm.rms {
+                    rm.instant_split_transition_requested = true;
+                    rm.update(t_sec, 0.0);
+                }
             }
         }
         self.refresh_preview_config();
@@ -1544,7 +1815,6 @@ impl TraceReelItem {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
-                seen_request = req.request_id;
                 let requested_id = req.request_id;
                 // Snap the request to the frame grid WITHIN the owning segment (all
                 // segments share the same fps): the quaternion and the decoded frame
@@ -1602,13 +1872,12 @@ impl TraceReelItem {
                     rgba = p
                         .get_with(t_snap, req.playing && req.speed > 1.01)
                         .map(|f| f.as_ref().clone());
-                    pipe_dead = rgba.is_none() && p.dead();
+                    pipe_dead = rgba.is_none() && (p.dead() || p.cold_stalled());
                 }
-                if rgba.is_none() && pipe_dead {
-                    // Only a permanently-dead hardware chain falls back to software; a
-                    // transient miss during a seek is resolved by the playhead-hold in `tick`
-                    // (see seek_settling), NOT by slow software decoding — a per-frame 16 GB
-                    // software seek would stall playback for seconds at a time.
+                if rgba.is_none() && (pipe_dead || soft.is_some()) {
+                    // Allow normal cold-start misses to retry, but recover if hardware
+                    // exits or stays alive without producing any frame for too long.
+                    // Keep using the software decoder after switching to it.
                     decoder = None;
                     if soft.is_none() {
                         soft = SoftDecoder::open(&segs[seg_idx].path, req.pw, req.ph).ok();
@@ -1621,8 +1890,8 @@ impl TraceReelItem {
                     }
                 }
                 let Some(mut rgba) = rgba else {
-                    // Cold decoder or latest seek not ready: let the GUI resubmit the same
-                    // timestamp with a new request id; never block the GUI thread.
+                    // A cold decoder is not a completed request. Retry it even when a
+                    // paused preview submits the same request id again.
                     continue;
                 };
                 let mut stabilized = false;
@@ -1662,7 +1931,9 @@ impl TraceReelItem {
                     .map(|g| {
                         (
                             g.generation == generation,
-                            g.request_id == requested_id && g.generation == generation,
+                            (g.request_id == requested_id
+                                || (!g.playing && (g.t_ms - req.t_ms).abs() < dt * 0.5))
+                                && g.generation == generation,
                         )
                     })
                     .unwrap_or((false, false));
@@ -1670,6 +1941,7 @@ impl TraceReelItem {
                 // frame is being processed; publish the newest completed frame anyway. For
                 // paused/seek requests, only publish if it is still the latest request.
                 if same_generation && (req.playing || still_latest) {
+                    seen_request = requested_id;
                     let t_global = segs[seg_idx].start_ms + t_snap;
                     if let Some(lp) = last_publish {
                         let gap = lp.elapsed().as_millis();
@@ -1682,6 +1954,7 @@ impl TraceReelItem {
                     last_publish = Some(std::time::Instant::now());
                     if let Ok(mut s) = slot.lock() {
                         *s = Some(PreviewFrame {
+                            generation,
                             request_id: requested_id,
                             t_ms: t_global,
                             seg_idx,
@@ -1741,8 +2014,14 @@ impl TraceReelItem {
     fn poll_preview_frame(&mut self) {
         let frame = self.preview_frame.lock().ok().and_then(|mut s| s.take());
         if let Some(frame) = frame {
+            // A completed frame can enter the slot just as a newer seek invalidates
+            // its decoder. Never let it overwrite the latest seek, even at the same time.
+            let current = self.preview_control.lock()
+                .map(|c| c.generation == frame.generation).unwrap_or(false);
+            if !current { return; }
             // 诊断计数：这个数不涨 = 画面没有新帧（"黑屏"症状的第一手判据）。
             self.debug_frames += 1.0;
+            self.debug_frame_ms = frame.t_ms;
             // Every frame the worker writes to the slot is from the current generation (the
             // worker only publishes when same_generation is true), so accept it regardless of
             // the exact request id. Requiring request_id == preview_request_id would reject
@@ -2300,20 +2579,6 @@ impl QQuickPaintedItem for TraceReelItem {
         let Some(settings) = self.settings.as_ref().cloned() else {
             return;
         };
-        // Pick the active map by global timeline: the one with the greatest start_ms
-        // not exceeding the current time (index 0 / the main map before any switch).
-        // With no map at all the scene still renders (video only), like before.
-        let (rm, map_image, route_start_ms) = if self.maps.is_empty() {
-            (None, None, 0.0)
-        } else {
-            let starts: Vec<f64> = self.maps.iter().map(|m| m.start_ms).collect();
-            let idx = locate_map(&starts, self.t_ms);
-            (
-                Some(self.maps[idx].rm.clone()),
-                Some(self.maps[idx].image.clone()),
-                self.maps[idx].start_ms,
-            )
-        };
         let (W, H) = (
             qtwrap::qquick_item_width(self.get_cpp_object()),
             qtwrap::qquick_item_height(self.get_cpp_object()),
@@ -2321,11 +2586,8 @@ impl QQuickPaintedItem for TraceReelItem {
         if W <= 0.0 || H <= 0.0 {
             return;
         }
-        // `draw_scene` only touches `rm` inside the map block, so a default manager is
-        // a safe placeholder when no map is configured (video-only preview).
-        let rm = rm.unwrap_or_default();
         let has_project_content = self.video_image.is_some()
-            || map_image.is_some()
+            || self.maps.iter().any(|m| !m.rms.is_empty())
             || self.gpx.is_some()
             || !settings.video.video_path.trim().is_empty()
             || !settings.map.image_file_path.trim().is_empty()
@@ -2333,30 +2595,59 @@ impl QQuickPaintedItem for TraceReelItem {
             || !settings.hud.gpx_file_path.trim().is_empty();
         // 预览按导出页的三个勾选合成：没勾的层不画，剩下的铺满画布。
         let mut settings = preview_layers(settings);
+        let placements = effective_placements(&settings);
+        let views = effective_frame_views(&settings);
+        let frames = box_frames(&settings, W, H);
+        // 逐框准备图层：只处理当前时间轴活动的那张地图（换图前其余地图不必动）。
+        let mut layers: Vec<SceneLayer> = Vec::new();
+        if !self.maps.is_empty() {
+            let starts: Vec<f64> = self.maps.iter().map(|m| m.start_ms).collect();
+            let idx = locate_map(&starts, self.t_ms);
+            {
+                let lm = &mut self.maps[idx];
+                for i in 0..lm.rms.len() {
+                    let placement = placements.get(i).copied().unwrap_or_default();
+                    let view = views.get(i).copied().unwrap_or_default();
+                    let frame = frames
+                        .get(i)
+                        .map(|b| b.rect)
+                        .unwrap_or_else(|| full_frame_rect(W, H));
+                    configure_frame_camera(&mut lm.rms[i], placement, view, frame);
+                    lm.rms[i].update(self.t_ms / 1000.0, 0.0);
+                }
+            }
+            let lm = &self.maps[idx];
+            for (i, rm) in lm.rms.iter().enumerate() {
+                let Some(placement) = placements.get(i).copied() else {
+                    break;
+                };
+                layers.push(SceneLayer {
+                    rm,
+                    map: &lm.image,
+                    placement,
+                    route_start_ms: lm.start_ms,
+                });
+            }
+        }
         if !has_project_content {
             settings.hud.layout = Some(crate::hud::Layout {
                 version: 1,
                 widgets: Vec::new(),
             });
         }
-        draw_scene(
+        let video = if settings.encode.include_video {
+            self.video_image.as_ref()
+        } else {
+            None
+        };
+        draw_scene_layers(
             p,
-            &rm,
             &settings,
-            if settings.encode.include_map {
-                map_image
-            } else {
-                None
-            },
-            if settings.encode.include_video {
-                self.video_image.clone()
-            } else {
-                None
-            },
+            video,
+            &layers,
             W,
             H,
             self.t_ms,
-            route_start_ms,
             self.gpx.as_ref(),
         );
     }
@@ -2366,17 +2657,13 @@ impl QQuickPaintedItem for TraceReelItem {
 ///
 /// 预览以前有自己的「HUD 预览」开关，和导出勾选各管各的，结果勾掉 HUD 导出、预览却还在画，
 /// 或者只导地图+HUD 时预览画不出成品的样子。现在只有一套真相（`encode.include_*`）：
-/// 这里把它翻译成 `draw_scene` 认的版面参数 —— 去掉地图就把地图带宽归零（视频铺满），
-/// 去掉视频就让地图占满整帧，去掉 HUD 就把布局清空。
+/// 去掉 HUD 就把布局清空；地图/视频两层的版面由 `composition::scene_layout` 按勾选决定
+/// （没勾地图 → 视频整幅；没勾视频 → 贴边地图框铺满整幅）。
 pub fn preview_layers(mut s: Settings) -> Settings {
-    if !s.encode.include_map {
-        s.map.relative_width = 0.0;
-    }
+    // 版面不再靠改 `relative_width` 表达「勾掉地图/视频」：`scene_layout` 直接看
+    // `include_map` / `include_video` 两个标志（单框工程与旧导出路径语义不变）。
     if !s.video.all_paths().iter().any(|p| !p.trim().is_empty()) {
         s.encode.include_video = false;
-    }
-    if !s.encode.include_video {
-        s.map.relative_width = 1.0;
     }
     if !s.encode.include_hud {
         s.hud.layout = Some(crate::hud::Layout {
@@ -2387,8 +2674,6 @@ pub fn preview_layers(mut s: Settings) -> Settings {
     s
 }
 
-/// Composite the map + route (left) and video (right) onto `p`. Shared by the GUI
-/// window, the headless renderer, and the encode pump.
 /// 「硬」防抖输入：**只有这些变化才需要真正重载稳定化器**（重探测视频 + 重读运动数据）。
 /// 其余 gyro 参数（视野/变焦/平滑/地平线/卷帘/附加旋转平移/陀螺偏移…）都走
 /// `apply_gyro_params` 的「只重算」路径 —— 与原版 Gyroflow 一致。
@@ -2402,7 +2687,7 @@ pub fn hard_gyro_sig(s: &Settings) -> String {
     )
 }
 
-/// 有没有配置任何地图/轨迹图片（主图或额外地图）。`draw_scene` 用它决定左侧地图带：
+/// 有没有配置任何地图/轨迹图片（主图或额外地图）。`draw_scene` 用它决定是否保留地图区域：
 /// 没配地图时视频铺满整帧。判断依据是 SETTINGS 而非已加载的图，这样「配置了地图但还在
 /// 加载」时布局不会跳动。导出解码尺寸（`encode::export_decode_size`）必须用同一个判据，
 /// 否则算出来的视频面板和实际绘制的不一致。
@@ -2416,25 +2701,392 @@ pub fn map_configured(settings: &Settings) -> bool {
             .any(|p| !p.trim().is_empty())
 }
 
-pub fn draw_scene(
-    p: &mut QPainter,
-    rm: &RouteManager,
+/// 当前有效的框列表（版面的唯一来源）：`layout` 里第 2+ 框原样，第 0 框用旧字段镜像重建
+/// （见 `MapSettings::effective_layout`，兼容仍只改扁平字段的旧代码/旧工程）。
+pub(crate) fn effective_map_boxes(settings: &Settings) -> Vec<crate::settings::MapBox> {
+    settings.map.effective_layout(&settings.route).boxes
+}
+
+/// 当前有效的框列表的版面部分（顺序 = 绘制/叠加顺序）。
+pub(crate) fn effective_placements(settings: &Settings) -> Vec<crate::composition::Placement> {
+    effective_map_boxes(settings)
+        .iter()
+        .map(|b| b.placement())
+        .collect()
+}
+
+/// 每个框的取景参数（逐框独立：方式/缩放/左右上下边距/灵敏度），顺序与框列表一致。
+pub(crate) fn effective_frame_views(settings: &Settings) -> Vec<FrameView> {
+    effective_map_boxes(settings)
+        .iter()
+        .map(|b| FrameView {
+            mode: b.view_mode,
+            zoom: b.view_zoom,
+            lr_margin: b.lr_margin,
+            tb_margin: b.tb_margin,
+            sensitivity: b.sensitivity,
+        })
+        .collect()
+}
+
+/// 第 0 框的取景参数（旧字段镜像，单框兼容路径用）。
+fn frame_view_from_settings(settings: &Settings) -> FrameView {
+    FrameView {
+        mode: settings.route.view_mode,
+        zoom: settings.route.view_zoom,
+        lr_margin: settings.route.left_right_margin,
+        tb_margin: settings.route.top_bottom_margin,
+        sensitivity: settings.route.runner_averaging_factor,
+    }
+}
+
+/// 一个地图框独立的取景参数（原 RouteSettings 取景字段的下沉版本）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FrameView {
+    /// 0 固定分段 / 1 跟跑者居中 / 2 跑者居中+分段定向。
+    pub mode: i32,
+    /// 只有居中两个模式用。
+    pub zoom: f64,
+    /// 只有固定分段用。
+    pub lr_margin: f64,
+    pub tb_margin: f64,
+    /// 镜头跟随平滑（原「运动员平均因子」），只有居中两个模式用。
+    pub sensitivity: f64,
+}
+
+impl Default for FrameView {
+    fn default() -> Self {
+        Self {
+            mode: 0,
+            zoom: 1.0,
+            lr_margin: 20.0,
+            tb_margin: 20.0,
+            sensitivity: 0.5,
+        }
+    }
+}
+
+pub(crate) fn view_mode_of(mode: i32) -> ViewMode {
+    match mode {
+        1 => ViewMode::RunnerCentered,
+        2 => ViewMode::RunnerCenteredSplitOriented,
+        _ => ViewMode::FixedSplit,
+    }
+}
+
+/// 把一框的取景参数写进取景器；返回「分段取景表需要重算」（边距变了才需要）。
+/// 取景方式只切换取景状态机，缩放/灵敏度是纯参数，都不需要重算分段表。
+fn apply_frame_view(rm: &mut RouteManager, view: FrameView) -> bool {
+    let mut tables_dirty = false;
+    let mode = view_mode_of(view.mode);
+    if rm.view_mode != mode {
+        rm.set_view_mode(mode);
+    }
+    let lr = if view.lr_margin.is_finite() {
+        view.lr_margin
+    } else {
+        20.0
+    };
+    let tb = if view.tb_margin.is_finite() {
+        view.tb_margin
+    } else {
+        20.0
+    };
+    if (rm.left_right_margin - lr).abs() > 1e-9 {
+        rm.left_right_margin = lr;
+        tables_dirty = true;
+    }
+    if (rm.top_bottom_margin - tb).abs() > 1e-9 {
+        rm.top_bottom_margin = tb;
+        tables_dirty = true;
+    }
+    let zoom = framing_zoom_value(view.zoom);
+    if (rm.centered_zoom - zoom).abs() > 1e-9 {
+        rm.centered_zoom = zoom;
+    }
+    let sensitivity = sensitivity_value(view.sensitivity);
+    if (rm.runner_averaging_factor - sensitivity).abs() > 1e-9 {
+        rm.set_runner_averaging_factor(sensitivity);
+    }
+    tables_dirty
+}
+
+/// 按「框的版面 + 取景参数 + 画布像素矩形」配置一个取景器：窗口尺寸、圆形取景半径、
+/// 取景方式/缩放/边距/灵敏度。返回是否发生了需要下一帧 update 的变化。
+fn configure_frame_camera(
+    rm: &mut RouteManager,
+    placement: crate::composition::Placement,
+    view: FrameView,
+    frame: crate::composition::Rect,
+) -> bool {
+    let mut changed = apply_frame_view(rm, view);
+    // 圆形地图框（自由摆放 + 形状=圆形）的可见区域是**内切圆**，取景也必须按内切圆来：
+    // 窗口用内切圆的外接正方形（边长 = min(宽,高)），半径 = 半个边长。只按矩形窗口收景
+    // 的话，长条地图框里轨迹会贴到矩形边（= 圆外）被裁掉。
+    let circular = placement.mode == 4 && placement.shape == 1;
+    let side = frame.width.min(frame.height).max(1.0);
+    let (w, h) = if circular {
+        (side, side)
+    } else {
+        (frame.width.max(1.0), frame.height.max(1.0))
+    };
+    let circular_radius = if circular { side / 2.0 } else { 0.0 };
+    if (rm.window_width - w).abs() > 0.01
+        || (rm.window_height - h).abs() > 0.01
+        || rm.map_relative_width != 1.0
+    {
+        rm.map_relative_width = 1.0;
+        rm.window_resized(w, h);
+        changed = true;
+    }
+    if (rm.circular_framing_radius - circular_radius).abs() > 0.01 {
+        // 只改取景圆：窗口尺寸没变，也要让分段取景表按新半径重算。
+        rm.circular_framing_radius = circular_radius;
+        changed = true;
+    }
+    if changed {
+        rm.request_full_update();
+    }
+    changed
+}
+
+/// Effective panel geometry, shared with the HUD, camera and decoder.
+pub fn scene_panels(settings: &Settings, width: f64, height: f64) -> crate::composition::Panels {
+    let layout = crate::composition::scene_layout(
+        &effective_placements(settings),
+        width,
+        height,
+        map_configured(settings) && settings.encode.include_map,
+        settings.encode.include_video,
+    );
+    let first = layout.boxes.first().copied();
+    crate::composition::Panels {
+        map: first
+            .map(|b| b.rect)
+            .unwrap_or(crate::composition::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            }),
+        rotation: first.map(|b| b.rotation).unwrap_or(0.0),
+        video: layout.video,
+    }
+}
+
+/// 每框在当前画布上的像素矩形 + 旋转（顺序与 `effective_placements` 一致）。
+/// 绘制路径由 `draw_scene_layers` 内部算版面；这个入口留给测试/诊断（以及以后可能
+/// 需要逐框矩形的工具）用。
+#[allow(dead_code)]
+pub(crate) fn scene_box_frames(
     settings: &Settings,
-    map: Option<QImage>,
-    video: Option<QImage>,
+    width: f64,
+    height: f64,
+) -> Vec<crate::composition::SceneBox> {
+    crate::composition::scene_layout(
+        &effective_placements(settings),
+        width,
+        height,
+        map_configured(settings) && settings.encode.include_map,
+        settings.encode.include_video,
+    )
+    .boxes
+}
+
+/// 相机配置用的框矩形：与绘制共用 `scene_layout`，只把「地图层开着」视作前提。
+/// 这样即使勾掉了导出地图（预览不画地图），取景器窗口尺寸也不会来回跳。
+pub(crate) fn box_frames(
+    settings: &Settings,
+    width: f64,
+    height: f64,
+) -> Vec<crate::composition::SceneBox> {
+    crate::composition::scene_layout(
+        &effective_placements(settings),
+        width,
+        height,
+        true,
+        settings.encode.include_video,
+    )
+    .boxes
+}
+
+/// 整幅画布的矩形（取景器窗口尺寸兜底用）。
+fn full_frame_rect(width: f64, height: f64) -> crate::composition::Rect {
+    crate::composition::Rect {
+        x: 0.0,
+        y: 0.0,
+        width: width.max(1.0),
+        height: height.max(1.0),
+    }
+}
+
+/// 从一份「基础取景器」（只含轨迹与样式）复制出每框各自的取景器：
+/// 各自 clone 后套上该框的取景方式/缩放/边距/灵敏度 + **该框自己的轨迹显示样式**
+/// （路线/尾巴/控制点/运动员；校准时间仍是全局），并按框矩形设窗口与圆形取景半径。
+/// 基础取景器本身保持干净（旧路径/HUD/时长/自适应配速仍用它）。
+pub(crate) fn build_frame_managers(
+    settings: &Settings,
+    base: &RouteManager,
+    width: f64,
+    height: f64,
+) -> Vec<RouteManager> {
+    let placements = effective_placements(settings);
+    let views = effective_frame_views(settings);
+    let frames = box_frames(settings, width, height);
+    let styles = effective_route_styles(settings);
+    let full = crate::composition::Rect {
+        x: 0.0,
+        y: 0.0,
+        width: width.max(1.0),
+        height: height.max(1.0),
+    };
+    let count = placements.len().max(1);
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let mut rm = base.clone();
+        let placement = placements.get(i).copied().unwrap_or_default();
+        let view = views.get(i).copied().unwrap_or_default();
+        let frame = frames.get(i).map(|b| b.rect).unwrap_or(full);
+        configure_frame_camera(&mut rm, placement, view, frame);
+        if let Some(style) = styles.get(i) {
+            apply_route_style(&mut rm, style);
+        }
+        out.push(rm);
+    }
+    out
+}
+
+/// 把一套绘制样式写进取景器里的每条路线（逐框独立）。
+///
+/// 只换显示字段；校准用的 `control_time_offset`/`runner_time_offset` 由样式构建时从
+/// 全局设置算好一并带上（保证与旧路径同一套换算）。改完重算自适应配速色带端点。
+pub(crate) fn apply_route_style(rm: &mut RouteManager, style: &RouteStyle) {
+    for r in rm.routes.iter_mut() {
+        r.style = style.clone();
+        r.control_time_offset = style.control_time_offset;
+        r.runner_time_offset = style.runner_time_offset;
+    }
+    apply_adaptive_pace(rm);
+}
+
+/// 单框兼容入口（旧路径/旧测试仍用它）：按第 0 框的版面与取景参数配置取景器。
+fn resize_map_camera(rm: &mut RouteManager, settings: &Settings, width: f64, height: f64) -> bool {
+    let placement = settings.map.placement();
+    let frame = scene_panels(settings, width, height).map;
+    configure_frame_camera(rm, placement, frame_view_from_settings(settings), frame)
+}
+
+/// 一个待绘制的地图框（预览与导出共用）。版面矩形/旋转由 `composition::scene_layout`
+/// 统一算，这里只带绘制所需的数据。
+pub struct SceneLayer<'a> {
+    pub rm: &'a RouteManager,
+    pub map: &'a QImage,
+    pub placement: crate::composition::Placement,
+    /// 这张地图在全局时间轴上的起点（路线只画起点之后的部分）。
+    pub route_start_ms: f64,
+}
+
+/// 画一个地图框（画布坐标）：先把画布平移到框中心、按框自身旋转，再在框局部坐标里
+/// 画地图相机 + 路线装饰；自由摆放的外观（不透明度/圆形/羽化/圆角）走离屏层 + 遮罩。
+fn draw_map_box(
+    p: &mut QPainter,
+    settings: &Settings,
+    layer: &SceneLayer<'_>,
+    frame: crate::composition::Rect,
+    rotation: f64,
+    t_ms: f64,
+) {
+    if frame.width <= 0.0 || frame.height <= 0.0 {
+        return;
+    }
+    p.save();
+    p.translate(QPointF {
+        x: frame.x + frame.width / 2.0,
+        y: frame.y + frame.height / 2.0,
+    });
+    p.rotate(rotation);
+    let style = layer.placement.sanitized();
+    if style.mode != 4
+        || (style.opacity == 1.0
+            && style.shape == 0
+            && style.feather == 0.0
+            && style.corner == 0.0)
+    {
+        draw_map_content(
+            p,
+            layer.rm,
+            settings,
+            (*layer.map).clone(),
+            frame.width,
+            frame.height,
+            t_ms,
+            layer.route_start_ms,
+        );
+    } else if style.opacity > 0.0 {
+        let mut layer_img =
+            qtwrap::qimage_new_transparent(frame.width.ceil() as i32, frame.height.ceil() as i32);
+        {
+            let mut lp = qtwrap::qpainter_on_image(&mut layer_img);
+            for hint in [
+                qmetaobject::qttypes::QPainterRenderHint::Antialiasing,
+                qmetaobject::qttypes::QPainterRenderHint::TextAntialiasing,
+                qmetaobject::qttypes::QPainterRenderHint::SmoothPixmapTransform,
+            ] {
+                lp.set_render_hint(hint, true);
+            }
+            lp.scale(
+                frame.width.ceil() / frame.width,
+                frame.height.ceil() / frame.height,
+            );
+            lp.translate(QPointF {
+                x: frame.width / 2.0,
+                y: frame.height / 2.0,
+            });
+            draw_map_content(
+                &mut lp,
+                layer.rm,
+                settings,
+                (*layer.map).clone(),
+                frame.width,
+                frame.height,
+                t_ms,
+                layer.route_start_ms,
+            );
+        }
+        qtwrap::qpainter_draw_map_layer(
+            p,
+            &mut layer_img,
+            frame.width,
+            frame.height,
+            style.shape,
+            style.feather,
+            style.corner,
+            style.opacity,
+        );
+    }
+    p.restore();
+}
+
+/// 多地图框合成入口：黑底 + 视频层 + 依次叠加的地图框 + HUD。
+/// 版面只由 `composition::scene_layout` 决定（与 `scene_panels`、导出解码尺寸同一真相）。
+#[allow(clippy::too_many_arguments)]
+pub fn draw_scene_layers(
+    p: &mut QPainter,
+    settings: &Settings,
+    video: Option<&QImage>,
+    layers: &[SceneLayer<'_>],
     W: f64,
     H: f64,
     t_ms: f64,
-    route_start_ms: f64,
     gpx: Option<&GpxTrack>,
 ) {
-    // 没有配置任何地图/轨迹图片时（只做防抖 + HUD 的项目）左侧不留空带：视频铺满整帧。
-    let map_configured = map_configured(settings);
-    let rel_w = if map_configured {
-        settings.map.relative_width
-    } else {
-        0.0
-    };
+    let layout = crate::composition::scene_layout(
+        &effective_placements(settings),
+        W,
+        H,
+        map_configured(settings) && settings.encode.include_map,
+        settings.encode.include_video,
+    );
 
     // Match the original renderer's quality hints: SmoothPixmapTransform keeps the map
     // crisp when it is scaled (this is the main sharpness fix alongside a higher map
@@ -2462,89 +3114,113 @@ pub fn draw_scene(
         QBrush::from_color(QColor::from_rgba(0, 0, 0, 255)),
     );
 
-    if let Some(map) = map {
-        let mp_off_x = -(W / 2.0 - (rel_w * W) / 2.0);
-        p.save();
-        p.translate(QPointF {
-            x: W / 2.0 + mp_off_x,
-            y: H / 2.0,
-        });
-        p.rotate(-(settings.map.angle + settings.map.user_angle + rm.get_angle()));
-        let s = settings.map.user_scale * rm.get_scale();
-        p.scale(s, s);
-        p.translate(QPointF {
-            x: settings.map.x + settings.map.user_x + rm.get_x(),
-            y: -(settings.map.y + settings.map.user_y + rm.get_y()),
-        });
-        let (tw, th) = (
-            qtwrap::qimage_width(&map) as f64,
-            qtwrap::qimage_height(&map) as f64,
-        );
-        p.draw_image_fit_rect(
-            QRectF {
-                x: -tw / 2.0,
-                y: -th / 2.0,
-                width: tw,
-                height: th,
-            },
-            map,
-        );
-        draw_route(p, rm, settings, t_ms / 1000.0, route_start_ms);
-        p.restore();
-    }
-
-    // Black out the video region so the map (which may overflow right) never shows under it.
-    p.fill_rect(
-        QRectF {
-            x: rel_w * W,
-            y: 0.0,
-            width: (1.0 - rel_w) * W,
-            height: H,
-        },
-        QBrush::from_color(QColor::from_rgba(0, 0, 0, 255)),
+    let hud_rect = crate::hud::viewport(
+        settings,
+        W,
+        H,
+        video.map(|image| {
+            (
+                qtwrap::qimage_width(image) as f64,
+                qtwrap::qimage_height(image) as f64,
+            )
+        }),
     );
-
-    let hud_rect = crate::hud::viewport(settings, W, H, video.as_ref().map(|image|
-        (qtwrap::qimage_width(image) as f64, qtwrap::qimage_height(image) as f64)));
     if let Some(video) = video {
+        let vp = layout.video;
         let (vw, vh) = (
-            qtwrap::qimage_width(&video) as f64,
-            qtwrap::qimage_height(&video) as f64,
+            qtwrap::qimage_width(video) as f64,
+            qtwrap::qimage_height(video) as f64,
         );
-        // Letterbox: keep the video's own aspect ratio, fit the largest rectangle inside
-        // the right region, centre it, and fill the remainder with black.
-        let vp_w = (1.0 - rel_w) * W;
-        let vp_h = H;
         let base = if vw > 0.0 && vh > 0.0 {
-            (vp_w / vw).min(vp_h / vh)
+            (vp.width / vw).min(vp.height / vh)
         } else {
             1.0
         };
-        let s = base * settings.video.scale;
-        p.save();
-        p.translate(QPointF {
-            x: rel_w * W + vp_w / 2.0,
-            y: H / 2.0,
-        });
-        p.rotate(settings.video.angle);
-        p.scale(s, s);
-        p.translate(QPointF {
-            x: settings.video.x,
-            y: settings.video.y,
-        });
-        p.draw_image_fit_rect(
-            QRectF {
-                x: -vw / 2.0,
-                y: -vh / 2.0,
-                width: vw,
-                height: vh,
-            },
-            video,
-        );
-        p.restore();
+        let scale = base * settings.video.scale;
+        if vp.width > 0.0 && vp.height > 0.0 {
+            p.save();
+            qtwrap::qpainter_clip_rect(p, vp.x, vp.y, vp.width, vp.height);
+            p.translate(QPointF {
+                x: vp.x + vp.width / 2.0,
+                y: vp.y + vp.height / 2.0,
+            });
+            p.rotate(settings.video.angle);
+            p.scale(scale, scale);
+            p.translate(QPointF {
+                x: settings.video.x,
+                y: settings.video.y,
+            });
+            p.draw_image_fit_rect(
+                QRectF {
+                    x: -vw / 2.0,
+                    y: -vh / 2.0,
+                    width: vw,
+                    height: vh,
+                },
+                (*video).clone(),
+            );
+            p.restore();
+        }
+    }
+
+    for (i, layer) in layers.iter().enumerate() {
+        let Some(box_frame) = layout.boxes.get(i).copied() else {
+            break;
+        };
+        draw_map_box(p, settings, layer, box_frame.rect, box_frame.rotation, t_ms);
     }
 
     crate::hud::draw_in_viewport(p, settings, gpx, t_ms, hud_rect);
+}
+
+/// 旧入口（单框）：把「一个取景器 + 一张地图」包成单框图层。
+/// `hudcheck` 的像素回归、单测、旧离屏工具都继续走它，签名保持不变。
+#[allow(clippy::too_many_arguments)]
+pub fn draw_scene(
+    p: &mut QPainter,
+    rm: &RouteManager,
+    settings: &Settings,
+    map: Option<QImage>,
+    video: Option<QImage>,
+    W: f64,
+    H: f64,
+    t_ms: f64,
+    route_start_ms: f64,
+    gpx: Option<&GpxTrack>,
+) {
+    let mut layers = Vec::new();
+    if let Some(map) = map.as_ref() {
+        let placement = effective_placements(settings)
+            .first()
+            .copied()
+            .unwrap_or_default();
+        layers.push(SceneLayer {
+            rm,
+            map,
+            placement,
+            route_start_ms,
+        });
+    }
+    draw_scene_layers(p, settings, video.as_ref(), &layers, W, H, t_ms, gpx);
+}
+
+/// Draw the map and all route decorations in local frame coordinates.
+#[allow(clippy::too_many_arguments)]
+fn draw_map_content(p: &mut QPainter, rm: &RouteManager, settings: &Settings, map: QImage,
+    width: f64, height: f64, t_ms: f64, route_start_ms: f64) {
+        // Clip before applying the map camera: rotate the whole frame, including its crop.
+        qtwrap::qpainter_clip_rect(p, -width / 2.0, -height / 2.0, width, height);
+        p.fill_rect(QRectF { x: -width / 2.0, y: -height / 2.0,
+            width: width, height: height },
+            QBrush::from_color(QColor::from_rgba(0, 0, 0, 255)));
+        p.rotate(-(settings.map.angle + settings.map.user_angle + rm.get_angle()));
+        let scale = settings.map.user_scale * rm.get_scale();
+        p.scale(scale, scale);
+        p.translate(QPointF { x: settings.map.x + settings.map.user_x + rm.get_x(),
+            y: -(settings.map.y + settings.map.user_y + rm.get_y()) });
+        let (tw, th) = (qtwrap::qimage_width(&map) as f64, qtwrap::qimage_height(&map) as f64);
+        p.draw_image_fit_rect(QRectF { x: -tw / 2.0, y: -th / 2.0, width: tw, height: th }, map);
+        draw_route(p, rm, settings, t_ms / 1000.0, route_start_ms);
 }
 
 /// Headless render: probe video, load map + route, decode a frame at `t_ms`, composite
@@ -2573,8 +3249,7 @@ pub fn render_composite_to_png(
     );
     let view_mode = view_mode_from_settings(settings);
     let mut rm = RouteManager::default();
-    rm.window_width = out_w as f64;
-    rm.window_height = out_h as f64;
+    resize_map_camera(&mut rm, settings, out_w as f64, out_h as f64);
     apply_framing_settings(&mut rm, settings);
     init_route_manager(
         &mut rm,
@@ -2585,15 +3260,13 @@ pub fn render_composite_to_png(
         rel,
         route_style,
         view_mode,
-        settings.map.relative_width,
+        1.0,
     )?;
     // Advance the camera/runner to the requested time (matches the GUI playback path).
-    let ft = if info.fps > 0.0 {
-        1000.0 / info.fps
-    } else {
-        16.0
-    };
-    rm.update(t_ms / 1000.0, ft);
+    // 单帧截图/合成是「直接跳到这个时刻」，不是逐帧播放：让取景瞬间到位，
+    // 否则「跟跑者居中」的平滑会从 t=0 的机位慢慢追，单帧就停在半路上。
+    rm.instant_split_transition_requested = true;
+    rm.update(t_ms / 1000.0, 0.0);
 
     // HUD 轨迹：与实时预览/导出同一条解析路径（工程里的 GPX → 视频同名 .gpx →
     // 轨迹文件自带的时间轴）。
@@ -2658,8 +3331,7 @@ pub fn encode_composite(
         settings.splits.is_relative,
     );
     let mut rm = RouteManager::default();
-    rm.window_width = out_w as f64;
-    rm.window_height = out_h as f64;
+    resize_map_camera(&mut rm, settings, out_w as f64, out_h as f64);
     apply_framing_settings(&mut rm, settings);
     init_route_manager(
         &mut rm,
@@ -2670,7 +3342,7 @@ pub fn encode_composite(
         rel,
         route_style,
         view_mode_from_settings(settings),
-        settings.map.relative_width,
+        1.0,
     )?;
 
     // HUD 轨迹（导出用）：工程里的 GPX → 视频同名 .gpx → 轨迹文件自带的时间轴。
@@ -2975,7 +3647,13 @@ const ROUTE_DISPLAY_KEYS: &[(&str, &str)] = &[
     ("route", "controlTimeOffset"),
     ("route", "leftRightMargin"),
     ("route", "topBottomMargin"),
+    ("route", "viewZoom"),
     ("map", "relativeWidth"),
+    ("map", "placement"),
+    ("map", "frameX"), ("map", "frameY"),
+    ("map", "frameWidth"), ("map", "frameHeight"), ("map", "frameRotation"),
+    ("map", "frameOpacity"), ("map", "frameShape"),
+    ("map", "frameFeather"), ("map", "frameCorner"),
     ("map", "x"),
     ("map", "y"),
     ("map", "userX"),
@@ -2983,6 +3661,8 @@ const ROUTE_DISPLAY_KEYS: &[(&str, &str)] = &[
     ("map", "angle"),
     ("map", "userAngle"),
     ("map", "userScale"),
+    // 多地图框布局（框数 > 1 才写这个键；单框工程仍只走上面那些旧键）。
+    ("map", "boxes"),
     // HUD 的显示范围只决定 HUD 落在哪块区域（视频区/整幅画面），不碰任何素材，
     // 就地重画就够，不必为下拉一下重载视频。
     ("hud", "scope"),
@@ -2994,6 +3674,11 @@ const ROUTE_DISPLAY_KEYS: &[(&str, &str)] = &[
 /// 保守失败：只要有任何**没进白名单**的差异（也包括解析不出键名的行），一律返回假，
 /// 调用方退回完整重载 —— 宁可慢一次，也不能悄悄吞掉一个真正影响预览的设置。
 fn only_route_display_changed(old: &Settings, new: &Settings) -> bool {
+    // 地图框数量变化意味着取景器数量要变（每框一套 RouteManager），就地更新处理不了：
+    // 必须完整重载重建。加框/删框/复制框走的正是这条（经临时 .trr → apply_settings）。
+    if old.map.layout.boxes.len() != new.map.layout.boxes.len() {
+        return false;
+    }
     fn non_display_lines(s: &Settings) -> Vec<String> {
         let mut section = String::new();
         let mut keep: Vec<String> = Vec::new();
@@ -3038,7 +3723,15 @@ pub fn view_mode_from_settings(s: &Settings) -> ViewMode {
     }
 }
 
+/// 全局显示设置（第 1 框镜像）→ 绘制样式。旧路径（单框离屏渲染 / 测试 / HUD 检查）仍走它。
 pub fn route_style_from_settings(s: &Settings) -> RouteStyle {
+    route_style_from_box(s, &MapBoxStyle::from_route(&s.route))
+}
+
+/// 一个地图框的轨迹显示样式：路线/尾巴/控制点/运动员等字段来自该框自己的
+/// `MapBoxStyle`；**时间校准**（按表-出发时间 / 录像-出发时间）与遗留的路线线宽
+/// 缩放系数仍是全局的（用户明确：校准时间不逐框独立）。
+pub fn route_style_from_box(s: &Settings, style: &MapBoxStyle) -> RouteStyle {
     let mut st = RouteStyle::default();
     st.user_scale = s.route.user_scale;
     // 统一时间校准模型（正值约定，与界面提示一致）：
@@ -3050,62 +3743,77 @@ pub fn route_style_from_settings(s: &Settings) -> RouteStyle {
     //       => runner_time_offset = T_watch - T_video（自动换算，无需单独输入）
     st.control_time_offset = s.route.control_time_offset;
     st.runner_time_offset = s.route.control_time_offset - s.video.start_time_offset_s;
-    st.tail_length = s.route.tail_length;
-    st.show_controls = s.route.show_controls;
-    st.show_runner = s.route.show_runner;
-    st.route_render_mode = match s.route.render_mode {
-        1 => RenderMode::Discreet,
+    st.tail_length = style.tail_length;
+    st.show_controls = style.show_controls;
+    st.show_runner = style.show_runner;
+    st.route_render_mode = match style.render_mode {
         // 3 = 配速（沿用原版编号）。2 是原版的「高亮」——本程序没有这个模式，
         // 老工程里存到 2 的一律按单色的「简洁」渲染。
-        2 => RenderMode::Discreet,
+        1 | 2 => RenderMode::Discreet,
         3 => RenderMode::Pace,
         _ => RenderMode::None,
     };
-    st.tail_render_mode = match s.route.tail_render_mode {
-        // 1 = 简洁；2 是原版尾巴的「高亮」——本程序没有这个模式，按单色的「简洁」渲染。
+    st.tail_render_mode = match style.tail_render_mode {
+        // 1 = 简洁；2 是原版尾巴的「高亮」——按单色的「简洁」渲染。
         1 | 2 => RenderMode::Discreet,
         // 3 = 配速（与路线渲染共用同一套编号与色带）。
         3 => RenderMode::Pace,
         _ => RenderMode::None,
     };
-    st.route_width = s.route.width;
-    st.tail_width = s.route.tail_width;
-    st.control_radius = s.route.control_radius;
-    st.runner_radius = s.route.runner_radius;
+    st.route_width = style.width;
+    // 渲染范围随样式走：逐框独立（固定分段框常配「单段」，居中框可配「完整」）。
+    st.render_scope = style.render_scope;
+    st.tail_width = style.tail_width;
+    st.control_radius = style.control_radius;
+    st.runner_radius = style.runner_radius;
     // 运动员样式：0 = 圆形（原版）、1 = 箭头（跟着运动方向转）。
-    st.runner_style = match s.route.runner_style {
+    st.runner_style = match style.runner_style {
         1 => RunnerStyle::Arrow,
         _ => RunnerStyle::Circle,
     };
     // 颜色与不透明度是两个独立设置项：颜色只给 RGB，alpha 一律取那个 0..255 的项
     // （原版 Renderer.cpp 里颜色自带 alpha，这里拆开是为了让界面能单独调透明度）。
     st.route_color = color_with_opacity(
-        &s.route.route_color,
-        s.route.route_opacity,
+        &style.route_color,
+        style.route_opacity,
         (0.0, 0.0, 0.0, 80.0 / 255.0),
     );
     st.tail_color = color_with_opacity(
-        &s.route.tail_color,
-        s.route.tail_opacity,
+        &style.tail_color,
+        style.tail_opacity,
         (0.0, 0.0, 0.0, 80.0 / 255.0),
     );
     st.control_border_color = color_with_opacity(
-        &s.route.control_color,
-        s.route.control_opacity,
+        &style.control_color,
+        style.control_opacity,
         (0.0, 0.0, 0.0, 1.0),
     );
     st.runner_color = color_with_opacity(
-        &s.route.runner_color,
-        s.route.runner_opacity,
+        &style.runner_color,
+        style.runner_opacity,
         (1.0, 1.0, 1.0, 1.0),
     );
-    st.low_pace = s.route.low_pace;
-    st.tail_low_pace = s.route.tail_low_pace;
-    st.high_pace = s.route.high_pace;
-    st.tail_high_pace = s.route.tail_high_pace;
-    st.pace_auto = s.route.pace_auto;
-    st.tail_pace_auto = s.route.tail_pace_auto;
+    st.low_pace = style.low_pace;
+    st.high_pace = style.high_pace;
+    st.pace_auto = style.pace_auto;
+    st.tail_low_pace = style.tail_low_pace;
+    st.tail_high_pace = style.tail_high_pace;
+    st.tail_pace_auto = style.tail_pace_auto;
     st
+}
+
+/// 每个地图框一套绘制样式（顺序 = 框列表顺序）。找不到逐框样式时回退到全局显示设置。
+pub(crate) fn effective_route_styles(s: &Settings) -> Vec<RouteStyle> {
+    effective_map_boxes(s)
+        .iter()
+        .map(|b| {
+            let style = b
+                .style
+                .clone()
+                .unwrap_or_else(|| MapBoxStyle::from_route(&s.route));
+            route_style_from_box(s, &style)
+        })
+        .collect()
 }
 
 /// 把一串**带配速的点**画成配速色带：先按全不透明画进一张离屏位图，再整张按 `alpha` 合成一次。
@@ -3151,6 +3859,8 @@ fn draw_pace_band(
     // 位图分辨率：默认跟父画家 1:1（1 个位图像素 = 1 个设备像素，线宽、边缘与直接画在画布上
     // 完全一致，合成就是一次 1:1 拷贝）；只在这三种情况下让步 —— 长边超过 1600 像素（大范围
     // 轨迹，位图太大不值当）、线宽不足 1 个位图像素（会淡成发丝）、总面积超过 400 万像素。
+    // 多地图框时每个框的相机缩放不同 → 同一路线会按不同 ls 各有一份位图，缓存按 LRU 多槽
+    // 保存（见下方 PACE_LAYER_CACHE），不会互相挤掉、不会每帧重建。
     let mut ls = qtwrap::painter_scale(p).max(1e-6);
     let long_side = bw.max(bh);
     if long_side * ls > 1600.0 {
@@ -3180,19 +3890,31 @@ fn draw_pace_band(
         ls.to_bits().hash(&mut h);
         h.finish()
     };
-    // 每个 cache_kind 各留一份：路线一份、尾巴一份。只留一槽的话，播放中每帧都在变的
-    // 尾巴位图会把路线那份挤掉，而路线带子可能有几千个点，重新生成它的代价正好落在每帧上。
-    // 也**不能**按插入顺序整体淘汰（那样路线会被每帧新来的尾巴挤走、隔帧重建）：按 kind 淘汰，
-    // 同一 kind 只保留最新的一份，于是路线在它的点位/配速/线宽不变时一直命中。
+    // 位图缓存：以前「每个 cache_kind 只留一份」（路线一份、尾巴一份）。多地图框时不同框的
+    // 相机缩放不同（ls 不同），同一路线/尾巴会按不同 ls 各有一份位图；只留一份的话各框会
+    // 互相挤掉、每帧全量重建 —— 配速模式最贵的一项就是它。现在改成有上限的 LRU
+    // （条数 + 字节预算），命中即刷新使用时间；重建代价大的路线位图长期留在缓存里。
     thread_local! {
-        static PACE_LAYER_CACHE: std::cell::RefCell<Vec<(u64, u64, QImage)>> =
+        static PACE_LAYER_CACHE: std::cell::RefCell<Vec<(u64, u64, QImage, u64)>> =
             std::cell::RefCell::new(Vec::new());
+        static PACE_LAYER_CLOCK: std::cell::Cell<u64> = std::cell::Cell::new(0);
     }
+    const PACE_LAYER_CACHE_MAX_ENTRIES: usize = 8;
+    const PACE_LAYER_CACHE_MAX_BYTES: usize = 48 * 1024 * 1024;
+    let tick = PACE_LAYER_CLOCK.with(|c| {
+        let t = c.get().wrapping_add(1);
+        c.set(t);
+        t
+    });
     let cached = PACE_LAYER_CACHE.with(|c| {
-        c.borrow()
-            .iter()
-            .find(|(_, k, _)| *k == key)
-            .map(|(_, _, img)| qtwrap::qimage_clone(img))
+        let mut b = c.borrow_mut();
+        match b.iter_mut().find(|(_, k, _, _)| *k == key) {
+            Some(entry) => {
+                entry.3 = tick;
+                Some(qtwrap::qimage_clone(&entry.2))
+            }
+            None => None,
+        }
     });
     let layer = match cached {
         Some(img) => img,
@@ -3254,9 +3976,27 @@ fn draw_pace_band(
             layer = qtwrap::qimage_from_rgba(iw, ih, &pixels);
             PACE_LAYER_CACHE.with(|c| {
                 let mut b = c.borrow_mut();
-                // 同一 kind 的旧位图直接替换掉；另一个 kind（路线 / 尾巴）留着。
-                b.retain(|(kind, k, _)| *kind != cache_kind && *k != key);
-                b.push((cache_kind, key, qtwrap::qimage_clone(&layer)));
+                b.retain(|(_, k, _, _)| *k != key);
+                b.push((cache_kind, key, qtwrap::qimage_clone(&layer), tick));
+                let bytes = |img: &QImage| -> usize {
+                    (qtwrap::qimage_width(img).max(0) as usize)
+                        * (qtwrap::qimage_height(img).max(0) as usize)
+                        * 4
+                };
+                while b.len() > PACE_LAYER_CACHE_MAX_ENTRIES {
+                    let idx = (0..b.len())
+                        .min_by_key(|i| b[*i].3)
+                        .unwrap_or(0);
+                    b.remove(idx);
+                }
+                let mut total: usize = b.iter().map(|(_, _, img, _)| bytes(img)).sum();
+                while total > PACE_LAYER_CACHE_MAX_BYTES && b.len() > 1 {
+                    let idx = (0..b.len())
+                        .min_by_key(|i| b[*i].3)
+                        .unwrap_or(0);
+                    let (_, _, img, _) = b.remove(idx);
+                    total = total.saturating_sub(bytes(&img));
+                }
             });
             layer
         }
@@ -3372,7 +4112,7 @@ pub fn draw_route_pub(
     // 路线的起点限制：`route_start_ms` 之后的路段才画（多地图分段用；0 表示整条）。
     let start_route_t = route_start_ms / 1000.0 + route.runner_time_offset;
     // 渲染范围：完整 = 整条路线（默认）；单段 = 只画当前所在的那一段，其余各段一个像素都不画。
-    let leg = if s.route.render_scope == 1 {
+    let leg = if style.render_scope == 1 {
         current_leg_window(rm, t_sec)
     } else {
         None
@@ -3554,11 +4294,70 @@ pub fn is_qrt_path(path: &str) -> bool {
 ///
 /// 之前预览准备和离屏渲染（导出、单帧截图）都只建了取景器、没同步这几项：界面上改边距
 /// 只有当场生效一次（走「就地更新」那条路），重新打开工程或导出时又回到代码默认的
-/// 10/30，和工程里存的值对不上。跑者平均因子按 `RUNNER_AVERAGING_FACTOR` 固定。
+/// 10/30，和工程里存的值对不上。灵敏度（原「运动员平均因子」）也跟着工程走。
 fn apply_framing_settings(rm: &mut RouteManager, settings: &Settings) {
     rm.left_right_margin = settings.route.left_right_margin;
     rm.top_bottom_margin = settings.route.top_bottom_margin;
-    rm.set_runner_averaging_factor(tracereel_core::route_manager::RUNNER_AVERAGING_FACTOR);
+    // 跟跑者居中的两个模式用「缩放」代替取景边距（边距只对固定分段取景有意义）。
+    rm.centered_zoom = framing_zoom(settings);
+    rm.set_runner_averaging_factor(runner_sensitivity(settings));
+}
+
+/// 「取景缩放」（跟跑者居中模式）的安全范围：0 或非有限值会得到全黑/爆放大，直接兜底到 1.0。
+fn framing_zoom_value(v: f64) -> f64 {
+    if v.is_finite() {
+        v.clamp(0.01, 20.0)
+    } else {
+        1.0
+    }
+}
+
+/// 「灵敏度」（原「运动员平均因子」）的安全范围：0/非有限值会得到不动的镜头或瞬移，
+/// 兜底到取景器默认值。等价时间常数 ≈ `1000 / 值` 毫秒（默认 0.5 → 约 2 秒平滑）。
+fn sensitivity_value(v: f64) -> f64 {
+    if v.is_finite() && v > 0.0 {
+        v.clamp(0.05, 20.0)
+    } else {
+        tracereel_core::route_manager::RUNNER_AVERAGING_FACTOR
+    }
+}
+
+/// 「取景缩放」的设置入口（第 0 框/旧字段镜像）。
+fn framing_zoom(settings: &Settings) -> f64 {
+    framing_zoom_value(settings.route.view_zoom)
+}
+
+/// 「灵敏度」（原「运动员平均因子」）：镜头跟随跑者的平滑强度，越大跟得越紧。
+fn runner_sensitivity(settings: &Settings) -> f64 {
+    sensitivity_value(settings.route.runner_averaging_factor)
+}
+
+/// 相机平滑要用的**内容时间**增量（毫秒）。`None` = 这次是跳转/回绕，取景要瞬间到位。
+///
+/// 关键是按内容时间积分：平滑的时间常数（`灵敏度`/平均因子）定义在轨迹时间轴上。以前
+/// 这里固定传 `1000/帧率`，倍速播放时内容时间按倍速前进、平滑器却按原速积分，等效平滑
+/// 时间被放大「倍速」倍 —— 用户看到的就是「倍速时地图画面跟不上运动员」。改用真实播放头
+/// 增量后，镜头跟随速度与倍速无关。
+///
+/// - 播放中：正向增量直接用（8 倍速、掉帧都正确）；回绕或大跳（>5 秒）视为跳转。
+/// - 暂停中：播放头不动，按标称帧长继续向当前时刻收敛，让镜头停稳；真的拖了进度
+///   （增量 >200 毫秒）则瞬间到位，避免暂停时镜头停在旧位置。
+fn camera_step_ms(playing: bool, nominal_frame_ms: f64, prev_ms: f64, now_ms: f64) -> Option<f64> {
+    let delta = now_ms - prev_ms;
+    if !delta.is_finite() || delta < 0.0 {
+        return None;
+    }
+    if playing {
+        if delta > 5000.0 {
+            None
+        } else {
+            Some(delta)
+        }
+    } else if delta > 200.0 {
+        None
+    } else {
+        Some(nominal_frame_ms)
+    }
 }
 
 /// Point a `RouteManager` at a track source, accepting either a QuickRoute JPEG
@@ -3729,7 +4528,10 @@ pub(crate) struct PreparedMap {
     pub w: i32,
     pub h: i32,
     pub start_ms: f64,
+    /// 基础取景器（第 0 框/整幅画布语义，旧路径仍用它：HUD 轨迹解析、时长、自适应配速）。
     pub rm: RouteManager,
+    /// 每个地图框一套取景器（长度 = `settings.map.layout.boxes.len()`）。
+    pub rms: Vec<RouteManager>,
 }
 
 /// Result of the background prepare: everything the GUI thread needs to land the apply,
@@ -3991,10 +4793,9 @@ pub(crate) fn prepare_one_map(
         (map_rgba, map_w0, map_h0)
     };
 
+    // 基础取景器：只建一次轨迹（文件只解析一次），每框的取景器从它 clone 出来再改参数。
+    // 阶段 3 之前是单框；多框后这里是 M×F 里「每张地图一份基础数据」的那一份。
     let mut rm = RouteManager::default();
-    rm.window_width = window.0;
-    rm.window_height = window.1;
-    apply_framing_settings(&mut rm, settings);
     if !route_path.is_empty() && map_w0 > 0 {
         let init = init_route_manager(
             &mut rm,
@@ -4005,7 +4806,7 @@ pub(crate) fn prepare_one_map(
             rel,
             route_style,
             view_mode,
-            settings.map.relative_width,
+            1.0,
         );
         if let Err(e) = init {
             if err.is_none() {
@@ -4049,12 +4850,16 @@ pub(crate) fn prepare_one_map(
         rm.update(0.0, 0.0);
     }
 
+    // 每个地图框一套取景器（长度 = 有效框数）。基础取景器保持干净（旧路径用它）。
+    let rms = build_frame_managers(settings, &rm, window.0, window.1);
+
     (
         PreparedMap {
             rgba: map_rgba,
             w: map_w,
             h: map_h,
             start_ms,
+            rms,
             rm,
         },
         err,
@@ -4075,26 +4880,658 @@ pub fn processing_size(w: usize, h: usize, cap_h: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{MapBox, MapBoxStyle, MapLayout, MAP_LAYOUT_VERSION};
 
     /// 预览版面完全由导出页的三个勾选决定：勾掉的层不出现，剩下的铺满画布。
+    #[test]
+    fn map_camera_and_hud_follow_all_panel_layouts() {
+        let mut s = Settings::default();
+        s.map.image_file_path = "map.png".into();
+        let mut rm = RouteManager::default();
+        for mode in [0, 1, 4] {
+            s.map.placement = mode;
+            let panels = scene_panels(&s, 1920.0, 1080.0);
+            resize_map_camera(&mut rm, &s, 1920.0, 1080.0);
+            assert_eq!(rm.window_width, panels.map.width);
+            assert_eq!(rm.window_height, panels.map.height);
+            assert_eq!(rm.map_relative_width, 1.0);
+            let hud = crate::hud::viewport(&s, 1920.0, 1080.0, Some((1920.0, 1080.0)));
+            assert!(hud.x >= panels.video.x && hud.y >= panels.video.y);
+            assert!(hud.x + hud.width <= panels.video.x + panels.video.width + 0.001);
+            assert!(hud.y + hud.height <= panels.video.y + panels.video.height + 0.001);
+            assert_eq!(hud.width / hud.height, 1920.0 / 1080.0);
+        }
+        s.encode.include_video = false;
+        s.map.placement = 2;
+        resize_map_camera(&mut rm, &s, 1920.0, 1080.0);
+        assert_eq!((rm.window_width, rm.window_height), (1920.0, 1080.0));
+        s.map.placement = 4;
+        resize_map_camera(&mut rm, &s, 1920.0, 1080.0);
+        assert_eq!(rm.window_width, s.map.frame_width * 1920.0);
+        // 圆形只对自由摆放生效：窗口改用内切圆的外接正方形，半径 = 半个边长；矩形/固定布局清掉。
+        s.map.frame_shape = 1;
+        resize_map_camera(&mut rm, &s, 1920.0, 1080.0);
+        let frame = scene_panels(&s, 1920.0, 1080.0).map;
+        let side = frame.width.min(frame.height);
+        assert_eq!((rm.window_width, rm.window_height), (side, side));
+        assert_eq!(rm.circular_framing_radius, side / 2.0);
+        s.map.frame_shape = 0;
+        resize_map_camera(&mut rm, &s, 1920.0, 1080.0);
+        assert_eq!(rm.circular_framing_radius, 0.0);
+        assert_eq!((rm.window_width, rm.window_height), (frame.width, frame.height));
+        s.map.frame_shape = 1;
+        for mode in [0, 1] {
+            s.map.placement = mode;
+            resize_map_camera(&mut rm, &s, 1920.0, 1080.0);
+            assert_eq!(rm.circular_framing_radius, 0.0, "固定布局保持矩形取景");
+        }
+    }
+
+    /// 「取景缩放」在跟随跑者居中的两个模式里取代取景边距：值要进得去取景器，脏值要兜底。
+    #[test]
+    fn framing_zoom_reaches_the_camera_and_is_sanitized() {
+        let mut s = Settings::default();
+        s.route.view_mode = 1;
+        s.route.view_zoom = 0.37;
+        let mut rm = RouteManager::default();
+        apply_framing_settings(&mut rm, &s);
+        assert_eq!(rm.centered_zoom, 0.37);
+        // 0 / 非有限值会让画面全黑或无限放大，必须兜底。
+        s.route.view_zoom = 0.0;
+        apply_framing_settings(&mut rm, &s);
+        assert_eq!(rm.centered_zoom, 0.01);
+        s.route.view_zoom = f64::NAN;
+        apply_framing_settings(&mut rm, &s);
+        assert_eq!(rm.centered_zoom, 1.0);
+    }
+
+    /// 多地图框版面：第 1 框贴边只挤一次视频区，第 2+ 框自由叠加、互不影响；
+    /// 无视频时贴边第 1 框铺满整幅（沿用纯地图导出的旧规则）。
+    #[test]
+    fn multi_box_layout_places_each_box_independently() {
+        let mut s = Settings::default();
+        s.map.image_file_path = "map.png".into();
+        s.video.video_path = "video.mp4".into();
+        s.map.layout = MapLayout {
+            version: MAP_LAYOUT_VERSION,
+            boxes: vec![
+                MapBox {
+                    mode: 0,
+                    share: 0.3,
+                    ..Default::default()
+                },
+                MapBox {
+                    mode: 4,
+                    x: 0.5,
+                    y: 0.5,
+                    w: 0.4,
+                    h: 0.4,
+                    rotation: 15.0,
+                    opacity: 0.8,
+                    shape: 1,
+                    ..Default::default()
+                },
+            ],
+        };
+        s.map.sync_legacy_from_layout(&mut s.route);
+        let panels = scene_panels(&s, 1000.0, 500.0);
+        assert!((panels.map.width - 300.0).abs() < 1e-9, "第 1 框贴边条带");
+        assert!((panels.video.x - 300.0).abs() < 1e-9, "视频区只让出一次条带");
+        let frames = scene_box_frames(&s, 1000.0, 500.0);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            frames[0].rect,
+            crate::composition::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 300.0,
+                height: 500.0
+            }
+        );
+        assert_eq!(
+            frames[1].rect,
+            crate::composition::Rect {
+                x: 500.0,
+                y: 250.0,
+                width: 400.0,
+                height: 200.0
+            }
+        );
+        assert_eq!(frames[1].rotation, 15.0);
+        // 去掉视频层：贴边第 1 框铺满整幅，自由框保持自己的矩形。
+        s.encode.include_video = false;
+        let frames = scene_box_frames(&s, 1000.0, 500.0);
+        assert_eq!(
+            frames[0].rect,
+            crate::composition::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1000.0,
+                height: 500.0
+            }
+        );
+        assert_eq!(frames[1].rect.width, 400.0);
+    }
+
+    /// 每框独立取景：同一份轨迹复制出的取景器，窗口尺寸按各自框矩形、取景方式/缩放各自生效。
+    #[test]
+    fn each_map_box_keeps_its_own_framing_camera() {
+        use tracereel_core::route::RoutePoint;
+        let points: Vec<RoutePoint> = (0..=60)
+            .map(|i| RoutePoint::new(i as f64 * 10.0, i as f64 * 5.0, i as f64))
+            .collect();
+        let mut style = RouteStyle::default();
+        style.show_controls = false;
+        style.show_runner = false;
+        let mut base = RouteManager::default();
+        base.initialize_from_points(
+            points,
+            "0:10|0:20|0:30|0:40|0:50",
+            false,
+            style,
+            ViewMode::FixedSplit,
+            1.0,
+        );
+        base.request_full_update();
+
+        let mut s = Settings::default();
+        s.map.image_file_path = "map.png".into();
+        s.video.video_path = "video.mp4".into();
+        s.map.layout = MapLayout {
+            version: MAP_LAYOUT_VERSION,
+            boxes: vec![
+                MapBox {
+                    mode: 0,
+                    share: 0.25,
+                    view_mode: 0,
+                    lr_margin: 10.0,
+                    tb_margin: 10.0,
+                    ..Default::default()
+                },
+                MapBox {
+                    mode: 4,
+                    x: 0.5,
+                    y: 0.5,
+                    w: 0.4,
+                    h: 0.4,
+                    view_mode: 1,
+                    view_zoom: 2.0,
+                    sensitivity: 0.8,
+                    ..Default::default()
+                },
+            ],
+        };
+        s.map.sync_legacy_from_layout(&mut s.route);
+        let mut rms = build_frame_managers(&s, &base, 800.0, 600.0);
+        assert_eq!(rms.len(), 2);
+        // 窗口 = 该框自己的像素矩形（贴边条带 / 自由框）。
+        assert_eq!((rms[0].window_width, rms[0].window_height), (200.0, 600.0));
+        assert_eq!((rms[1].window_width, rms[1].window_height), (320.0, 240.0));
+        assert_eq!(rms[0].view_mode, ViewMode::FixedSplit);
+        assert_eq!(rms[1].view_mode, ViewMode::RunnerCentered);
+        for rm in &mut rms {
+            rm.instant_split_transition_requested = true;
+            // 取段中点与跑者位置不同的时刻：固定分段框对准段中点、居中框对准跑者。
+            rm.update(7.5, 33.0);
+        }
+        // 居中框的缩放只认它自己的「取景缩放」；固定分段框由分段取景表自动算。
+        assert!((rms[1].get_scale() - 2.0).abs() < 1e-9);
+        assert!((rms[0].get_scale() - 2.0).abs() > 1e-6);
+        // 居中框把跑者放到画面中心：相机 x = -跑者 x、y = 跑者 y（路线坐标）。
+        let (rx, ry) = (
+            rms[1].routes[0].runner_position.0,
+            rms[1].routes[0].runner_position.1,
+        );
+        assert!(
+            (rms[1].get_x() + rx).abs() < 1e-6,
+            "居中框没有对准跑者：{} vs {}",
+            rms[1].get_x(),
+            -rx
+        );
+        assert!((rms[1].get_y() - ry).abs() < 1e-6);
+        // 两个框的相机彼此独立（不是同一个取景器被重复使用）。
+        assert!((rms[0].get_x() - rms[1].get_x()).abs() > 1.0);
+    }
+
+    /// 多框绘制：每个框都按自己的矩形画出来；不透明度/框外黑底都正确。
+    #[test]
+    fn draw_scene_layers_paints_every_box() {
+        let mut s = Settings::default();
+        s.map.image_file_path = "map.png".into();
+        s.encode.include_video = false;
+        s.encode.include_hud = false;
+        s.hud.layout = Some(crate::hud::Layout {
+            version: 1,
+            widgets: Vec::new(),
+        });
+        s.map.layout = MapLayout {
+            version: MAP_LAYOUT_VERSION,
+            boxes: vec![
+                MapBox {
+                    mode: 4,
+                    x: 0.05,
+                    y: 0.05,
+                    w: 0.3,
+                    h: 0.3,
+                    ..Default::default()
+                },
+                MapBox {
+                    mode: 4,
+                    x: 0.55,
+                    y: 0.55,
+                    w: 0.3,
+                    h: 0.3,
+                    opacity: 0.5,
+                    ..Default::default()
+                },
+            ],
+        };
+        s.map.sync_legacy_from_layout(&mut s.route);
+        let rm = RouteManager::default();
+        let map = qtwrap::qimage_from_rgba(400, 400, &[60, 20, 10, 255].repeat(400 * 400));
+        let placements = effective_placements(&s);
+        assert_eq!(placements.len(), 2);
+        let mut img = qtwrap::qimage_new_argb32(1000, 1000);
+        {
+            let mut handle = qtwrap::qpainter_on_image(&mut img);
+            let p: &mut QPainter = &mut handle;
+            let layers: Vec<SceneLayer> = placements
+                .iter()
+                .map(|pl| SceneLayer {
+                    rm: &rm,
+                    map: &map,
+                    placement: *pl,
+                    route_start_ms: 0.0,
+                })
+                .collect();
+            draw_scene_layers(p, &s, None, &layers, 1000.0, 1000.0, 0.0, None);
+        }
+        let rgba = qtwrap::qimage_to_rgba(&img);
+        let px = |x: usize, y: usize| -> (u8, u8, u8) {
+            let i = (y * 1000 + x) * 4;
+            (rgba[i], rgba[i + 1], rgba[i + 2])
+        };
+        let first = px(200, 200);
+        let second = px(700, 700);
+        assert!(first.0 > 40, "第 1 框没有画地图：{first:?}");
+        assert!(
+            second.0 > 15 && second.0 < first.0,
+            "第 2 框不透明度应压低地图色：{first:?} vs {second:?}"
+        );
+        assert_eq!(px(500, 500), (0, 0, 0), "框外应当是黑底");
+    }
+
+    /// 逐框轨迹显示样式：路线/尾巴/控制点/运动员各自独立；校准时间仍是全局的。
+    #[test]
+    fn each_map_box_keeps_its_own_route_style() {
+        use tracereel_core::route::RoutePoint;
+        let points: Vec<RoutePoint> = (0..=60)
+            .map(|i| RoutePoint::new(i as f64 * 10.0, 0.0, i as f64))
+            .collect();
+        let mut base = RouteManager::default();
+        base.initialize_from_points(
+            points,
+            "0:10|0:20",
+            false,
+            RouteStyle::default(),
+            ViewMode::FixedSplit,
+            1.0,
+        );
+        base.request_full_update();
+
+        let mut s = Settings::default();
+        s.map.image_file_path = "map.png".into();
+        // 校准是全局的：两框必须拿到同一套换算（不是逐框字段）。
+        s.route.control_time_offset = 3.0;
+        s.video.start_time_offset_s = 1.0;
+        s.map.layout = MapLayout {
+            version: MAP_LAYOUT_VERSION,
+            boxes: vec![
+                MapBox {
+                    mode: 0,
+                    share: 0.3,
+                    style: Some(MapBoxStyle {
+                        render_mode: 1,
+                        render_scope: 1,
+                        width: 8.0,
+                        route_color: "#ff0000".into(),
+                        route_opacity: 200.0,
+                        show_controls: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                MapBox {
+                    mode: 4,
+                    x: 0.5,
+                    y: 0.5,
+                    w: 0.4,
+                    h: 0.4,
+                    style: Some(MapBoxStyle {
+                        render_mode: 3,
+                        render_scope: 0,
+                        width: 15.0,
+                        route_color: "#00ff00".into(),
+                        route_opacity: 100.0,
+                        show_runner: false,
+                        runner_style: 0,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+        };
+        s.map.sync_legacy_from_layout(&mut s.route);
+        let rms = build_frame_managers(&s, &base, 800.0, 600.0);
+        assert_eq!(rms.len(), 2);
+        let st0 = &rms[0].routes[0].style;
+        let st1 = &rms[1].routes[0].style;
+        assert_eq!(st0.route_render_mode, RenderMode::Discreet);
+        assert_eq!(st1.route_render_mode, RenderMode::Pace);
+        assert_eq!(st0.render_scope, 1, "第 1 框应单段渲染");
+        assert_eq!(st1.render_scope, 0, "第 2 框应完整渲染");
+        assert!((st0.route_width - 8.0).abs() < 1e-9);
+        assert!((st1.route_width - 15.0).abs() < 1e-9);
+        assert!(st0.route_color.0 > 0.9 && st0.route_color.1 < 0.1, "第 1 框红色");
+        assert!(st1.route_color.1 > 0.9 && st1.route_color.0 < 0.1, "第 2 框绿色");
+        assert!(st0.show_controls);
+        assert!(!st1.show_runner);
+        assert_eq!(st1.runner_style, RunnerStyle::Circle);
+        // 校准全局：两框相同（3s - 1s = 2s），不随框变化。
+        assert!((st0.control_time_offset - 3.0).abs() < 1e-9);
+        assert!((st1.control_time_offset - 3.0).abs() < 1e-9);
+        assert!((st0.runner_time_offset - 2.0).abs() < 1e-9);
+        assert!((st1.runner_time_offset - 2.0).abs() < 1e-9);
+        // effective_route_styles 与逐框版本一致（预览/导出都用它）。
+        let styles = effective_route_styles(&s);
+        assert_eq!(styles.len(), 2);
+        assert_eq!(styles[0].render_scope, 1);
+        assert_eq!(styles[1].render_scope, 0);
+    }
+
+    /// 绘制时每框用自己的样式：同一份轨迹在两个框里画出不同颜色。
+    #[test]
+    fn draw_scene_layers_uses_each_boxes_route_style() {
+        use tracereel_core::route::RoutePoint;
+        let points: Vec<RoutePoint> = (0..=30)
+            .map(|i| RoutePoint::new(i as f64 * 10.0 - 150.0, 0.0, i as f64))
+            .collect();
+        let mut base = RouteManager::default();
+        base.initialize_from_points(
+            points,
+            "",
+            false,
+            RouteStyle::default(),
+            ViewMode::FixedSplit,
+            1.0,
+        );
+        base.request_full_update();
+
+        let style_for = |color: &str| MapBoxStyle {
+            render_mode: 1,
+            render_scope: 0,
+            width: 12.0,
+            route_color: color.into(),
+            route_opacity: 255.0,
+            show_controls: false,
+            show_runner: false,
+            tail_render_mode: 0,
+            runner_style: 0,
+            ..Default::default()
+        };
+        let mut s = Settings::default();
+        s.map.image_file_path = "map.png".into();
+        s.encode.include_video = false;
+        s.encode.include_hud = false;
+        s.hud.layout = Some(crate::hud::Layout {
+            version: 1,
+            widgets: Vec::new(),
+        });
+        s.map.layout = MapLayout {
+            version: MAP_LAYOUT_VERSION,
+            boxes: vec![
+                MapBox {
+                    mode: 4,
+                    x: 0.02,
+                    y: 0.1,
+                    w: 0.45,
+                    h: 0.8,
+                    style: Some(style_for("#ff0000")),
+                    ..Default::default()
+                },
+                MapBox {
+                    mode: 4,
+                    x: 0.53,
+                    y: 0.1,
+                    w: 0.45,
+                    h: 0.8,
+                    style: Some(style_for("#00ff00")),
+                    ..Default::default()
+                },
+            ],
+        };
+        s.map.sync_legacy_from_layout(&mut s.route);
+        let rms = build_frame_managers(&s, &base, 800.0, 400.0);
+        let map = qtwrap::qimage_from_rgba(400, 400, &[20, 20, 20, 255].repeat(400 * 400));
+        let placements = effective_placements(&s);
+        let mut img = qtwrap::qimage_new_argb32(800, 400);
+        {
+            let mut handle = qtwrap::qpainter_on_image(&mut img);
+            let p: &mut QPainter = &mut handle;
+            let layers: Vec<SceneLayer> = rms
+                .iter()
+                .enumerate()
+                .map(|(i, rm)| SceneLayer {
+                    rm,
+                    map: &map,
+                    placement: placements[i],
+                    route_start_ms: 0.0,
+                })
+                .collect();
+            draw_scene_layers(p, &s, None, &layers, 800.0, 400.0, 0.0, None);
+        }
+        let rgba = qtwrap::qimage_to_rgba(&img);
+        let mut left_red = 0usize;
+        let mut right_green = 0usize;
+        for y in 0..400usize {
+            for x in 0..800usize {
+                let i = (y * 800 + x) * 4;
+                let (r, g, b) = (rgba[i] as i32, rgba[i + 1] as i32, rgba[i + 2] as i32);
+                if x < 400 && r > 150 && g < 80 && b < 80 {
+                    left_red += 1;
+                }
+                if x >= 400 && g > 150 && r < 80 && b < 80 {
+                    right_green += 1;
+                }
+            }
+        }
+        assert!(left_red > 50, "第 1 框没有画出自己的红色路线：{left_red} 像素");
+        assert!(
+            right_green > 50,
+            "第 2 框没有画出自己的绿色路线：{right_green} 像素"
+        );
+    }
+
+    /// 框数变化必须走完整重载（每框一套取景器，就地更新处理不了）；只改框内容则允许就地。
+    #[test]
+    fn box_count_change_forces_full_reload() {
+        let mut one = Settings::default();
+        one.map.image_file_path = "map.png".into();
+        let mut two = one.clone();
+        two.map.layout = MapLayout {
+            version: MAP_LAYOUT_VERSION,
+            boxes: vec![
+                MapBox::default(),
+                MapBox {
+                    mode: 4,
+                    x: 0.6,
+                    y: 0.6,
+                    w: 0.3,
+                    h: 0.3,
+                    ..Default::default()
+                },
+            ],
+        };
+        two.map.sync_legacy_from_layout(&mut two.route);
+        assert!(!only_route_display_changed(&one, &two), "加框必须完整重载");
+        assert!(!only_route_display_changed(&two, &one), "删框必须完整重载");
+        // 框数不变、只挪第 2 个框：属于就地更新（白名单里有 [map] boxes）。
+        let mut moved = two.clone();
+        moved.map.layout.boxes[1].x = 0.1;
+        moved.map.sync_legacy_from_layout(&mut moved.route);
+        assert!(only_route_display_changed(&two, &moved));
+    }
+
+    /// 圆形地图框：整段轨迹都必须画在可见圆内。
+    ///
+    /// 以前分段取景只按窗口宽高（矩形）收。竖长地图框里矩形高度大于内切圆直径，取景把
+    /// 轨迹撑到矩形上下边 —— 圆形框把它们裁掉，看上去就是「部分轨迹在圆形之外（看不见）」。
+    /// 这里用真实画笔渲染一次做像素级回归：圆形框里轨迹最远点必须留出余量；同样内容换成
+    /// 矩形框时轨迹会明显越过内切圆。
+    #[test]
+    fn circular_map_frame_keeps_the_whole_track_inside_the_circle() {
+        use tracereel_core::route::RoutePoint;
+
+        const W: f64 = 400.0;
+        const H: f64 = 300.0;
+        let mut s = Settings::default();
+        s.map.image_file_path = "synthetic-map".into();
+        s.map.placement = 4;
+        // 竖长框（120x210）：矩形高度 210 > 内切圆直径 120，正是会被裁的情况。
+        s.map.frame_x = 0.3;
+        s.map.frame_y = 0.1;
+        s.map.frame_width = 0.3;
+        s.map.frame_height = 0.7;
+        s.map.frame_opacity = 1.0;
+        s.route.user_scale = 1.0;
+        s.route.render_scope = 1; // 只画当前这一段，供「整段都在圆内」判断
+        s.hud.layout = Some(crate::hud::Layout {
+            version: 1,
+            widgets: vec![],
+        });
+        let map = qtwrap::qimage_from_rgba(2000, 1000, &[10, 10, 10, 255].repeat(2_000_000));
+        // 直线轨迹：每段长 300 个地图单位，取景会把它铺满矩形的高（=210px）。
+        let points: Vec<RoutePoint> = (0..=40)
+            .map(|i| RoutePoint::new(200.0 + i as f64 * 30.0, 500.0, i as f64))
+            .collect();
+        let mut style = RouteStyle::default();
+        style.route_render_mode = RenderMode::Discreet;
+        style.tail_render_mode = RenderMode::None;
+        style.show_controls = false;
+        style.show_runner = false;
+        style.route_width = 8.0;
+        // 渲染范围现在随样式走（逐框独立）；这个用例只画当前段，便于按像素判断「整段都在圆内」。
+        style.render_scope = 1;
+        style.route_color = (0.0, 1.0, 0.0, 1.0);
+
+        // 渲染一次，返回（轨迹绿色像素到框中心的距离, 框的内切圆半径, 取景信息）。
+        let render = |shape: i32, t: f64| -> (Vec<f64>, f64, String) {
+            let mut settings = s.clone();
+            settings.map.frame_shape = shape;
+            let mut rm = RouteManager::default();
+            rm.use_smooth_split_transition = false; // 直接落到当前段，便于按像素断言
+            resize_map_camera(&mut rm, &settings, W, H);
+            rm.initialize_from_points(
+                points.clone(),
+                "0:10|0:20|0:30",
+                false,
+                style.clone(),
+                ViewMode::FixedSplit,
+                1.0,
+            );
+            rm.update(t, 0.0);
+            let mut img = qtwrap::qimage_new_argb32(W as i32, H as i32);
+            {
+                let mut handle = qtwrap::qpainter_on_image(&mut img);
+                let p: &mut QPainter = &mut handle;
+                draw_scene(
+                    p,
+                    &rm,
+                    &settings,
+                    Some(map.clone()),
+                    None,
+                    W,
+                    H,
+                    t * 1000.0,
+                    0.0,
+                    None,
+                );
+            }
+            let frame = scene_panels(&settings, W, H).map;
+            let (cx, cy) = (frame.x + frame.width / 2.0, frame.y + frame.height / 2.0);
+            let radius = frame.width.min(frame.height) / 2.0;
+            let rgba = qtwrap::qimage_to_rgba(&img);
+            let info = format!(
+                "shape={shape} 窗口={}x{} 取景圆={} 缩放={:.3}",
+                rm.window_width, rm.window_height, rm.circular_framing_radius, rm.get_scale()
+            );
+            let mut distances = Vec::new();
+            for y in 0..H as usize {
+                for x in 0..W as usize {
+                    let i = (y * W as usize + x) * 4;
+                    // 轨迹是纯绿（0,255,0），背景地图是深灰、圆外是黑。
+                    if rgba[i] < 90 && rgba[i + 1] > 150 && rgba[i + 2] < 90 {
+                        distances.push(((x as f64 + 0.5 - cx).powi(2)
+                            + (y as f64 + 0.5 - cy).powi(2))
+                        .sqrt());
+                    }
+                }
+            }
+            (distances, radius, info)
+        };
+
+        let (rect, radius, rect_info) = render(0, 15.0);
+        let (circle, radius2, circle_info) = render(1, 15.0);
+        assert_eq!(radius, radius2);
+        assert!(
+            circle.len() > 120,
+            "圆形框里轨迹没画出来：{} 像素（{circle_info}）",
+            circle.len()
+        );
+        let farthest = circle.iter().copied().fold(0.0_f64, f64::max);
+        assert!(
+            farthest < radius - 2.0,
+            "圆形框里轨迹越出可见圆：最远 {farthest:.1}px / 半径 {radius:.1}px（{circle_info}）"
+        );
+
+        // 对照：同样内容在矩形框里会明显越过内切圆（说明上面那条断言确实能抓住回归）。
+        assert!(
+            rect.len() > 120,
+            "矩形框里轨迹没画出来：{} 像素（{rect_info}）",
+            rect.len()
+        );
+        let farthest = rect.iter().copied().fold(0.0_f64, f64::max);
+        assert!(
+            farthest > radius + 5.0,
+            "测试前提不成立：矩形框的轨迹没有越过内切圆（最远 {farthest:.1}px / 半径 {radius:.1}px，{rect_info}）"
+        );
+    }
+
     #[test]
     fn preview_layers_follow_export_selection() {
         let mut base = Settings::default();
         base.map.image_file_path = "map.png".into();
         base.video.video_path = "video.mp4".into();
         base.map.relative_width = 0.3;
-        // 三勾全开：版面就是设置里的样子。
+        // 三勾全开：第 1 框贴左边条，视频让出条带。
         let all = preview_layers(base.clone());
-        assert_eq!(all.map.relative_width, 0.3);
+        let panels = scene_panels(&all, 1000.0, 500.0);
+        assert!((panels.map.width - 300.0).abs() < 1e-9);
+        assert!((panels.video.x - 300.0).abs() < 1e-9);
+        assert!((panels.video.width - 700.0).abs() < 1e-9);
         assert!(all.hud.layout.as_ref().is_some_and(|l| !l.widgets.is_empty()));
-        // 不导地图：左边不留黑带，视频铺满。
+        // 不导地图：不留条带，视频铺满整幅。
         let mut no_map = base.clone();
         no_map.encode.include_map = false;
-        assert_eq!(preview_layers(no_map).map.relative_width, 0.0);
-        // 不导视频：地图铺满整帧（只导地图+HUD 的场景）。
+        let panels = scene_panels(&preview_layers(no_map), 1000.0, 500.0);
+        assert_eq!(panels.map.width, 0.0);
+        assert_eq!((panels.video.x, panels.video.width), (0.0, 1000.0));
+        // 不导视频：贴边地图铺满整帧（只导地图+HUD 的场景）。
         let mut no_video = base.clone();
         no_video.encode.include_video = false;
-        assert_eq!(preview_layers(no_video).map.relative_width, 1.0);
+        let panels = scene_panels(&preview_layers(no_video), 1000.0, 500.0);
+        assert!((panels.map.width - 1000.0).abs() < 1e-9);
+        assert!((panels.map.height - 500.0).abs() < 1e-9);
         // 不导 HUD：布局清空，画面上不再有 HUD。
         let mut no_hud = base.clone();
         no_hud.encode.include_hud = false;
@@ -4112,9 +5549,13 @@ mod tests {
         s.map.relative_width = 0.25;
         s.encode.include_video = true;
         let preview = preview_layers(s.clone());
+        // 没有视频文件时预览强制不画视频层；贴边地图框铺满整帧。
         assert!(!preview.encode.include_video);
-        assert_eq!(preview.map.relative_width, 1.0);
+        let panels = scene_panels(&preview, 1000.0, 500.0);
+        assert!((panels.map.width - 1000.0).abs() < 1e-9);
+        // 保存的设置本身不被预览改写（勾选与地图占比都还在）。
         assert!(s.encode.include_video);
+        assert_eq!(s.map.relative_width, 0.25);
     }
 
     #[test]
@@ -4242,6 +5683,10 @@ mod tests {
         s.route.left_right_margin = 0.05;
         s.route.top_bottom_margin = 0.1;
         s.map.relative_width = 0.3;
+        s.map.placement = 4;
+        s.map.frame_x = 0.2; s.map.frame_y = 0.3;
+        s.map.frame_width = 0.5; s.map.frame_height = 0.4;
+        s.map.frame_rotation = 45.0;
         assert!(
             only_route_display_changed(&base, &s),
             "外观项（含派生色键）应当判为可就地更新"
@@ -4299,7 +5744,7 @@ mod tests {
     /// 「取景」类设置必须在**建取景器时**同步进去：预览准备、导出、单帧截图三条路都只
     /// 建了一个 `RouteManager::default()`，以前没同步，于是工程里存的边距只在「当场改一次」
     /// 时生效（走就地更新那条路），重新打开工程/导出又回到代码默认（左右 10 / 上下 30）。
-    /// 跑者平均因子按 `RUNNER_AVERAGING_FACTOR` 固定，工程里存的旧值（老工程常见 4.0）不生效。
+    /// 灵敏度（原跑者平均因子）同理：以前被钉死成默认值，现在跟着工程走。
     #[test]
     fn framing_settings_reach_the_manager() {
         let mut s = Settings::default();
@@ -4312,16 +5757,54 @@ mod tests {
         assert_eq!(rm.left_right_margin, 120.0, "左右边距要跟着工程走");
         assert_eq!(rm.top_bottom_margin, 90.0, "上下边距要跟着工程走");
         assert_eq!(
-            rm.runner_averaging_factor,
-            tracereel_core::route_manager::RUNNER_AVERAGING_FACTOR,
-            "跑者平均因子固定 0.5，不受工程里的旧值影响"
+            rm.runner_averaging_factor, 4.0,
+            "灵敏度要跟着工程走（老工程存 4.0 就用 4.0）"
         );
-        assert_eq!(rm.runner_averaging_factor, 0.5);
         assert_eq!(
             RouteManager::default().runner_averaging_factor,
             0.5,
-            "取景器自己的默认值也要是 0.5（未同步的路径不许退回 4.0）"
+            "取景器自己的默认值仍是 0.5"
         );
+    }
+
+    /// 灵敏度（原「运动员平均因子」）的兜底与夹取：0/负数/非有限值不能让镜头不动或瞬移。
+    #[test]
+    fn runner_sensitivity_is_sanitized() {
+        let mut s = Settings::default();
+        s.route.runner_averaging_factor = 2.5;
+        assert_eq!(runner_sensitivity(&s), 2.5);
+        for bad in [0.0, -3.0, f64::NAN, f64::INFINITY] {
+            s.route.runner_averaging_factor = bad;
+            assert_eq!(
+                runner_sensitivity(&s),
+                tracereel_core::route_manager::RUNNER_AVERAGING_FACTOR,
+                "非法灵敏度 {bad} 要兜底到默认值"
+            );
+        }
+        s.route.runner_averaging_factor = 300.0;
+        assert_eq!(runner_sensitivity(&s), 20.0, "过大值要夹到安全上限");
+        s.route.runner_averaging_factor = 0.001;
+        assert_eq!(runner_sensitivity(&s), 0.05, "过小值要夹到安全下限");
+    }
+
+    /// 相机平滑的积分增量必须按**内容时间**走：倍速播放时每次前进 倍速×帧长，
+    /// 以前固定 1000/帧率，于是平滑时间常数被放大「倍速」倍（倍速越快镜头越跟不上）。
+    #[test]
+    fn camera_step_follows_content_time() {
+        let ft = 1000.0 / 30.0;
+        // 原速：每帧前进一个帧长。
+        assert_eq!(camera_step_ms(true, ft, 0.0, ft), Some(ft));
+        // 2 倍速/4 倍速：增量等于内容时间前进量，而不是帧长。
+        assert_eq!(camera_step_ms(true, ft, 0.0, 2.0 * ft), Some(2.0 * ft));
+        assert_eq!(camera_step_ms(true, ft, 0.0, 4.0 * ft), Some(4.0 * ft));
+        // 跳转/回绕：瞬间到位（返回 None）。
+        assert_eq!(camera_step_ms(true, ft, 30_000.0, 1_000.0), None, "回退要瞬间到位");
+        assert_eq!(camera_step_ms(true, ft, 0.0, 60_000.0), None, "大跳要瞬间到位");
+        assert_eq!(camera_step_ms(true, ft, 0.0, f64::NAN), None);
+        // 暂停：播放头不动时按标称帧长继续收敛，让镜头停稳。
+        assert_eq!(camera_step_ms(false, ft, 5_000.0, 5_000.0), Some(ft));
+        // 暂停中拖进度：瞬间到位。
+        assert_eq!(camera_step_ms(false, ft, 5_000.0, 9_000.0), None);
     }
 
     /// 统一时间校准模型（用户示例，正值约定）：
@@ -5482,7 +6965,11 @@ mod tests {
         let paint = |rm: &RouteManager, scope: i32, t: f64| -> Vec<usize> {
             let mut s = Settings::default();
             s.route.user_scale = 1.0;
-            s.route.render_scope = scope;
+            // 渲染范围现在写在样式里（逐框独立）：这个用例直接改一份副本的样式来驱动绘制。
+            let mut rm = rm.clone();
+            for r in rm.routes.iter_mut() {
+                r.style.render_scope = scope;
+            }
 
             let mut img = qtwrap::qimage_new_argb32(CANVAS_W, CANVAS_H);
             {
@@ -5504,7 +6991,7 @@ mod tests {
                     x: 1.0 / K,
                     y: (CANVAS_H as f64 / 2.0) / K,
                 });
-                draw_route_pub(p, rm, &s, t, 0.0);
+                draw_route_pub(p, &rm, &s, t, 0.0);
                 p.restore();
             }
             let rgba = qtwrap::qimage_to_rgba(&img);

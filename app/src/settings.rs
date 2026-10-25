@@ -5,6 +5,7 @@
 //! existing project files load unchanged). Keys are grouped by the same path prefixes the
 //! old build used (e.g. `map/imageFilePath`, `route/quickRouteJpegFilePath`).
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -273,7 +274,17 @@ pub struct MapSettings {
     /// 而不是"从 0 秒开始接管整条时间轴"。不这样区分的话，忘填换图时间的地图
     /// 会与主图同为 0 ms 起点，定位规则取后者，于是从头到尾都显示那张图。
     pub extra_map_change_times: Vec<Option<f64>>,
-    pub relative_width: f64,      // 0..1, default 0.25
+    pub relative_width: f64,      // Strip width/height fraction, default 0.25.
+    pub placement: i32,           // 0 left, 1 right, 4 free overlay.
+    pub frame_x: f64,
+    pub frame_y: f64,
+    pub frame_width: f64,
+    pub frame_height: f64,
+    pub frame_rotation: f64,
+    pub frame_opacity: f64,
+    pub frame_shape: i32,
+    pub frame_feather: f64,
+    pub frame_corner: f64,
     pub scale: f64,               // initial scale
     pub header_crop: i32,         // pixels cropped from the top of the map image
     pub background_color: String, // hex "#rrggbb"
@@ -284,9 +295,44 @@ pub struct MapSettings {
     pub angle: f64,
     pub user_angle: f64,
     pub user_scale: f64,
+    /// 多地图框布局（内存里永远 ≥ 1 框）。`layout.boxes[0]` 与上面的单框字段 + 下面
+    /// `RouteSettings` 的取景字段互为镜像；第 2+ 框只存在于 `layout` 里。
+    ///
+    /// 这样旧的单框代码路径（预览/导出/离屏渲染都仍读 `map.frame_*`、`route.view_*`）
+    /// 保持原行为，而新 UI 通过 `layout` 编辑多框；两者由
+    /// [`MapSettings::effective_layout`] / [`MapSettings::sync_legacy_from_layout`] 对齐。
+    pub layout: MapLayout,
 }
 
 impl MapSettings {
+    pub fn placement(&self) -> crate::composition::Placement {
+        crate::composition::Placement {
+            mode: self.placement, share: self.relative_width,
+            frame: crate::composition::Rect { x: self.frame_x, y: self.frame_y,
+                width: self.frame_width, height: self.frame_height },
+            rotation: self.frame_rotation,
+            opacity: self.frame_opacity,
+            shape: self.frame_shape,
+            feather: self.frame_feather,
+            corner: self.frame_corner,
+        }.sanitized()
+    }
+
+    pub fn set_placement(&mut self, p: crate::composition::Placement) {
+        let p = p.sanitized();
+        self.placement = p.mode;
+        self.relative_width = p.share;
+        self.frame_x = p.frame.x;
+        self.frame_y = p.frame.y;
+        self.frame_width = p.frame.width;
+        self.frame_height = p.frame.height;
+        self.frame_rotation = p.rotation;
+        self.frame_opacity = p.opacity;
+        self.frame_shape = p.shape;
+        self.frame_feather = p.feather;
+        self.frame_corner = p.corner;
+    }
+
     /// 额外地图 (路径, 换图时间) 对齐序列：跳过空路径；换图时间为 `None`（没填）
     /// 的条目也会返回，调用方据此决定"暂不排程"。
     pub fn extra_maps(&self) -> Vec<(String, Option<f64>)> {
@@ -299,6 +345,610 @@ impl MapSettings {
             out.push((p.clone(), t));
         }
         out
+    }
+
+    /// 多框布局的“当前真相”：`layout.boxes[0]` 用旧的单框字段 + `route` 的取景字段
+    /// **重建**，`boxes[1..]` 原样保留。
+    ///
+    /// 为什么 box0 不直接信 `layout`：旧代码（预览/导出/旧测试/手改 `.trr` 的旧键）仍
+    /// 然只写 `map.frame_*` 与 `route.view_*`；把它们当成 box0 的真相可以避免“同一份
+    /// 设置里两处 box0 不一致”。新 UI 改 box0 时也必须先把 `layout` 同步回旧字段
+    /// （见 [`MapSettings::sync_legacy_from_layout`]），保证两边一致。
+    pub fn effective_layout(&self, route: &RouteSettings) -> MapLayout {
+        let mut out = self.layout.clone();
+        if out.boxes.is_empty() {
+            out = MapLayout::new_single();
+        }
+        out.version = MAP_LAYOUT_VERSION;
+        out.boxes[0] = MapBox {
+            mode: self.placement,
+            share: self.relative_width,
+            x: self.frame_x,
+            y: self.frame_y,
+            w: self.frame_width,
+            h: self.frame_height,
+            rotation: self.frame_rotation,
+            opacity: self.frame_opacity,
+            shape: self.frame_shape,
+            feather: self.frame_feather,
+            corner: self.frame_corner,
+            view_mode: route.view_mode,
+            view_zoom: route.view_zoom,
+            lr_margin: route.left_right_margin,
+            tb_margin: route.top_bottom_margin,
+            sensitivity: route.runner_averaging_factor,
+            // box0 的样式恒由全局显示设置反推（和版面/取景同一套镜像规则）：
+            // 旧代码/旧测试只改 `route.*` 显示字段时，QML 与导出看到的 box0 必须一致。
+            style: Some(MapBoxStyle::from_route(route)),
+        }
+        .sanitized(0);
+        // boxes[1..]：旧多框工程（JSON 里没有 style）用全局显示设置补齐；已有的保留并
+        // 在 sanitize 后原样使用。`iterator_mut().skip(1)` 不会碰已经重建好的 box0。
+        for b in out.boxes.iter_mut().skip(1) {
+            b.style = Some(match b.style.take() {
+                Some(style) => style.sanitized(),
+                None => MapBoxStyle::from_route(route),
+            });
+        }
+        out
+    }
+
+    /// 把 `layout.boxes[0]` 写回旧的单框字段与 `route` 的取景字段（镜像不变量）。
+    /// 任何时候 `layout` 被外部（QML/反序列化）改动后都要调一次。
+    pub fn sync_legacy_from_layout(&mut self, route: &mut RouteSettings) {
+        let b = self.layout.legacy_box0().sanitized(0);
+        self.set_placement(b.placement());
+        route.view_mode = b.view_mode;
+        route.view_zoom = b.view_zoom;
+        route.left_right_margin = b.lr_margin;
+        route.top_bottom_margin = b.tb_margin;
+        route.runner_averaging_factor = b.sensitivity;
+        // box0 的逐框样式 → 全局显示字段（其它框不写：全局字段只镜像第 1 框）。
+        // 校准字段（control_time_offset / video.start_time_offset）不在这里，保持全局。
+        if let Some(style) = b.style.as_ref() {
+            style.apply_to_route(route);
+        }
+    }
+}
+
+/// 多地图框布局的版本号。JSON 结构变化时 +1，`parse` 只认当前版本。
+pub const MAP_LAYOUT_VERSION: u32 = 1;
+
+/// 一个地图框自己的轨迹显示样式（路线 / 尾巴 / 控制点 / 运动员）。
+///
+/// 这是 `RouteSettings` 里那 25 个“显示字段”的逐框副本。**时间校准不在其中**：
+/// `route.control_time_offset`（按表-出发时间）与 `video.start_time_offset_s`
+/// （录像-出发时间）永远是全局的一对，不随框变化。
+///
+/// JSON 字段用 camelCase（与 `.trr` 老 `[route]` 键同源），嵌套在 `MapBox.style`
+/// 里；`Option` 缺省（`None`）表示“沿用全局显示设置”，用于旧多框工程迁移 ——
+/// 旧工程的多框没有逐框样式，读进来后由 `effective_layout` 用全局显示设置补全。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MapBoxStyle {
+    /// 0 = 无, 1 = 简洁, 3 = 配速（2 是原版的「高亮」，按简洁处理/归一成 1）。
+    #[serde(rename = "renderMode")]
+    pub render_mode: i32,
+    /// 0 = 完整渲染，1 = 单段渲染。
+    #[serde(rename = "renderScope")]
+    pub render_scope: i32,
+    pub width: f64,
+    /// 0 = 无, 1 = 简洁, 3 = 配速（2 → 1）。
+    #[serde(rename = "tailRenderMode")]
+    pub tail_render_mode: i32,
+    #[serde(rename = "tailWidth")]
+    pub tail_width: f64,
+    #[serde(rename = "tailLength")]
+    pub tail_length: f64,
+    #[serde(rename = "controlRadius")]
+    pub control_radius: f64,
+    #[serde(rename = "showControls")]
+    pub show_controls: bool,
+    /// 颜色只存 RGB（`#rrggbb`），不透明度是独立的 0..255 字段。
+    #[serde(rename = "routeColor")]
+    pub route_color: String,
+    #[serde(rename = "routeOpacity")]
+    pub route_opacity: f64,
+    #[serde(rename = "tailColor")]
+    pub tail_color: String,
+    #[serde(rename = "tailOpacity")]
+    pub tail_opacity: f64,
+    #[serde(rename = "controlColor")]
+    pub control_color: String,
+    #[serde(rename = "controlOpacity")]
+    pub control_opacity: f64,
+    #[serde(rename = "runnerRadius")]
+    pub runner_radius: f64,
+    #[serde(rename = "showRunner")]
+    pub show_runner: bool,
+    #[serde(rename = "runnerColor")]
+    pub runner_color: String,
+    #[serde(rename = "runnerOpacity")]
+    pub runner_opacity: f64,
+    /// 0 = 圆形，1 = 箭头。
+    #[serde(rename = "runnerStyle")]
+    pub runner_style: i32,
+    #[serde(rename = "lowPace")]
+    pub low_pace: f64,
+    #[serde(rename = "highPace")]
+    pub high_pace: f64,
+    #[serde(rename = "paceAuto")]
+    pub pace_auto: bool,
+    #[serde(rename = "tailLowPace")]
+    pub tail_low_pace: f64,
+    #[serde(rename = "tailHighPace")]
+    pub tail_high_pace: f64,
+    #[serde(rename = "tailPaceAuto")]
+    pub tail_pace_auto: bool,
+}
+
+impl Default for MapBoxStyle {
+    fn default() -> Self {
+        // 必须与 `Settings::default().route` 的显示字段一致（单框工程迁移后画面不变）。
+        Self {
+            render_mode: 0,
+            render_scope: 0,
+            width: 10.0,
+            tail_render_mode: 3,
+            tail_width: 10.0,
+            tail_length: 30.0,
+            control_radius: 15.0,
+            show_controls: false,
+            route_color: "#000000".to_string(),
+            route_opacity: 80.0,
+            tail_color: "#000000".to_string(),
+            tail_opacity: 204.0,
+            control_color: "#000000".to_string(),
+            control_opacity: 255.0,
+            runner_radius: 15.0,
+            show_runner: true,
+            runner_color: "#ff5d00".to_string(),
+            runner_opacity: 255.0,
+            runner_style: 1,
+            low_pace: 15.0,
+            high_pace: 5.0,
+            pace_auto: true,
+            tail_low_pace: 16.204162961116385,
+            tail_high_pace: 5.117530921453715,
+            tail_pace_auto: true,
+        }
+    }
+}
+
+impl MapBoxStyle {
+    /// 从全局 `RouteSettings` 的显示字段生成（box0 恒定来源 / 旧多框工程回填）。
+    pub fn from_route(route: &RouteSettings) -> Self {
+        Self {
+            render_mode: route.render_mode,
+            render_scope: route.render_scope,
+            width: route.width,
+            tail_render_mode: route.tail_render_mode,
+            tail_width: route.tail_width,
+            tail_length: route.tail_length,
+            control_radius: route.control_radius,
+            show_controls: route.show_controls,
+            route_color: route.route_color.clone(),
+            route_opacity: route.route_opacity,
+            tail_color: route.tail_color.clone(),
+            tail_opacity: route.tail_opacity,
+            control_color: route.control_color.clone(),
+            control_opacity: route.control_opacity,
+            runner_radius: route.runner_radius,
+            show_runner: route.show_runner,
+            runner_color: route.runner_color.clone(),
+            runner_opacity: route.runner_opacity,
+            runner_style: route.runner_style,
+            low_pace: route.low_pace,
+            high_pace: route.high_pace,
+            pace_auto: route.pace_auto,
+            tail_low_pace: route.tail_low_pace,
+            tail_high_pace: route.tail_high_pace,
+            tail_pace_auto: route.tail_pace_auto,
+        }
+        .sanitized()
+    }
+
+    /// 写回全局 `RouteSettings` 的**显示字段**（box0 镜像）。
+    ///
+    /// 刻意不碰校准/时间轴字段：`control_time_offset`、`runner_time_offset`、
+    /// `frame_readout`、`view_mode`/边距/缩放（取景另有归属）都保持全局。
+    pub fn apply_to_route(&self, route: &mut RouteSettings) {
+        route.render_mode = self.render_mode;
+        route.render_scope = self.render_scope;
+        route.width = self.width;
+        route.tail_render_mode = self.tail_render_mode;
+        route.tail_width = self.tail_width;
+        route.tail_length = self.tail_length;
+        route.control_radius = self.control_radius;
+        route.show_controls = self.show_controls;
+        route.route_color = self.route_color.clone();
+        route.route_opacity = self.route_opacity;
+        route.tail_color = self.tail_color.clone();
+        route.tail_opacity = self.tail_opacity;
+        route.control_color = self.control_color.clone();
+        route.control_opacity = self.control_opacity;
+        route.runner_radius = self.runner_radius;
+        route.show_runner = self.show_runner;
+        route.runner_color = self.runner_color.clone();
+        route.runner_opacity = self.runner_opacity;
+        route.runner_style = self.runner_style;
+        route.low_pace = self.low_pace;
+        route.high_pace = self.high_pace;
+        route.pace_auto = self.pace_auto;
+        route.tail_low_pace = self.tail_low_pace;
+        route.tail_high_pace = self.tail_high_pace;
+        route.tail_pace_auto = self.tail_pace_auto;
+    }
+
+    /// 脏值兜底：模式枚举合法化、不透明度 0..255、尺寸/配速非负且有限。
+    /// 颜色保持字符串（渲染侧会做 `color_to_hex` 归一；颜色种类太多，这里不猜）。
+    pub fn sanitized(mut self) -> Self {
+        let d = Self::default();
+        fn num(v: f64, fallback: f64, lo: f64, hi: f64) -> f64 {
+            if v.is_finite() {
+                v.clamp(lo, hi)
+            } else {
+                fallback
+            }
+        }
+        // 原版 2（高亮）本程序没有，读入一律按「简洁」；其它未知值回默认。
+        self.render_mode = match self.render_mode {
+            0 => 0,
+            1 | 2 => 1,
+            3 => 3,
+            _ => 0,
+        };
+        self.tail_render_mode = match self.tail_render_mode {
+            0 => 0,
+            1 | 2 => 1,
+            3 => 3,
+            _ => 3,
+        };
+        self.render_scope = if self.render_scope == 1 { 1 } else { 0 };
+        self.width = num(self.width, d.width, 0.0, 10_000.0);
+        self.tail_width = num(self.tail_width, d.tail_width, 0.0, 10_000.0);
+        self.tail_length = num(self.tail_length, d.tail_length, 0.0, 100_000.0);
+        self.control_radius = num(self.control_radius, d.control_radius, 0.0, 10_000.0);
+        self.runner_radius = num(self.runner_radius, d.runner_radius, 0.0, 10_000.0);
+        self.route_opacity = num(self.route_opacity, d.route_opacity, 0.0, 255.0);
+        self.tail_opacity = num(self.tail_opacity, d.tail_opacity, 0.0, 255.0);
+        self.control_opacity = num(self.control_opacity, d.control_opacity, 0.0, 255.0);
+        self.runner_opacity = num(self.runner_opacity, d.runner_opacity, 0.0, 255.0);
+        self.runner_style = if self.runner_style == 0 { 0 } else { 1 };
+        self.low_pace = if self.low_pace.is_finite() && self.low_pace > 0.0 {
+            self.low_pace.clamp(0.01, 1000.0)
+        } else {
+            d.low_pace
+        };
+        self.high_pace = if self.high_pace.is_finite() && self.high_pace > 0.0 {
+            self.high_pace.clamp(0.01, 1000.0)
+        } else {
+            d.high_pace
+        };
+        self.tail_low_pace = if self.tail_low_pace.is_finite() && self.tail_low_pace > 0.0 {
+            self.tail_low_pace.clamp(0.01, 1000.0)
+        } else {
+            d.tail_low_pace
+        };
+        self.tail_high_pace = if self.tail_high_pace.is_finite() && self.tail_high_pace > 0.0 {
+            self.tail_high_pace.clamp(0.01, 1000.0)
+        } else {
+            d.tail_high_pace
+        };
+        if self.route_color.trim().is_empty() {
+            self.route_color = d.route_color;
+        }
+        if self.tail_color.trim().is_empty() {
+            self.tail_color = d.tail_color;
+        }
+        if self.control_color.trim().is_empty() {
+            self.control_color = d.control_color;
+        }
+        if self.runner_color.trim().is_empty() {
+            self.runner_color = d.runner_color;
+        }
+        self
+    }
+
+    /// 浮点入库存前收敛到 1e-6（与 `MapBox` 的几何字段同一规则）。
+    fn round6(&mut self) {
+        fn r6(v: f64) -> f64 {
+            if v.is_finite() {
+                (v * 1e6).round() / 1e6
+            } else {
+                v
+            }
+        }
+        self.width = r6(self.width);
+        self.tail_width = r6(self.tail_width);
+        self.tail_length = r6(self.tail_length);
+        self.control_radius = r6(self.control_radius);
+        self.runner_radius = r6(self.runner_radius);
+        self.route_opacity = r6(self.route_opacity);
+        self.tail_opacity = r6(self.tail_opacity);
+        self.control_opacity = r6(self.control_opacity);
+        self.runner_opacity = r6(self.runner_opacity);
+        self.low_pace = r6(self.low_pace);
+        self.high_pace = r6(self.high_pace);
+        self.tail_low_pace = r6(self.tail_low_pace);
+        self.tail_high_pace = r6(self.tail_high_pace);
+    }
+}
+
+/// 一个地图框：版面 + 它自己的取景参数。
+///
+/// 字段刻意用「短名 + 扁平结构」，与 `.trr` 里 `[map] boxes=<JSON>` 的键完全一致；
+/// 与 `composition::Placement` 通过 [`MapBox::placement`] / [`MapBox::set_placement`]
+/// 互转（沿用 `MapSettings` 对旧单框字段的做法）。`view_mode` 等取景字段在 JSON 里
+/// 用 camelCase（`viewMode`/`viewZoom`/`lrMargin`/`tbMargin`），前后端/QML 一致。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MapBox {
+    // ---- 版面（等价于 composition::Placement）----
+    /// 0 = 固定左侧，1 = 固定右侧，4 = 自由摆放。**第 2+ 框强制 4**（不允许贴边：
+    // 多贴边会需要第二套“视频区”语义，见设计文档 §1.1/§4）。
+    pub mode: i32,
+    /// 贴边时地图条带占画面宽度的比例。
+    pub share: f64,
+    /// 自由摆放矩形（归一化画布坐标，未旋转），与 `composition::Rect` 同义。
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub rotation: f64,
+    pub opacity: f64,
+    /// 0 = 矩形，1 = 内切圆。
+    pub shape: i32,
+    pub feather: f64,
+    pub corner: f64,
+    // ---- 取景（原 RouteSettings 的取景字段下沉到这里）----
+    /// 0 = 固定分段，1 = 跟跑者居中，2 = 跑者居中+分段定向。
+    #[serde(rename = "viewMode")]
+    pub view_mode: i32,
+    /// 跟跑者居中两个模式下的地图缩放（固定分段模式不用）。
+    #[serde(rename = "viewZoom")]
+    pub view_zoom: f64,
+    /// 固定分段模式的左右边距（居中模式不用）。
+    #[serde(rename = "lrMargin")]
+    pub lr_margin: f64,
+    /// 固定分段模式的上下边距（居中模式不用）。
+    #[serde(rename = "tbMargin")]
+    pub tb_margin: f64,
+    /// 镜头跟随平滑强度（原「运动员平均因子」），居中模式用。
+    pub sensitivity: f64,
+    /// 本框的轨迹显示样式（路线/尾巴/控制点/运动员）。`None` = 尚未写入（默认框 /
+    /// 旧多框工程），由 `MapSettings::effective_layout` 用全局显示设置补齐。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<MapBoxStyle>,
+}
+
+impl Default for MapBox {
+    fn default() -> Self {
+        Self {
+            mode: 0,
+            share: 0.25,
+            x: 0.03,
+            y: 0.05,
+            w: 0.3,
+            h: 0.6,
+            rotation: 0.0,
+            opacity: 1.0,
+            shape: 0,
+            feather: 0.0,
+            corner: 0.0,
+            view_mode: 0,
+            view_zoom: 1.0,
+            lr_margin: 20.0,
+            tb_margin: 20.0,
+            sensitivity: 0.5,
+            style: None,
+        }
+    }
+}
+
+impl MapBox {
+    pub fn placement(&self) -> crate::composition::Placement {
+        crate::composition::Placement {
+            mode: self.mode,
+            share: self.share,
+            frame: crate::composition::Rect {
+                x: self.x,
+                y: self.y,
+                width: self.w,
+                height: self.h,
+            },
+            rotation: self.rotation,
+            opacity: self.opacity,
+            shape: self.shape,
+            feather: self.feather,
+            corner: self.corner,
+        }
+        .sanitized()
+    }
+
+    pub fn set_placement(&mut self, p: crate::composition::Placement) {
+        let p = p.sanitized();
+        self.mode = p.mode;
+        self.share = p.share;
+        self.x = p.frame.x;
+        self.y = p.frame.y;
+        self.w = p.frame.width;
+        self.h = p.frame.height;
+        self.rotation = p.rotation;
+        self.opacity = p.opacity;
+        self.shape = p.shape;
+        self.feather = p.feather;
+        self.corner = p.corner;
+    }
+
+    /// 脏值兜底 + 策略夹取：`index > 0` 的框强制自由摆放（mode=4）。
+    ///
+    /// 取景参数的规则与旧单框代码保持一致（坏值回落默认，见 `Settings::from_ini` 里
+    /// `view_zoom`/`runner_averaging_factor` 的兜底）：0/负数/非有限一律回默认，
+    /// 正常值夹到安全区间。
+    pub fn sanitized(mut self, index: usize) -> Self {
+        let placement = self.placement();
+        self.set_placement(placement);
+        if index > 0 {
+            self.mode = 4;
+        }
+        self.view_mode = match self.view_mode {
+            1 => 1,
+            2 => 2,
+            _ => 0,
+        };
+        self.view_zoom = if self.view_zoom.is_finite() && self.view_zoom > 0.0 {
+            self.view_zoom.clamp(0.01, 20.0)
+        } else {
+            1.0
+        };
+        self.lr_margin = if self.lr_margin.is_finite() {
+            self.lr_margin.clamp(0.0, 100_000.0)
+        } else {
+            20.0
+        };
+        self.tb_margin = if self.tb_margin.is_finite() {
+            self.tb_margin.clamp(0.0, 100_000.0)
+        } else {
+            20.0
+        };
+        self.sensitivity = if self.sensitivity.is_finite() && self.sensitivity > 0.0 {
+            self.sensitivity.clamp(0.05, 20.0)
+        } else {
+            0.5
+        };
+        self.style = self.style.map(|s| s.sanitized());
+        self
+    }
+
+    /// 浮点入库存前收敛到 1e-6，避免 QML ↔ Rust 往返的末位抖动。
+    fn round6(&mut self) {
+        fn r6(v: f64) -> f64 {
+            if v.is_finite() {
+                (v * 1e6).round() / 1e6
+            } else {
+                v
+            }
+        }
+        self.share = r6(self.share);
+        self.x = r6(self.x);
+        self.y = r6(self.y);
+        self.w = r6(self.w);
+        self.h = r6(self.h);
+        self.rotation = r6(self.rotation);
+        self.opacity = r6(self.opacity);
+        self.feather = r6(self.feather);
+        self.corner = r6(self.corner);
+        self.view_zoom = r6(self.view_zoom);
+        self.lr_margin = r6(self.lr_margin);
+        self.tb_margin = r6(self.tb_margin);
+        self.sensitivity = r6(self.sensitivity);
+        if let Some(style) = self.style.as_mut() {
+            style.round6();
+        }
+    }
+}
+
+/// 多地图框布局：顺序 = 绘制顺序（后面的画在上面），内存里永远至少 1 个框。
+///
+/// 持久化只在新格式工程里出现：`[map] boxes=<紧凑 JSON>`（`boxes.len() > 1` 才写）。
+/// 单框工程的文件与多框改造前逐字节一致，旧版本程序也靠旧键看到第 1 框。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MapLayout {
+    pub version: u32,
+    pub boxes: Vec<MapBox>,
+}
+
+impl Default for MapLayout {
+    fn default() -> Self {
+        Self {
+            version: MAP_LAYOUT_VERSION,
+            boxes: vec![MapBox::default()],
+        }
+    }
+}
+
+impl MapLayout {
+    /// 单框布局（默认版面 + 默认取景）。
+    pub fn new_single() -> Self {
+        Self::default()
+    }
+
+    /// 解析 `.trr` 里的 `[map] boxes` 或 QML 传来的 JSON。
+    ///
+    /// 规则：版本必须匹配、非空、逐框 sanitize。**不设框数上限**（用户口径：框数不设限；
+    /// 性能由 UI 提示，数据层不截断）。任何结构性问题都返回 `Err`，调用方回退单框。
+    pub fn parse(json: &str) -> Result<Self, String> {
+        let mut layout: Self = serde_json::from_str(json)
+            .map_err(|e| format!("地图框布局 JSON 解析失败: {e}"))?;
+        if layout.version != MAP_LAYOUT_VERSION {
+            return Err(format!(
+                "不支持的地图框布局版本 {}（只支持 {}）",
+                layout.version, MAP_LAYOUT_VERSION
+            ));
+        }
+        if layout.boxes.is_empty() {
+            return Err("地图框布局为空（至少要有一个地图框）".to_string());
+        }
+        layout.boxes = layout
+            .boxes
+            .into_iter()
+            .enumerate()
+            .map(|(i, b)| b.sanitized(i))
+            .collect();
+        Ok(layout)
+    }
+
+    /// 序列化为紧凑 JSON（用于 `[map] boxes` 与代理属性 `map_boxes`）。
+    /// 出口统一 sanitize + 浮点收敛，保证存盘/QML 往返稳定。
+    pub fn json(&self) -> String {
+        let mut copy = self.clone();
+        if copy.boxes.is_empty() {
+            copy = Self::new_single();
+        }
+        copy.version = MAP_LAYOUT_VERSION;
+        for (i, b) in copy.boxes.iter_mut().enumerate() {
+            *b = b.clone().sanitized(i);
+            b.round6();
+        }
+        // 非有限值在 sanitize 后不会存在；序列化失败只可能是极端内存问题，回退到
+        // 一个合法的单框 JSON（不递归调用 json()，避免异常路径栈溢出）。
+        serde_json::to_string(&copy)
+            .unwrap_or_else(|_| r#"{"version":1,"boxes":[{}]}"#.to_string())
+    }
+
+    /// 旧的单框字段（`MapSettings` 版面 + `RouteSettings` 取景）→ 单框布局。
+    /// 老工程没有 `[map] boxes` 键时走这里。
+    pub fn from_legacy(map: &MapSettings, route: &RouteSettings) -> Self {
+        Self {
+            version: MAP_LAYOUT_VERSION,
+            boxes: vec![MapBox {
+                mode: map.placement,
+                share: map.relative_width,
+                x: map.frame_x,
+                y: map.frame_y,
+                w: map.frame_width,
+                h: map.frame_height,
+                rotation: map.frame_rotation,
+                opacity: map.frame_opacity,
+                shape: map.frame_shape,
+                feather: map.frame_feather,
+                corner: map.frame_corner,
+                view_mode: route.view_mode,
+                view_zoom: route.view_zoom,
+                lr_margin: route.left_right_margin,
+                tb_margin: route.top_bottom_margin,
+                sensitivity: route.runner_averaging_factor,
+                style: Some(MapBoxStyle::from_route(route)),
+            }
+            .sanitized(0)],
+        }
+    }
+
+    /// 第 1 框（镜像写回旧字段用）；布局异常时返回默认框。
+    pub fn legacy_box0(&self) -> MapBox {
+        self.boxes.first().cloned().unwrap_or_default()
     }
 }
 
@@ -361,6 +1011,9 @@ pub struct RouteSettings {
     pub control_time_offset: f64, // 按表-出发时间（秒）：出发前按表为负，出发后按表为正
     pub left_right_margin: f64,
     pub top_bottom_margin: f64,
+    /// 跟跑者居中两个模式下的地图缩放倍数（1.0 = 地图坐标 1:1）。
+    /// 这两个模式没有「取景边距」的概念，远近由它控制；固定分段模式不用这个值。
+    pub view_zoom: f64,
 }
 
 /// Splits (time markers) settings.
@@ -577,8 +1230,6 @@ pub struct Settings {
     /// Preview performance mode: when true, the live preview uses a lower resolution
     /// cap and skips Gyroflow stabilization per frame (encode still uses full settings).
     pub preview_perf: bool,
-    /// 界面外观：`light` / `dark` / `system`（对齐原版 Gyroflow 的主题设置）。
-    pub theme: String,
 }
 
 impl Default for Settings {
@@ -603,6 +1254,13 @@ impl Default for Settings {
                 image_file_path: String::new(),
                 extra_map_files: Vec::new(),
                 extra_map_change_times: Vec::new(),                relative_width: 0.25,
+                placement: 0,
+                frame_x: 0.03, frame_y: 0.05, frame_width: 0.3, frame_height: 0.6,
+                frame_rotation: 0.0,
+                frame_opacity: 1.0,
+                frame_shape: 0,
+                frame_feather: 0.0,
+                frame_corner: 0.0,
                 scale: 1.0,
                 header_crop: 0,
                 background_color: "#ffffff".to_string(),
@@ -613,6 +1271,8 @@ impl Default for Settings {
                 angle: 0.0,
                 user_angle: 0.0,
                 user_scale: 1.0,
+                // 多框布局：默认 1 框，取景参数与下面 RouteSettings 的取景默认值一致。
+                layout: MapLayout::default(),
             },
             route: RouteSettings {
                 quick_route_jpeg_file_path: String::new(),
@@ -653,6 +1313,7 @@ impl Default for Settings {
                 control_time_offset: 0.0,
                 left_right_margin: 20.0,
                 top_bottom_margin: 20.0,
+                view_zoom: 1.0,
             },
             splits: SplitSettings {
                 split_times: String::new(),
@@ -708,7 +1369,6 @@ impl Default for Settings {
             window_hide_cursor: false,
             window_multisamples: 16,
             preview_perf: false,
-            theme: "light".to_string(),
         }
     }
 }
@@ -879,6 +1539,18 @@ impl GyroSettings {
 }
 
 impl Settings {
+    /// Resolve available export layers on a job snapshot, retaining the user's
+    /// saved checkboxes. Projects without a video use the route/GPX timeline.
+    pub fn prepare_export_layers(&mut self) {
+        if !self.video.all_paths().iter().any(|p| !p.trim().is_empty()) {
+            self.encode.include_video = false;
+        }
+        self.encode.map_only = !self.encode.include_video;
+        if self.encode.map_only {
+            self.encode.audio_codec = "none".into();
+        }
+    }
+
     /// Load settings from a `.trr` or legacy `.orv` INI file. Missing/null values fall back to defaults.
     /// Relative paths are resolved against the project file's own directory.
     pub fn load_orv(path: &str) -> Self {
@@ -983,6 +1655,17 @@ impl Settings {
             })
             .unwrap_or_default();
         s.map.relative_width = ini.get_f64("map", "relativeWidth", s.map.relative_width);
+        s.map.placement = ini.get("map", "placement").and_then(|v| v.parse().ok()).unwrap_or(0);
+        s.map.frame_x = ini.get_f64("map", "frameX", s.map.frame_x);
+        s.map.frame_y = ini.get_f64("map", "frameY", s.map.frame_y);
+        s.map.frame_width = ini.get_f64("map", "frameWidth", s.map.frame_width);
+        s.map.frame_height = ini.get_f64("map", "frameHeight", s.map.frame_height);
+        s.map.frame_rotation = ini.get_f64("map", "frameRotation", s.map.frame_rotation);
+        s.map.frame_opacity = ini.get_f64("map", "frameOpacity", s.map.frame_opacity);
+        s.map.frame_shape = ini.get("map", "frameShape").and_then(|v| v.parse().ok()).unwrap_or(0);
+        s.map.frame_feather = ini.get_f64("map", "frameFeather", s.map.frame_feather);
+        s.map.frame_corner = ini.get_f64("map", "frameCorner", s.map.frame_corner);
+        s.map.set_placement(s.map.placement());
         s.map.scale = ini.get_f64("map", "scale", s.map.scale);
         s.map.header_crop = ini
             .get("map", "headerCrop")
@@ -1111,6 +1794,41 @@ impl Settings {
             ini.get_f64("route", "leftRightMargin", s.route.left_right_margin);
         s.route.top_bottom_margin =
             ini.get_f64("route", "topBottomMargin", s.route.top_bottom_margin);
+        s.route.view_zoom = ini.get_f64("route", "viewZoom", s.route.view_zoom);
+        // 坏值兜底（老工程/手改）：缩放的 0 会全黑，灵敏度 0/负值会让镜头完全不动。
+        if !s.route.view_zoom.is_finite() || s.route.view_zoom <= 0.0 {
+            s.route.view_zoom = 1.0;
+        }
+        if !s.route.runner_averaging_factor.is_finite()
+            || s.route.runner_averaging_factor <= 0.0
+        {
+            s.route.runner_averaging_factor = 0.5;
+        }
+
+        // ---- 多地图框 ----
+        // 新格式在 `[map] boxes` 里存紧凑 JSON（只在框数 > 1 时写）。没有这个键的工程
+        //（旧 `.orv`、0.3.x 的 `.trr`、以及本次改造后的单框工程）由旧的单框字段迁移成
+        // 1 个框；JSON 坏掉/版本不认识也回退单框，保证第 1 框不丢。
+        s.map.layout = match ini
+            .get("map", "boxes")
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            Some(raw) => match MapLayout::parse(raw) {
+                Ok(layout) => layout,
+                Err(e) => {
+                    log::warn!("[settings] 地图框布局加载失败，回退为单框: {e}");
+                    MapLayout::from_legacy(&s.map, &s.route)
+                }
+            },
+            None => MapLayout::from_legacy(&s.map, &s.route),
+        };
+        // 镜像不变量：box0 = 旧键（[map] 版面 + [route] 显示/取景）。`[map] boxes` 里的
+        // box0 是写盘时 round(1e-6) 过的副本，不能当真相 —— 否则「读→写」会让第 1 框的
+        // 长小数（例如 tailLowPace=16.204162961116385）被截成 16.204163，文件不再稳定。
+        // 这里用 effective_layout 以旧键重建 box0（boxes[1..] 保留 JSON 内容），再同步镜像。
+        s.map.layout = s.map.effective_layout(&s.route);
+        s.map.sync_legacy_from_layout(&mut s.route);
 
         s.splits.split_times = ini.get_string("splits", "splitTimes", &s.splits.split_times);
         s.splits.point_codes = ini.get_string("splits", "pointCodes", &s.splits.point_codes);
@@ -1342,7 +2060,6 @@ impl Settings {
             .and_then(|v| v.parse().ok())
             .unwrap_or(s.window.3);
         s.preview_perf = ini.get_bool("window", "previewPerf", s.preview_perf);
-        s.theme = ini.get_string("window", "theme", &s.theme);
 
         // Segments are the source of truth for the export clip when enabled; concrete clip ms
         // are derived so every consumer (GUI + CLI) sees a consistent range. Legacy files
@@ -1475,6 +2192,23 @@ impl Settings {
             "relativeWidth",
             &format!("{}", self.map.relative_width),
         );
+        ini.set("map", "placement", &self.map.placement.to_string());
+        ini.set("map", "frameX", &self.map.frame_x.to_string());
+        ini.set("map", "frameY", &self.map.frame_y.to_string());
+        ini.set("map", "frameWidth", &self.map.frame_width.to_string());
+        ini.set("map", "frameHeight", &self.map.frame_height.to_string());
+        ini.set("map", "frameRotation", &self.map.frame_rotation.to_string());
+        ini.set("map", "frameOpacity", &self.map.frame_opacity.to_string());
+        ini.set("map", "frameShape", &self.map.frame_shape.to_string());
+        ini.set("map", "frameFeather", &self.map.frame_feather.to_string());
+        ini.set("map", "frameCorner", &self.map.frame_corner.to_string());
+        // 多地图框：只有存在第 2+ 框时才写 `[map] boxes`；单框工程的文件与多框改造前
+        // 逐字节一致（旧版本程序照旧能打开，看到第 1 框）。box0 由旧字段反推，保证
+        // 「旧字段 → box0」的单向真相不被 JSON 里的陈旧副本覆盖。
+        let layout = self.map.effective_layout(&self.route);
+        if layout.boxes.len() > 1 {
+            ini.set("map", "boxes", &layout.json());
+        }
         ini.set("map", "scale", &format!("{}", self.map.scale));
         ini.set("map", "headerCrop", &format!("{}", self.map.header_crop));
         ini.set("map", "backgroundColor", &self.map.background_color);
@@ -1613,6 +2347,7 @@ impl Settings {
             "topBottomMargin",
             &format!("{}", self.route.top_bottom_margin),
         );
+        ini.set("route", "viewZoom", &format!("{}", self.route.view_zoom));
 
         ini.set("splits", "splitTimes", &self.splits.split_times);
         ini.set("splits", "pointCodes", &self.splits.point_codes);
@@ -1897,7 +2632,6 @@ impl Settings {
             &format!("{}", self.window_multisamples),
         );
         ini.set("window", "previewPerf", &format!("{}", self.preview_perf));
-        ini.set("window", "theme", &self.theme);
 
         ini.to_ini_string()
     }
@@ -1939,12 +2673,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn export_without_video_uses_route_clock_without_changing_saved_choices() {
+        let mut saved = Settings::default();
+        saved.encode.include_video = true;
+        saved.video.video_path.clear();
+        saved.splits.split_times = "1:12|2:29".into();
+        saved.encode.seg_enabled = true;
+        saved.encode.start_seg = 0;
+        saved.encode.end_seg = 2;
+        saved.route.control_time_offset = 4.0;
+        saved.video.start_time_offset_s = 100.0;
+        let mut job = saved.clone();
+        job.prepare_export_layers();
+        job.resolve_encode_clip_ms();
+        assert!(!job.encode.include_video);
+        assert!(job.encode.map_only);
+        assert_eq!(job.encode.audio_codec, "none");
+        assert_eq!(job.encode.clip_start_ms, 4000.0);
+        assert_eq!(job.encode.clip_end_ms, 153000.0);
+        assert!(saved.encode.include_video);
+        saved.video.video_path = "source.mp4".into();
+        saved.prepare_export_layers();
+        assert!(saved.encode.include_video);
+        assert!(!saved.encode.map_only);
+    }
+
+    #[test]
     fn parses_ini_sections() {
         let text = "[video]\r\nvideoFilePath=foo.mp4\r\nstartTimeOffset=100\r\n\r\n[map]\r\nrelativeWidth=0.25\r\n";
         let ini = IniFile::parse(text);
         assert_eq!(ini.get_string("video", "videoFilePath", ""), "foo.mp4");
         assert_eq!(ini.get_f64("video", "startTimeOffset", 0.0), 100.0);
         assert_eq!(ini.get_f64("map", "relativeWidth", 0.0), 0.25);
+    }
+
+    #[test]
+    fn project_theme_is_ignored_and_not_written() {
+        let baseline = Settings::from_ini(&IniFile::parse("[window]\nwidth=1280\n"));
+        for theme in ["light", "dark", "system"] {
+            let loaded = Settings::from_ini(&IniFile::parse(&format!("[window]\nwidth=1280\ntheme={theme}\n")));
+            assert_eq!(loaded.to_ini(), baseline.to_ini());
+            assert!(IniFile::parse(&loaded.to_ini()).get("window", "theme").is_none());
+        }
     }
 
     #[test]
@@ -1959,7 +2729,7 @@ mod tests {
             "lowPace", "highPace", "paceAuto", "tailLowPace", "tailHighPace", "tailPaceAuto",
             "showControls", "controlRadius", "controlColor", "controlOpacity",
             "showRunner", "runnerStyle", "runnerRadius", "runnerColor", "runnerOpacity",
-            "viewMode", "leftRightMargin", "topBottomMargin",
+            "viewMode", "leftRightMargin", "topBottomMargin", "viewZoom", "runnerAveragingFactor",
         ] {
             assert_eq!(actual.get("route", key), expected.get("route", key), "{key}");
         }
@@ -1967,9 +2737,440 @@ mod tests {
         let startup = Settings::load_orv("");
         assert_eq!(startup.hud.scope, "video");
         assert_eq!(startup.hud.layout.unwrap().json(), crate::hud::Layout::theme("campus").json());
-        assert_eq!(defaults.hud.layout.unwrap().json(), crate::hud::Layout::theme("campus").json());
+        assert_eq!(defaults.hud.layout.as_ref().unwrap().json(), crate::hud::Layout::theme("campus").json());
         assert!(defaults.video.video_path.is_empty());
         assert!(defaults.route.quick_route_jpeg_file_path.is_empty());
+        // 多地图框：默认设置与 demo 工程都应迁移成同一个单框布局（box0 逐字段一致），
+        // 且单框工程不写 `[map] boxes` 键（文件与改造前一致）。
+        assert_eq!(defaults.map.layout.boxes.len(), 1);
+        assert_eq!(reference.map.layout.boxes.len(), 1);
+        assert_eq!(
+            defaults.map.effective_layout(&defaults.route).json(),
+            reference.map.effective_layout(&reference.route).json(),
+            "默认设置与 demo 工程的单框布局应一致"
+        );
+        assert!(!defaults.to_ini().contains("boxes"), "单框工程不应写 [map] boxes");
+    }
+
+    /// 老工程（无 `[map] boxes`）→ 旧单框字段 + 旧取景字段迁移成 1 个框。
+    #[test]
+    fn legacy_project_migrates_to_single_box() {
+        let ini = IniFile::parse(
+            "[map]\nrelativeWidth=0.3\nplacement=4\nframeX=0.11\nframeY=0.22\n\
+             frameWidth=0.33\nframeHeight=0.44\nframeRotation=12.5\nframeOpacity=0.75\n\
+             frameShape=1\nframeFeather=0.05\nframeCorner=0.1\n\
+             [route]\nviewMode=2\nviewZoom=0.42\nleftRightMargin=12.5\n\
+             topBottomMargin=47\nrunnerAveragingFactor=2.5\n",
+        );
+        let s = Settings::from_ini(&ini);
+        assert_eq!(s.map.layout.boxes.len(), 1, "老工程应迁移成 1 个框");
+        let b = &s.map.layout.boxes[0];
+        assert_eq!(b.mode, 4);
+        assert_eq!(b.share, 0.3);
+        assert_eq!(b.x, 0.11);
+        assert_eq!(b.y, 0.22);
+        assert_eq!(b.w, 0.33);
+        assert_eq!(b.h, 0.44);
+        assert_eq!(b.rotation, 12.5);
+        assert_eq!(b.opacity, 0.75);
+        assert_eq!(b.shape, 1);
+        assert_eq!(b.feather, 0.05);
+        assert_eq!(b.corner, 0.1);
+        assert_eq!(b.view_mode, 2);
+        assert_eq!(b.view_zoom, 0.42);
+        assert_eq!(b.lr_margin, 12.5);
+        assert_eq!(b.tb_margin, 47.0);
+        assert_eq!(b.sensitivity, 2.5);
+        // 镜像不变量：旧字段就是 box0。
+        assert_eq!(s.route.view_mode, 2);
+        assert_eq!(s.route.view_zoom, 0.42);
+        assert_eq!(s.route.left_right_margin, 12.5);
+        assert_eq!(s.route.top_bottom_margin, 47.0);
+        assert_eq!(s.route.runner_averaging_factor, 2.5);
+        assert!(!s.to_ini().contains("boxes"), "迁移后仍是单框，不写 boxes 键");
+    }
+
+    /// 两框（每框独立取景）JSON 落盘/读回逐字段一致；旧键镜像第 1 框。
+    #[test]
+    fn two_boxes_roundtrip_with_independent_framing() {
+        let mut s = Settings::default();
+        s.map.image_file_path = "map.jpg".into();
+        let mut layout = MapLayout::new_single();
+        layout.boxes[0] = MapBox {
+            mode: 0,
+            share: 0.3,
+            view_mode: 0,
+            lr_margin: 12.5,
+            tb_margin: 47.0,
+            ..Default::default()
+        };
+        layout.boxes.push(MapBox {
+            mode: 4,
+            x: 0.62,
+            y: 0.55,
+            w: 0.34,
+            h: 0.4,
+            rotation: -15.0,
+            opacity: 0.8,
+            shape: 1,
+            feather: 0.1,
+            corner: 0.2,
+            view_mode: 1,
+            view_zoom: 0.37,
+            sensitivity: 2.5,
+            ..Default::default()
+        });
+        s.map.layout = layout;
+        s.map.sync_legacy_from_layout(&mut s.route);
+
+        let text = s.to_ini();
+        assert!(text.contains("boxes="), "两框工程必须写 [map] boxes");
+        // 旧键仍镜像第 1 框，旧版本程序打开时看到的就是它。
+        let raw = IniFile::parse(&text);
+        assert_eq!(raw.get("map", "placement"), Some("0"));
+        assert_eq!(raw.get("map", "relativeWidth"), Some("0.3"));
+        assert_eq!(raw.get("route", "viewMode"), Some("0"));
+
+        let s2 = Settings::from_ini(&raw);
+        assert_eq!(s2.map.layout.boxes.len(), 2);
+        assert_eq!(s2.map.layout.boxes[1].mode, 4, "第 2+ 框强制自由摆放");
+        assert_eq!(s2.map.layout.boxes[1].x, 0.62);
+        assert_eq!(s2.map.layout.boxes[1].rotation, -15.0);
+        assert_eq!(s2.map.layout.boxes[1].shape, 1);
+        assert_eq!(s2.map.layout.boxes[1].view_mode, 1);
+        assert_eq!(s2.map.layout.boxes[1].view_zoom, 0.37);
+        assert_eq!(s2.map.layout.boxes[1].sensitivity, 2.5);
+        assert_eq!(s2.map.layout.boxes[0].view_mode, 0);
+        assert_eq!(s2.map.layout.boxes[0].lr_margin, 12.5);
+        // 二次保存稳定（JSON 往返不抖动）。
+        assert_eq!(s2.to_ini(), text, "两框工程读写应幂等");
+    }
+
+    /// 逐框样式的默认值必须与全局显示设置完全一致（单框工程迁移后画面不变）。
+    #[test]
+    fn map_box_style_defaults_match_global_route_display() {
+        let s = Settings::default();
+        assert_eq!(
+            MapBoxStyle::default(),
+            MapBoxStyle::from_route(&s.route),
+            "MapBoxStyle 默认值要与 Settings::default().route 的显示字段一致"
+        );
+        // from_route → apply_to_route 往返不改变任何显示字段。
+        let mut route = s.route.clone();
+        route.control_time_offset = 7.5;
+        let style = MapBoxStyle::from_route(&route);
+        style.apply_to_route(&mut route);
+        assert_eq!(MapBoxStyle::from_route(&route), style);
+        // 校准字段不归 style 管：写回后原值保持。
+        assert_eq!(route.control_time_offset, 7.5);
+        let mut full = s.clone();
+        full.route.control_time_offset = 3.0;
+        full.video.start_time_offset_s = 40.0;
+        let b0 = MapBoxStyle::from_route(&full.route);
+        b0.apply_to_route(&mut full.route);
+        assert_eq!(full.route.control_time_offset, 3.0);
+        assert_eq!(full.video.start_time_offset_s, 40.0);
+    }
+
+    /// 两框带各自独立的轨迹样式：JSON 落盘/读回逐字段一致，box0 镜像回全局显示字段。
+    #[test]
+    fn two_box_styles_roundtrip_independently() {
+        let mut s = Settings::default();
+        s.route.control_time_offset = 7.0;
+        s.video.start_time_offset_s = 12.0;
+        let mut layout = MapLayout::new_single();
+        layout.boxes[0].style = Some(MapBoxStyle {
+            render_mode: 1,
+            width: 18.0,
+            route_color: "#112233".to_string(),
+            route_opacity: 64.0,
+            ..Default::default()
+        });
+        layout.boxes.push(MapBox {
+            mode: 4,
+            x: 0.6,
+            y: 0.1,
+            w: 0.3,
+            h: 0.3,
+            style: Some(MapBoxStyle {
+                render_mode: 3,
+                render_scope: 1,
+                width: 22.0,
+                tail_render_mode: 1,
+                tail_width: 14.0,
+                tail_length: 12.0,
+                show_controls: true,
+                control_radius: 9.0,
+                control_color: "#00ff00".to_string(),
+                runner_color: "#0000ff".to_string(),
+                runner_radius: 6.0,
+                runner_style: 0,
+                low_pace: 6.0,
+                high_pace: 4.0,
+                pace_auto: false,
+                tail_low_pace: 7.0,
+                tail_high_pace: 3.0,
+                tail_pace_auto: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        s.map.layout = layout;
+        s.map.sync_legacy_from_layout(&mut s.route);
+
+        // box0 style → 全局显示字段（镜像）；校准字段不受影响。
+        assert_eq!(s.route.render_mode, 1);
+        assert_eq!(s.route.width, 18.0);
+        assert_eq!(s.route.route_color, "#112233");
+        assert_eq!(s.route.route_opacity, 64.0);
+        assert_eq!(s.route.control_time_offset, 7.0, "校准保持全局");
+        assert_eq!(s.video.start_time_offset_s, 12.0, "录像-出发时间保持全局");
+
+        let text = s.to_ini();
+        let raw = IniFile::parse(&text);
+        assert!(text.contains("boxes="), "两框工程必须写 [map] boxes");
+        let json = raw.get("map", "boxes").unwrap();
+        // JSON 键用 camelCase（与任务约定的结构一致）。
+        assert!(json.contains("\"style\":{"), "每个框都要带 style: {json}");
+        assert!(json.contains("\"renderMode\":3"), "第 2 框的渲染模式要落盘: {json}");
+        assert!(json.contains("\"tailPaceAuto\":false"));
+        assert!(json.contains("\"routeOpacity\":64"), "样式字段是 camelCase: {json}");
+        assert!(!json.contains("render_mode"), "不允许 snake_case 键: {json}");
+
+        let s2 = Settings::from_ini(&raw);
+        let eff = s2.map.effective_layout(&s2.route);
+        assert_eq!(eff.boxes.len(), 2);
+        let b0 = eff.boxes[0].style.as_ref().unwrap();
+        assert_eq!(b0.render_mode, 1);
+        assert_eq!(b0.width, 18.0);
+        assert_eq!(b0.route_color, "#112233");
+        assert_eq!(b0.route_opacity, 64.0);
+        let b1 = eff.boxes[1].style.as_ref().unwrap();
+        assert_eq!(b1.render_mode, 3);
+        assert_eq!(b1.render_scope, 1);
+        assert_eq!(b1.width, 22.0);
+        assert_eq!(b1.tail_render_mode, 1);
+        assert_eq!(b1.show_controls, true);
+        assert_eq!(b1.control_color, "#00ff00");
+        assert_eq!(b1.runner_color, "#0000ff");
+        assert_eq!(b1.runner_style, 0);
+        assert_eq!(b1.pace_auto, false);
+        assert_eq!(b1.low_pace, 6.0);
+        assert_eq!(b1.tail_low_pace, 7.0);
+        // 二次保存稳定。
+        assert_eq!(s2.to_ini(), text, "两框样式读写应幂等");
+    }
+
+    /// 旧多框工程（boxes 里没有 style）→ effective_layout 用全局显示设置填充。
+    #[test]
+    fn legacy_multi_box_without_style_inherits_global_display() {
+        let ini = IniFile::parse(concat!(
+            "[route]\n",
+            "routeRenderMode=3\nrouteRenderScope=1\nrouteWidth=18\n",
+            "runnerColor=#00ff00\nrunnerStyle=0\nrunnerRadius=6\n",
+            "lowPace=6\nhighPace=4\npaceAuto=0\ntailLowPace=7\ntailHighPace=3\ntailPaceAuto=0\n",
+            "controlTimeOffset=7\nleftRightMargin=12.5\n",
+            "[video]\nstartTimeOffset=12\n",
+            "[map]\n",
+            "boxes={\"version\":1,\"boxes\":[{\"mode\":0},{\"mode\":4,\"x\":0.6,\"y\":0.1,\"w\":0.3,\"h\":0.3}]}\n",
+        ));
+        let s = Settings::from_ini(&ini);
+        assert_eq!(s.map.layout.boxes.len(), 2);
+        // from_ini 末尾会把 layout 归一化：box0 由旧键重建、boxes[1..] 用全局显示设置
+        // 回填 style（旧多框工程迁移），所以内存里读到的每一框都已经带样式。
+        let global = MapBoxStyle::from_route(&s.route);
+        for b in &s.map.layout.boxes {
+            assert_eq!(
+                b.style.as_ref(),
+                Some(&global),
+                "旧多框工程读入时就应回填全局显示样式"
+            );
+        }
+        assert_eq!(global.render_mode, 3);
+        assert_eq!(global.width, 18.0);
+        assert_eq!(global.low_pace, 6.0);
+        assert_eq!(global.pace_auto, false);
+        let eff = s.map.effective_layout(&s.route);
+        for (i, b) in eff.boxes.iter().enumerate() {
+            assert_eq!(b.style.as_ref().unwrap(), &global, "第 {i} 框应继承全局显示设置");
+        }
+        assert_eq!(s.route.control_time_offset, 7.0);
+        // 保存一次就写全 style；再读回来仍是同一份。
+        let text = s.to_ini();
+        let json = IniFile::parse(&text).get("map", "boxes").unwrap().to_string();
+        assert!(json.contains("\"renderMode\":3"), "保存时要把回填的样式写全: {json}");
+        let s2 = Settings::from_ini(&IniFile::parse(&text));
+        let eff2 = s2.map.effective_layout(&s2.route);
+        assert_eq!(eff2.boxes[1].style.as_ref().unwrap().width, 18.0);
+        assert_eq!(s2.to_ini(), text, "回填后读写应幂等");
+    }
+
+    /// 逐框样式的脏值兜底：模式枚举/不透明度/尺寸/配速/颜色。
+    #[test]
+    fn dirty_map_box_style_is_sanitized() {
+        let json = r##"{"version":1,"boxes":[
+            {"mode":0,"style":{"renderMode":2,"renderScope":9,"width":-3,
+             "tailRenderMode":7,"tailWidth":-1,"tailLength":-2,"controlRadius":-4,
+             "showControls":true,"routeColor":"","routeOpacity":999,
+             "tailColor":"#123456","tailOpacity":-8,"controlColor":"#abcdef",
+             "controlOpacity":300,"runnerRadius":-5,"showRunner":false,
+             "runnerColor":"","runnerOpacity":-1,"runnerStyle":5,
+             "lowPace":0,"highPace":-1,"paceAuto":false,
+             "tailLowPace":-2,"tailHighPace":0,"tailPaceAuto":true}}
+        ]}"##;
+        let layout = MapLayout::parse(json).expect("坏样式值应被 sanitize 而不是报错");
+        let st = layout.boxes[0].style.as_ref().expect("style 应保留为 Some");
+        assert_eq!(st.render_mode, 1, "原版 2（高亮）按简洁归一");
+        assert_eq!(st.render_scope, 0, "未知渲染范围回完整");
+        assert_eq!(st.width, 0.0, "负宽度夹到 0");
+        assert_eq!(st.tail_render_mode, 3, "未知尾巴模式回默认");
+        assert_eq!(st.tail_width, 0.0);
+        assert_eq!(st.tail_length, 0.0);
+        assert_eq!(st.control_radius, 0.0);
+        assert_eq!(st.route_color, "#000000", "空颜色回默认");
+        assert_eq!(st.route_opacity, 255.0, "不透明度夹到 0..255");
+        assert_eq!(st.tail_opacity, 0.0);
+        assert_eq!(st.control_opacity, 255.0);
+        assert_eq!(st.runner_radius, 0.0);
+        assert_eq!(st.runner_color, "#ff5d00", "空运动员颜色回默认");
+        assert_eq!(st.runner_opacity, 0.0);
+        assert_eq!(st.runner_style, 1, "非法样式回箭头默认");
+        assert_eq!(st.low_pace, MapBoxStyle::default().low_pace, "0 配速回默认");
+        assert_eq!(st.high_pace, MapBoxStyle::default().high_pace);
+        assert_eq!(st.tail_low_pace, MapBoxStyle::default().tail_low_pace);
+        assert_eq!(st.tail_high_pace, MapBoxStyle::default().tail_high_pace);
+        // 非有限值（内存直接赋值）同样兜底，且能再序列化/解析。
+        let dirty = MapBox {
+            style: Some(MapBoxStyle {
+                route_opacity: f64::NAN,
+                width: f64::INFINITY,
+                low_pace: f64::NEG_INFINITY,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .sanitized(0);
+        let st = dirty.style.as_ref().unwrap();
+        assert_eq!(st.route_opacity, 80.0);
+        assert_eq!(st.width, 10.0, "非有限宽度回默认");
+        assert_eq!(st.low_pace, 15.0);
+        let layout = MapLayout { version: 1, boxes: vec![dirty, MapBox::default()] };
+        assert!(!layout.json().contains("null"), "非有限值不能以 null 落盘");
+        assert!(MapLayout::parse(&layout.json()).is_ok());
+    }
+
+    /// 坏 JSON / 版本不认识 / 空列表 → 回退旧单框字段，不丢第 1 框。
+    #[test]
+    fn bad_map_boxes_falls_back_to_legacy_single_box() {
+        for bad in [
+            "not json at all",
+            r#"{"version":2,"boxes":[]}"#,
+            r#"{"version":1,"boxes":[]}"#,
+            r#"{"version":1,"boxes":"oops"}"#,
+        ] {
+            let ini = IniFile::parse(&format!(
+                "[map]\nrelativeWidth=0.35\nframeX=0.2\n[route]\nviewMode=1\nviewZoom=0.5\n[map]\nboxes={bad}\n"
+            ));
+            let s = Settings::from_ini(&ini);
+            assert_eq!(s.map.layout.boxes.len(), 1, "坏档应回退单框: {bad}");
+            assert_eq!(s.map.layout.boxes[0].share, 0.35, "回退时第 1 框要来自旧键");
+            assert_eq!(s.map.layout.boxes[0].x, 0.2);
+            assert_eq!(s.map.layout.boxes[0].view_mode, 1);
+            assert_eq!(s.map.layout.boxes[0].view_zoom, 0.5);
+        }
+    }
+
+    /// 脏值兜底：NaN/∞/0 缩放/非法模式等；第 2+ 框强制自由摆放。
+    #[test]
+    fn dirty_map_box_values_are_sanitized() {
+        let json = r#"{"version":1,"boxes":[
+            {"mode":9,"share":3.0,"w":-1.0,"opacity":5.0,
+             "viewMode":9,"viewZoom":0.0,"lrMargin":-5.0,"sensitivity":-2.0},
+            {"mode":0,"x":0.5,"w":0.2,"h":0.2,"viewMode":1,"viewZoom":50.0,"sensitivity":100.0}
+        ]}"#;
+        let layout = MapLayout::parse(json).expect("坏值应被 sanitize 而不是报错");
+        assert_eq!(layout.boxes.len(), 2);
+        let b0 = &layout.boxes[0];
+        assert_eq!(b0.mode, 0, "非法 mode 回退固定左侧");
+        assert_eq!(b0.share, 1.0, "share 夹到 0..1");
+        assert_eq!(b0.w, 0.02, "宽高下限 0.02");
+        assert_eq!(b0.opacity, 1.0, "不透明度夹到 0..1");
+        assert_eq!(b0.view_mode, 0, "非法取景方式回退固定分段");
+        assert_eq!(b0.view_zoom, 1.0, "0 缩放回默认");
+        assert_eq!(b0.lr_margin, 0.0, "负边距夹到 0");
+        assert_eq!(b0.sensitivity, 0.5, "负灵敏度回默认");
+        let b1 = &layout.boxes[1];
+        assert_eq!(b1.mode, 4, "第 2+ 框强制自由摆放");
+        assert_eq!(b1.view_zoom, 20.0, "缩放上限 20");
+        assert_eq!(b1.sensitivity, 20.0, "灵敏度上限 20");
+        // JSON 里真的没有 NaN/Infinity：导出后必须还能再解析。
+        let round = MapLayout::parse(&layout.json()).expect("导出的 JSON 必须可再解析");
+        assert_eq!(round, layout);
+        // 非有限值只能来自内存里直接赋值（JSON 本身不允许 NaN）：同样要兜底。
+        let dirty = MapBox {
+            rotation: f64::NAN,
+            view_zoom: f64::INFINITY,
+            lr_margin: f64::NEG_INFINITY,
+            sensitivity: f64::NAN,
+            ..Default::default()
+        }
+        .sanitized(0);
+        assert_eq!(dirty.rotation, 0.0);
+        assert_eq!(dirty.view_zoom, 1.0);
+        assert_eq!(dirty.lr_margin, 20.0);
+        assert_eq!(dirty.sensitivity, 0.5);
+        // 序列化时也要能处理（json() 里统一再 sanitize 一次）。
+        let layout = MapLayout {
+            version: 1,
+            boxes: vec![dirty, MapBox::default()],
+        };
+        assert!(!layout.json().contains("null"), "非有限值不能以 null 落盘");
+        assert!(MapLayout::parse(&layout.json()).is_ok());
+    }
+
+    /// 单框工程：to_ini 不写 boxes 键、读写幂等；旧版程序可以原样打开。
+    #[test]
+    fn single_box_ini_has_no_boxes_key_and_is_stable() {
+        let s = Settings::default();
+        let text = s.to_ini();
+        assert!(!text.contains("boxes"), "单框工程不写 [map] boxes");
+        let s2 = Settings::from_ini(&IniFile::parse(&text));
+        assert_eq!(s2.to_ini(), text, "单框工程读写应逐字节稳定");
+        assert_eq!(s2.map.layout.boxes.len(), 1);
+        // 手工改过的单框字段也要能往返（旧代码只写扁平字段的场景）。
+        let mut legacy = Settings::default();
+        legacy.map.placement = 4;
+        legacy.map.frame_x = 0.4;
+        legacy.map.frame_y = 0.3;
+        legacy.map.frame_width = 0.2;
+        legacy.map.frame_height = 0.25;
+        legacy.map.frame_rotation = 33.0;
+        legacy.route.view_mode = 1;
+        legacy.route.view_zoom = 2.0;
+        let text2 = legacy.to_ini();
+        assert!(!text2.contains("boxes"));
+        let back = Settings::from_ini(&IniFile::parse(&text2));
+        assert_eq!(back.map.frame_x, 0.4);
+        assert_eq!(back.map.frame_rotation, 33.0);
+        assert_eq!(back.route.view_mode, 1);
+        assert_eq!(back.route.view_zoom, 2.0);
+        assert_eq!(back.map.layout.boxes[0].view_zoom, 2.0, "取景要进 box0");
+    }
+
+    #[test]
+    fn bad_framing_values_fall_back() {
+        // 0/负数的缩放会全黑、灵敏度会让镜头不动：读工程时兜底到默认。
+        let bad = Settings::from_ini(&IniFile::parse(
+            "[route]\nviewZoom=0\nrunnerAveragingFactor=-2\n",
+        ));
+        assert_eq!(bad.route.view_zoom, 1.0);
+        assert_eq!(bad.route.runner_averaging_factor, 0.5);
+        // 正常值（含老工程常见的 4.0 灵敏度）原样保留。
+        let ok = Settings::from_ini(&IniFile::parse(
+            "[route]\nviewZoom=0.3\nrunnerAveragingFactor=4\n",
+        ));
+        assert_eq!(ok.route.view_zoom, 0.3);
+        assert_eq!(ok.route.runner_averaging_factor, 4.0);
     }
 
     #[test]

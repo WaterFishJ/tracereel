@@ -17,7 +17,7 @@
    保存密码的 **Value**（不是 Secret ID），并记录过期时间。
 5. 从 Partner Center 账户标识中取得 Seller ID；从 TraceReel 的产品标识取得 Store Product ID
    （如 `9…`）。Product ID 与 MSIX 包名 `WaterFishJ.TraceReel`、Publisher GUID 是不同字段。
-6. 核对 `AppxManifest.xml` 中的包名、Publisher、显示名与商店一致；本次版本将是 `0.3.1.0`，
+6. 核对 `AppxManifest.xml` 中的包名、Publisher、显示名与商店一致；本次版本将是 `0.4.0.0`，
    必须高于该应用商店内已有的对应包版本。
 
 官方说明：[GitHub Actions 前提条件](https://learn.microsoft.com/en-us/windows/apps/publish/msstore-dev-cli/github-actions)、
@@ -86,7 +86,7 @@
 1. 复制便携包内容到 `staging`；
 2. 把两个中文文件名改成 ASCII（`使用说明.txt` → `README.zh-CN.txt`、`licenses/第三方组件.txt` → `licenses/THIRD-PARTY-COMPONENTS.txt`）——MSIX 的包内路径必须是 ASCII；
 3. 删除 `qmltooling`（QML 调试插件，商店包不需要）；
-4. 从 `assets/branding/tracereel-icon.png` 生成 `Assets` 图标（含 100%/200% 缩放）；
+4. 从 `assets/branding/tracereel-icon.png` 生成 `Assets` 图标（应用方块图标含 100%/200% 缩放；`.trr` 文件关联图标 `TraceReelProject.png` 固定 512×512）；
 5. 用 `makepri` 生成 `resources.pri`，用 `makeappx` 打包；
 6. 输出 SHA256。
 
@@ -101,6 +101,12 @@
 | 发布者显示名 | `WaterFishJ` |
 
 清单还注册了 `.trr` 工程文件关联（双击工程文件会用 TraceReel 打开），只声明 `runFullTrust` 一项受限能力，最低系统 Windows 10 1809。
+
+> **文件关联图标为什么单独用 512 像素图**：Windows 把文件类型图标按图片的**原始像素**
+> 画进格子里，图比格子小时不会放大（只是居中留白）。清单里原本写 `Square44x44Logo.png`
+> （44 像素），资源管理器大图标视图就只在格子中间画一个指甲盖大的小图标；`.prproj` 这类
+> 自带 256 像素多尺寸图标的才铺满。所以 `uap:Logo` 改指 `Assets\TraceReelProject.png`
+> （512×512，覆盖超大图标在 200% 缩放下的 512 物理像素），小尺寸交给系统缩小。
 
 ## 本地安装测试（可选）
 
@@ -119,3 +125,9 @@ Export-PfxCertificate -Cert $cert -FilePath "$env:TEMP\test.pfx" -Password $pw |
 1. Partner Center → 应用 → 创建提交；
 2. 定价与可用性、属性（隐私政策 URL）、年龄分级、包（上传本目录产物）、商店一览（含“其他许可条款”）、提交选项（`runFullTrust` 用途说明 + 认证说明）；
 3. 提交认证，通常 1–3 个工作日；通过后微软重签并发布。
+
+## 用户配置与升级
+
+外观偏好保存在当前应用包家族的 `%LOCALAPPDATA%\Packages\<PackageFamilyName>\LocalState\settings.ini`，不随工程读写，也不随 MSIX 包发布。路径使用不含版本号的包家族标识，同一应用正常更新保留该文件；重置应用或卸载可能清除应用数据。
+
+首次创建 INI 时迁移之前的注册表主题，之后只读写 INI。已有配置不会被默认文件覆盖，新设置按缺失键使用默认值。便携版使用 `%LOCALAPPDATA%\TraceReel\settings.ini`，独立于程序解压目录。

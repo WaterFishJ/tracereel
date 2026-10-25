@@ -4,7 +4,7 @@
 
 use qmetaobject::*;
 
-use crate::settings::Settings;
+use crate::settings::{MapLayout, Settings};
 
 #[derive(QObject, Default)]
 pub struct SettingsProxy {
@@ -48,11 +48,17 @@ pub struct SettingsProxy {
     window_hide_cursor: qt_property!(bool),
     window_multisamples: qt_property!(i32),
     preview_perf: qt_property!(bool),
-    /// 界面外观：`light` / `dark` / `system`。
-    theme: qt_property!(QString),
 
     // ---- map ----
-    relative_width: qt_property!(f64),
+    /// 多地图框布局（紧凑 JSON，`{"version":1,"boxes":[...]}`）。
+    ///
+    /// 与 `hud_layout` 同一套模式：编辑器（`MapEditor.qml`）自己 parse/编辑/stringify，
+    /// 拖框/改取景时直接写这个属性并调 `renderer.apply_map_frames(...)`；增删框再走
+    /// `collect_settings` 落临时 `.trr` 触发完整重载。逐框的旧属性（relative_width、
+    /// map_placement、map_frame_*、route_view_mode/route_lr_margin/route_tb_margin/
+    /// route_view_zoom/route_runner_averaging_factor）已被它取代并删除 —— 单一真相，
+    /// 避免两处 box0 不一致。
+    map_boxes: qt_property!(QString),
     map_scale: qt_property!(f64),
     map_header_crop: qt_property!(i32),
     map_background_color: qt_property!(QString),
@@ -83,12 +89,8 @@ pub struct SettingsProxy {
     route_tail_low_pace: qt_property!(f64),
     route_tail_high_pace: qt_property!(f64),
     route_tail_pace_auto: qt_property!(bool),
-    route_view_mode: qt_property!(i32),
-    route_runner_averaging_factor: qt_property!(f64),
     route_control_time_offset: qt_property!(f64),
     route_runner_time_offset: qt_property!(f64),
-    route_lr_margin: qt_property!(f64),
-    route_tb_margin: qt_property!(f64),
 
     // ---- splits ----
     split_is_relative: qt_property!(bool),
@@ -437,9 +439,10 @@ impl SettingsProxy {
         self.window_hide_cursor = s.window_hide_cursor;
         self.window_multisamples = s.window_multisamples;
         self.preview_perf = s.preview_perf;
-        self.theme = QString::from(s.theme.as_str());
 
-        self.relative_width = s.map.relative_width;
+        // 多地图框：box0 由 Settings 的旧单框字段/取景字段反推（单一真相），
+        // boxes[1..] 原样；QML 编辑器直接 parse 这个 JSON。
+        self.map_boxes = QString::from(s.map.effective_layout(&s.route).json().as_str());
         self.map_scale = s.map.scale;
         self.map_header_crop = s.map.header_crop;
         self.map_background_color = QString::from(s.map.background_color.as_str());
@@ -480,12 +483,8 @@ impl SettingsProxy {
         self.route_tail_high_pace = s.route.tail_high_pace;
         self.route_pace_auto = s.route.pace_auto;
         self.route_tail_pace_auto = s.route.tail_pace_auto;
-        self.route_view_mode = s.route.view_mode;
-        self.route_runner_averaging_factor = s.route.runner_averaging_factor;
         self.route_control_time_offset = s.route.control_time_offset;
         self.route_runner_time_offset = s.route.runner_time_offset;
-        self.route_lr_margin = s.route.left_right_margin;
-        self.route_tb_margin = s.route.top_bottom_margin;
         self.route_path = QString::from(s.route.quick_route_jpeg_file_path.as_str());
 
         self.split_times = QString::from(s.splits.split_times.as_str());
@@ -617,7 +616,6 @@ impl SettingsProxy {
         s.window_hide_cursor = self.window_hide_cursor;
         s.window_multisamples = self.window_multisamples;
         s.preview_perf = self.preview_perf;
-        s.theme = self.theme.to_string();
 
         s.map.image_file_path = self.map_path.to_string();
         {
@@ -648,7 +646,17 @@ impl SettingsProxy {
             s.map.extra_map_files = files;
             s.map.extra_map_change_times = times;
         }
-        s.map.relative_width = self.relative_width;
+        // 多地图框：`map_boxes` 是新 UI 的唯一真相。为空串（旧代码/异常路径）或 JSON
+        // 坏掉时回退为单框，避免把工程变成 0 框；不会让已存在的第 1 框配置丢失。
+        s.map.layout = match MapLayout::parse(&self.map_boxes.to_string()) {
+            Ok(layout) => layout,
+            Err(e) => {
+                if !self.map_boxes.to_string().trim().is_empty() {
+                    ::log::warn!("[settings] 设置代理的地图框布局解析失败，回退为单框: {e}");
+                }
+                MapLayout::from_legacy(&s.map, &s.route)
+            }
+        };
         s.map.scale = self.map_scale;
         s.map.header_crop = self.map_header_crop;
         s.map.background_color = self.map_background_color.to_string();
@@ -679,12 +687,11 @@ impl SettingsProxy {
         s.route.tail_high_pace = self.route_tail_high_pace;
         s.route.pace_auto = self.route_pace_auto;
         s.route.tail_pace_auto = self.route_tail_pace_auto;
-        s.route.view_mode = self.route_view_mode;
-        s.route.runner_averaging_factor = self.route_runner_averaging_factor;
         s.route.control_time_offset = self.route_control_time_offset;
         s.route.runner_time_offset = self.route_runner_time_offset;
-        s.route.left_right_margin = self.route_lr_margin;
-        s.route.top_bottom_margin = self.route_tb_margin;
+        // 镜像不变量：逐框取景的 box0 → 旧的 route 取景字段（预览/导出在逐框改造
+        // 完成前仍只读 route.view_*）。
+        s.map.sync_legacy_from_layout(&mut s.route);
 
         s.splits.split_times = self.split_times.to_string();
         s.splits.point_codes = self.split_point_codes.to_string();
@@ -806,6 +813,198 @@ impl SettingsProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 旧代码只改 `map.frame_*`（单框字段）时：代理的 `map_boxes` 必须能看到同一个
+    /// 第 1 框，且保存/加载后不丢（走「单框工程不写 boxes 键」的旧键路径）。
+    #[test]
+    fn legacy_map_frame_flows_through_map_boxes_and_roundtrips() {
+        let mut s = Settings::default();
+        for mode in [0, 1, 4] {
+            s.map.placement = mode;
+            s.map.frame_x = -0.1;
+            s.map.frame_y = 0.2;
+            s.map.frame_width = 0.45;
+            s.map.frame_height = 0.7;
+            s.map.frame_rotation = -37.0;
+            s.map.frame_opacity = 0.65;
+            s.map.frame_shape = 1;
+            s.map.frame_feather = 0.12;
+            s.map.frame_corner = 0.2;
+            let mut proxy = SettingsProxy::default();
+            proxy.apply_settings(&s);
+            let boxes = MapLayout::parse(&proxy.map_boxes.to_string()).unwrap();
+            assert_eq!(boxes.boxes.len(), 1, "旧单框字段应映射成 1 个框");
+            assert_eq!(boxes.boxes[0].mode, mode);
+            assert_eq!(boxes.boxes[0].x, -0.1);
+            let collected = proxy.collect_settings();
+            let loaded = Settings::from_ini(&crate::settings::IniFile::parse(&collected.to_ini()));
+            assert_eq!(loaded.map.placement, mode);
+            assert_eq!(loaded.map.frame_x, -0.1);
+            assert_eq!(loaded.map.frame_y, 0.2);
+            assert_eq!(loaded.map.frame_width, 0.45);
+            assert_eq!(loaded.map.frame_height, 0.7);
+            assert_eq!(loaded.map.frame_rotation, -37.0);
+            assert_eq!(loaded.map.frame_opacity, 0.65);
+            assert_eq!(loaded.map.frame_shape, 1);
+            assert_eq!(loaded.map.frame_feather, 0.12);
+            assert_eq!(loaded.map.frame_corner, 0.2);
+        }
+    }
+
+    /// 两框（box0 贴边固定分段 + box1 自由摆放跟跑者居中）经代理 + `.trr` 双向往返。
+    #[test]
+    fn two_map_boxes_survive_proxy_and_project_roundtrip() {
+        let mut s = Settings::default();
+        let mut layout = MapLayout::new_single();
+        layout.boxes[0] = crate::settings::MapBox {
+            mode: 0,
+            share: 0.3,
+            view_mode: 0,
+            lr_margin: 12.5,
+            tb_margin: 47.0,
+            ..Default::default()
+        };
+        layout.boxes.push(crate::settings::MapBox {
+            mode: 4,
+            x: 0.62,
+            y: 0.55,
+            w: 0.34,
+            h: 0.4,
+            shape: 1,
+            feather: 0.1,
+            view_mode: 1,
+            view_zoom: 0.37,
+            sensitivity: 2.5,
+            ..Default::default()
+        });
+        s.map.layout = layout;
+        s.map.sync_legacy_from_layout(&mut s.route);
+
+        let mut proxy = SettingsProxy::default();
+        proxy.apply_settings(&s);
+        let from_proxy = MapLayout::parse(&proxy.map_boxes.to_string()).unwrap();
+        assert_eq!(from_proxy.boxes.len(), 2);
+        assert_eq!(from_proxy.boxes[1].mode, 4);
+        assert_eq!(from_proxy.boxes[1].view_mode, 1);
+        assert_eq!(from_proxy.boxes[1].view_zoom, 0.37);
+
+        let collected = proxy.collect_settings();
+        assert_eq!(collected.map.layout.boxes.len(), 2, "多框必须随 collect 带上");
+        assert_eq!(collected.route.view_mode, 0, "box0 的取景要镜像回旧字段");
+        assert_eq!(collected.route.left_right_margin, 12.5);
+
+        let loaded = Settings::from_ini(&crate::settings::IniFile::parse(&collected.to_ini()));
+        assert_eq!(loaded.map.layout.boxes.len(), 2, "两框要写进 [map] boxes");
+        assert_eq!(loaded.map.layout.boxes[1].x, 0.62);
+        assert_eq!(loaded.map.layout.boxes[1].view_zoom, 0.37);
+        assert_eq!(loaded.map.layout.boxes[1].sensitivity, 2.5);
+    }
+
+    /// 逐框轨迹样式经代理 + `.trr` 双向往返；box0 样式镜像回全局 route 显示字段。
+    #[test]
+    fn two_box_styles_survive_proxy_and_project_roundtrip() {
+        use crate::settings::{MapBox, MapBoxStyle};
+        let mut s = Settings::default();
+        let mut layout = MapLayout::new_single();
+        layout.boxes[0].style = Some(MapBoxStyle {
+            render_mode: 1,
+            width: 18.0,
+            route_color: "#112233".to_string(),
+            show_runner: false,
+            ..Default::default()
+        });
+        layout.boxes.push(MapBox {
+            mode: 4,
+            x: 0.6,
+            y: 0.1,
+            w: 0.3,
+            h: 0.3,
+            style: Some(MapBoxStyle {
+                render_mode: 3,
+                tail_render_mode: 1,
+                tail_width: 14.0,
+                runner_color: "#00ff00".to_string(),
+                low_pace: 6.0,
+                high_pace: 4.0,
+                pace_auto: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        s.map.layout = layout;
+        s.map.sync_legacy_from_layout(&mut s.route);
+
+        let mut proxy = SettingsProxy::default();
+        proxy.apply_settings(&s);
+        // 全局 route_* 代理属性保留为 box0 镜像（兼容旧测试/旧代码）。
+        assert_eq!(proxy.route_width, 18.0);
+        assert_eq!(proxy.route_render_mode, 1);
+        assert!(!proxy.route_show_runner);
+        let parsed = MapLayout::parse(&proxy.map_boxes.to_string()).unwrap();
+        assert_eq!(parsed.boxes.len(), 2);
+        assert_eq!(parsed.boxes[0].style.as_ref().unwrap().width, 18.0);
+        let b1 = parsed.boxes[1].style.as_ref().unwrap();
+        assert_eq!(b1.render_mode, 3);
+        assert_eq!(b1.tail_width, 14.0);
+        assert_eq!(b1.runner_color, "#00ff00");
+
+        let collected = proxy.collect_settings();
+        // box0 样式写回全局显示字段；box1 样式留在 layout 里。
+        assert_eq!(collected.route.width, 18.0);
+        assert_eq!(collected.route.render_mode, 1);
+        assert_eq!(collected.route.route_color, "#112233");
+        assert!(!collected.route.show_runner);
+        let loaded = Settings::from_ini(&crate::settings::IniFile::parse(&collected.to_ini()));
+        let eff = loaded.map.effective_layout(&loaded.route);
+        assert_eq!(eff.boxes.len(), 2);
+        assert_eq!(eff.boxes[0].style.as_ref().unwrap().render_mode, 1);
+        let b1 = eff.boxes[1].style.as_ref().unwrap();
+        assert_eq!(b1.tail_width, 14.0);
+        assert_eq!(b1.runner_color, "#00ff00");
+        assert_eq!(b1.pace_auto, false);
+    }
+
+    #[test]
+    fn route_framing_survives_proxy_and_project_roundtrip() {
+        let mut s = Settings::default();
+        s.route.view_mode = 1;
+        s.route.left_right_margin = 12.5;
+        s.route.top_bottom_margin = 47.0;
+        s.route.view_zoom = 0.37;
+        s.route.runner_averaging_factor = 2.5;
+        let mut proxy = SettingsProxy::default();
+        proxy.apply_settings(&s);
+        // 代理只暴露聚合 JSON：取景参数应在 map_boxes 的第 1 框里。
+        let boxes = MapLayout::parse(&proxy.map_boxes.to_string()).unwrap();
+        assert_eq!(boxes.boxes[0].view_mode, 1);
+        assert_eq!(boxes.boxes[0].view_zoom, 0.37);
+        assert_eq!(boxes.boxes[0].lr_margin, 12.5);
+        assert_eq!(boxes.boxes[0].tb_margin, 47.0);
+        assert_eq!(boxes.boxes[0].sensitivity, 2.5);
+        let collected = proxy.collect_settings();
+        let loaded = Settings::from_ini(&crate::settings::IniFile::parse(&collected.to_ini()));
+        assert_eq!(loaded.route.view_mode, 1);
+        assert_eq!(loaded.route.left_right_margin, 12.5);
+        assert_eq!(loaded.route.top_bottom_margin, 47.0);
+        assert_eq!(loaded.route.view_zoom, 0.37);
+        assert_eq!(
+            loaded.route.runner_averaging_factor, 2.5,
+            "灵敏度要随工程保存/加载"
+        );
+    }
+
+    /// 代理的 `map_boxes` 为空/坏掉时必须回退成「单框」，不能把工程变成 0 框。
+    #[test]
+    fn empty_or_bad_map_boxes_falls_back_to_single_box() {
+        let mut proxy = SettingsProxy::default();
+        let collected = proxy.collect_settings();
+        assert_eq!(collected.map.layout.boxes.len(), 1);
+        assert_eq!(collected.map.effective_layout(&collected.route).boxes.len(), 1);
+
+        proxy.map_boxes = QString::from(r#"{"version":1,"boxes":"oops"}"#);
+        let collected = proxy.collect_settings();
+        assert_eq!(collected.map.layout.boxes.len(), 1, "坏 JSON 回退单框");
+    }
 
     #[test]
     fn cadence_survives_proxy_and_snapshot_roundtrip() {

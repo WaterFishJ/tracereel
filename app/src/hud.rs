@@ -368,13 +368,6 @@ pub fn viewport(
     height: f64,
     video_size: Option<(f64, f64)>,
 ) -> QRectF {
-    let map_configured = !settings.map.image_file_path.trim().is_empty()
-        || !settings.route.quick_route_jpeg_file_path.trim().is_empty()
-        || settings
-            .map
-            .extra_map_files
-            .iter()
-            .any(|p| !p.trim().is_empty());
     if !settings.encode.include_video || settings.hud.scope.eq_ignore_ascii_case("frame") {
         return QRectF {
             x: 0.0,
@@ -383,22 +376,17 @@ pub fn viewport(
             height,
         };
     }
-    let left = if map_configured && settings.encode.include_map {
-        settings.map.relative_width.clamp(0.0, 1.0) * width
-    } else {
-        0.0
-    };
-    let available = (width - left).max(0.0);
+    let panel = crate::gui::scene_panels(settings, width, height).video;
     let (w, h) = video_size
         .filter(|(w, h)| *w > 0.0 && *h > 0.0)
         .map(|(w, h)| {
-            let scale = (available / w).min(height / h);
+            let scale = (panel.width / w).min(panel.height / h);
             (w * scale, h * scale)
         })
-        .unwrap_or((available, height));
+        .unwrap_or((panel.width, panel.height));
     QRectF {
-        x: left + (available - w) / 2.0,
-        y: (height - h) / 2.0,
+        x: panel.x + (panel.width - w) / 2.0,
+        y: panel.y + (panel.height - h) / 2.0,
         width: w,
         height: h,
     }

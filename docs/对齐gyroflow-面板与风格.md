@@ -123,9 +123,8 @@ fn zoom_algorithm(mode: i32) -> i32 { if mode == 1 { 1 } else { 0 } } // 只送 
 | `highlight` | #10000000 | #10ffffff |
 | `font_family` / `dpi_scale` | Arial / 屏幕 DPI÷96 | 同 |
 
-切换入口：菜单「外观 → 浅色 / 深色 / 跟随系统」（`settings.theme` 存 `.orv [window] theme`，默认浅色；
-「跟随系统」用 `Qt.styleHints.colorScheme` 解析）。`refreshFields()` 里会 `applyTheme()`，
-所以切换即时生效、不需要重新应用工程（不会触发重探测/重算）。
+切换入口：菜单「外观 → 浅色 / 深色 / 跟随系统」。`Theme.preference` 是应用级用户偏好，通过 QSettings 的 INI 格式保存在独立用户配置文件中，默认深色；工程既不读取也不保存主题。
+「跟随系统」用 `Qt.styleHints.colorScheme` 解析并响应其变化。主题切换独立于 `refreshFields()`，即时生效，不会触发工程重载或重算。
 
 ### 3.2 关键做法：窗口调色板 + 组件覆写
 

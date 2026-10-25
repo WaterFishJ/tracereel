@@ -7,6 +7,7 @@
 #![recursion_limit = "256"]
 
 pub mod branding;
+pub mod composition;
 pub mod data_paths;
 pub mod encode;
 #[macro_use]

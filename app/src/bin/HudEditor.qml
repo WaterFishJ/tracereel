@@ -6,6 +6,16 @@ Column {
     id: root
     property var source
     property var renderer
+    property color textColor: "#242424"
+    property color mutedColor: "#616161"
+    property color accentColor: "#4c9aff"
+    property color textOnAccent: "#ffffff"
+    property color buttonColor: "#ffffff"
+    property color fieldColor: "#ffffff"
+    property color surfaceHoverColor: "#f4f5f7"
+    property color borderColor: "#d5d5d5"
+    property color highlightColor: "#eaf3fb"
+    property color errorColor: "#c42b1c"
     property bool snapping: true
     property var layout: ({version:1,widgets:[]})
     property int selected: -1
@@ -197,15 +207,61 @@ Column {
     }
     Component.onCompleted: {reload();refreshTemplates()}
 
+    component HudTextField: TextField {
+        id: fieldControl
+        color: root.textColor
+        selectByMouse: true
+        leftPadding: 10; rightPadding: 10
+        background: Rectangle {
+            color: root.fieldColor
+            radius: 5
+            border.width: fieldControl.activeFocus ? 2 : 1
+            border.color: fieldControl.activeFocus ? root.accentColor : root.borderColor
+        }
+    }
+
+    component HudSwitch: Switch {
+        id: control
+        font.pixelSize: 13
+        spacing: 6
+        leftPadding: 0
+        rightPadding: 0
+        contentItem: Text {
+            text: control.text
+            font: control.font
+            color: root.textColor
+            leftPadding: control.indicator.width + control.spacing
+            verticalAlignment: Text.AlignVCenter
+        }
+        indicator: Rectangle {
+            implicitWidth: 38 * 1
+            implicitHeight: 22 * 1
+            y: (control.height - height) / 2
+            radius: height / 2
+            color: control.checked ? root.accentColor : root.surfaceHoverColor
+            border.width: control.activeFocus ? 2 : 1
+            border.color: control.checked || control.activeFocus ? root.accentColor : root.borderColor
+            opacity: control.enabled ? 1 : 0.45
+            Behavior on color { ColorAnimation { duration: 140 } }
+            Rectangle {
+                x: control.checked ? parent.width - width - 3 * 1 : 3 * 1
+                anchors.verticalCenter: parent.verticalCenter
+                width: 16 * 1; height: width; radius: width / 2
+                color: "#ffffff"
+                Behavior on x { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
+            }
+        }
+    }
+
     Row {
         spacing:4
-        Button {text:"撤销";enabled:root.undoStack.length>0;onClicked:root.undo()}
+        Button {text:"撤销";palette.buttonText:root.textColor;enabled:root.undoStack.length>0;onClicked:root.undo()}
         Button {
             objectName:"resetTemplateButton"
-            text:"重做";enabled:root.canResetTemplate;onClicked:root.redo()
+            text:"重做";palette.buttonText:root.textColor;enabled:root.canResetTemplate;onClicked:root.redo()
             ToolTip.visible:hovered;ToolTip.text:"将所有控件和数据项恢复到所选模板的配置";ToolTip.delay:400
         }
-        CheckBox {text:"吸附";checked:true;onToggled:root.snapping=checked}
+        HudSwitch {text:"吸附";checked:true;onToggled:root.snapping=checked}
     }
     RowLayout {
         width:parent.width;spacing:5
@@ -215,9 +271,9 @@ Column {
             displayText:currentIndex>=0 && currentIndex<root.templateOptions.length ? root.templateOptions[currentIndex].name : "选择模板"
             onActivated:root.applyTemplate(currentIndex)
         }
-        Button {text:"保存模板";onClicked:saveDialog.open()}
+        Button {text:"保存模板";palette.buttonText:root.textColor;onClicked:saveDialog.open()}
         Button {
-            text:"删除";visible:root.activeTemplateId.length>0 && root.activeTemplateId.indexOf("builtin:")!==0
+            text:"删除";palette.buttonText:root.textColor;visible:root.activeTemplateId.length>0 && root.activeTemplateId.indexOf("builtin:")!==0
             onClicked:deleteDialog.open()
         }
     }
@@ -226,7 +282,7 @@ Column {
         width:parent.width;columns:4;columnSpacing:8;rowSpacing:2
         Repeater {
             model:root.metrics
-            delegate:CheckBox {
+            delegate:HudSwitch {
                 required property var modelData
                 text:root.metricName(modelData)
                 checked:root.metricEnabled(modelData)
@@ -234,28 +290,30 @@ Column {
             }
         }
     }
-    Label {text:"控件列表";font.bold:true}
-    Repeater {
-        model:root.layout.widgets
-        delegate:Button {
-            required property int index
-            required property var modelData
-            width:root.width
-            text:(root.selected===index?"● ":"")+root.metricName(modelData.metric)+" · "+root.variantName(modelData.variant)
-                +(modelData.locked?" 🔒":"")+(modelData.visible?"":"（隐藏）")
-            onClicked:root.selected=index
-        }
-    }
     Column {
-        width:parent.width;spacing:5;visible:root.current!==null
-        Label {text:"控件配置"}
+        objectName:"hudWidgetConfig"
+        width:parent.width;spacing:8;visible:root.current!==null
+        RowLayout {
+            width:parent.width
+            Label {
+                objectName:"hudWidgetConfigTitle"
+                text:root.current?root.metricName(root.current.metric)+" · "+root.variantName(root.current.variant):""
+                color:root.textColor;font.bold:true
+                Layout.fillWidth:true;elide:Text.ElideRight
+            }
+            Button {
+                text:"收起";flat:true
+                palette.buttonText:root.mutedColor
+                onClicked:root.selected=-1
+            }
+        }
         Row {
             spacing:3
-            Button {text:"删除";enabled:root.current && !root.current.locked;onClicked:root.remove()}
-            CheckBox {text:"显示";checked:root.current?root.current.visible:false;onToggled:root.setField("visible",checked,false)}
-            CheckBox {text:"锁定";checked:root.current?root.current.locked:false;onToggled:root.setField("locked",checked,false)}
-            Button {text:"前移一层";onClicked:if(root.current)root.setField("z",root.current.z+1,false)}
-            Button {text:"后移一层";onClicked:if(root.current)root.setField("z",root.current.z-1,false)}
+            Button {text:"删除";palette.buttonText:root.textColor;enabled:root.current && !root.current.locked;onClicked:root.remove()}
+            HudSwitch {text:"显示";checked:root.current?root.current.visible:false;onToggled:root.setField("visible",checked,false)}
+            HudSwitch {text:"锁定";checked:root.current?root.current.locked:false;onToggled:root.setField("locked",checked,false)}
+            Button {text:"前移一层";palette.buttonText:root.textColor;onClicked:if(root.current)root.setField("z",root.current.z+1,false)}
+            Button {text:"后移一层";palette.buttonText:root.textColor;onClicked:if(root.current)root.setField("z",root.current.z-1,false)}
         }
         RowLayout {
             objectName:"variantChoiceRow"
@@ -280,7 +338,7 @@ Column {
                     required property var modelData
                     Layout.fillWidth:true
                     Label {text:modelData[1];Layout.preferredWidth:62;elide:Text.ElideRight}
-                    TextField {
+                    HudTextField {
                         Layout.fillWidth:true
                         enabled:root.current && !root.current.locked
                         text:root.current?Number(root.current[modelData[0]]*modelData[2]).toFixed(2):""
@@ -304,29 +362,40 @@ Column {
                         Layout.fillWidth:true
                         enabled:root.current && !root.current.locked
                         text:root.current?root.current[modelData[0]]:""
+                        palette.buttonText:root.textColor
                         onClicked:{picker.field=modelData[0];picker.selectedColor=root.current[modelData[0]];picker.open()}
                     }
                 }
             }
         }
-        CheckBox {
+        HudSwitch {
             visible:root.current && root.current.metric==="speed"
             text:"自动量程";checked:root.current?root.current.automatic:true
             onToggled:root.setField("automatic",checked,false)
         }
-        TextField {
+        HudTextField {
             width:parent.width;visible:root.current && root.current.metric==="speed" && !root.current.automatic
             placeholderText:"最大速度 km/h";text:root.current?String(root.current.maximum):"30"
             onEditingFinished:if(Number(text)>0)root.setField("maximum",Number(text),false)
         }
-        TextField {
+        HudTextField {
             width:parent.width;visible:root.current && root.current.variant==="scroll"
             placeholderText:"滚动窗口（秒）";text:root.current?String(root.current.window):"300"
             onEditingFinished:if(Number(text)>=1)root.setField("window",Number(text),false)
         }
     }
-    Label {text:root.error;color:"#b00020";wrapMode:Text.Wrap;width:parent.width;visible:text.length>0}
-    Label {text:"在画面拖动控件；右下角缩放，上方圆点旋转。方向键微调，Shift 加速。";wrapMode:Text.Wrap;width:parent.width}
+    Label {text:root.error;color:root.errorColor;wrapMode:Text.Wrap;width:parent.width;visible:text.length>0}
+    Rectangle {
+        width:parent.width;height:helpText.implicitHeight+20
+        radius:6;color:root.surfaceHoverColor
+        Label {
+            id:helpText
+            x:10;y:10;width:parent.width-20
+            text:"操作提示\n点击预览中的控件可配置；点击空白处收起配置。\n右下角缩放 · 上方圆点旋转 · 方向键微调 · Shift 加速"
+            color:root.mutedColor;font.pixelSize:12
+            wrapMode:Text.Wrap;lineHeight:1.3
+        }
+    }
     Dialog {
         id:deleteDialog;title:"删除模板？";modal:true
         parent:Overlay.overlay;anchors.centerIn:parent
@@ -339,7 +408,7 @@ Column {
         standardButtons:Dialog.Save|Dialog.Cancel
         onOpened:{templateName.text="";templateName.forceActiveFocus()}
         onAccepted:root.saveTemplate(templateName.text)
-        contentItem:TextField {id:templateName;placeholderText:"模板名称";selectByMouse:true}
+        contentItem:HudTextField {id:templateName;placeholderText:"模板名称";selectByMouse:true}
     }
     HudColorDialog {id:picker;property string field;onAccepted:root.setField(field,selectedColor.toString(),false)}
 }

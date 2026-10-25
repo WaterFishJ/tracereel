@@ -21,6 +21,7 @@ Dialog {
     property int columns: 0
     property string correctedUrl: ""
     property string message: ""
+    property color warningColor: "#e79832"
     property var undoRows: []
     property alias timeColumnIndex: timeColumn.currentIndex
     property alias codeColumnIndex: codeColumn.currentIndex
@@ -202,7 +203,7 @@ Dialog {
                 Label {
                     visible: dialog.suspectedCount > 0
                     text: dialog.suspectedCount + " 行疑似重复打卡"
-                    color: "#e79832"
+                    color: dialog.warningColor
                     wrapMode: Text.Wrap; Layout.fillWidth: true
                 }
                 ScrollView {
@@ -235,10 +236,10 @@ Dialog {
                                         objectName: "receiptCell" + gridRow.rowIndex + "_" + index
                                         width: 96
                                         text: gridRow.record.cells[index] || ""
-                                        color: gridRow.record.scores[index] < 0.85 ? "#e79832" : palette.text
+                                        color: gridRow.record.scores[index] < 0.85 ? dialog.warningColor : palette.text
                                         background: Rectangle {
-                                            color: dialog.suspected[gridRow.rowIndex] ? Qt.tint(palette.base,"#35e79832") : palette.base
-                                            border.color: dialog.suspected[gridRow.rowIndex] ? "#e79832" : palette.mid
+                                            color: dialog.suspected[gridRow.rowIndex] ? Qt.tint(palette.base, Qt.rgba(dialog.warningColor.r, dialog.warningColor.g, dialog.warningColor.b, 0.21)) : palette.base
+                                            border.color: dialog.suspected[gridRow.rowIndex] ? dialog.warningColor : palette.mid
                                             border.width: 1; radius: 3
                                         }
                                         onTextEdited: { gridRow.record.cells[index]=text; dialog.changedRows() }
@@ -263,7 +264,7 @@ Dialog {
                                 Label {
                                     width: 110
                                     text: dialog.suspected[gridRow.rowIndex] ? "疑似重复打卡" : ""
-                                    color: "#e79832"
+                                    color: dialog.warningColor
                                 }
                             }
                         }

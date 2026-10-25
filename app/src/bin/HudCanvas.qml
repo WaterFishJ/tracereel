@@ -3,13 +3,17 @@ import QtQuick
 Item {
     id: canvas
     required property var editor
+    property bool allowDelete: true
+    property bool allowRedo: true
+    property color selectionColor: "#00e5a0"
+    property color lockedColor: "#ffca5c"
     enabled:editor.enabled
     focus:true
     clip:true
     Keys.onPressed: function(event) {
         if(event.modifiers & Qt.ControlModifier) {
             if(event.key===Qt.Key_Z){editor.undo();event.accepted=true}
-            if(event.key===Qt.Key_Y){editor.redoHistory();event.accepted=true}
+            if(event.key===Qt.Key_Y && allowRedo){editor.redoHistory();event.accepted=true}
         } else if(editor.current && !editor.current.locked) {
             var dx=0,dy=0,step=(event.modifiers & Qt.ShiftModifier)?10:1
             if(event.key===Qt.Key_Left)dx=-step
@@ -17,7 +21,7 @@ Item {
             if(event.key===Qt.Key_Up)dy=-step
             if(event.key===Qt.Key_Down)dy=step
             if(dx || dy){editor.begin();editor.setRect(editor.current.x+dx/width,editor.current.y+dy/height,editor.current.w,editor.current.h);editor.end();event.accepted=true}
-            if(event.key===Qt.Key_Delete){editor.remove();event.accepted=true}
+            if(event.key===Qt.Key_Delete && allowDelete){editor.remove();event.accepted=true}
         }
     }
     function snap(value,size,axis) {
@@ -64,7 +68,14 @@ Item {
         x:c?c.x*canvas.width:0;y:c?c.y*canvas.height:0
         width:c?c.w*canvas.width:0;height:c?c.h*canvas.height:0
         rotation:c?c.rotation:0
-        Rectangle {anchors.fill:parent;color:"transparent";border.color:selection.c && selection.c.locked?"#ffca5c":"#00e5a0";border.width:2}
+        Rectangle {
+            anchors.centerIn:parent
+            property bool circle:selection.c && selection.c.shape===1
+            width:circle?Math.min(parent.width,parent.height):parent.width
+            height:circle?width:parent.height
+            radius:circle?width/2:(selection.c && selection.c.corner?selection.c.corner*Math.min(width,height):0)
+            color:"transparent";border.color:selection.c && selection.c.locked?canvas.lockedColor:canvas.selectionColor;border.width:2
+        }
         MouseArea {
             anchors.fill:parent;enabled:selection.c && !selection.c.locked
             cursorShape:Qt.SizeAllCursor
@@ -81,7 +92,8 @@ Item {
             onCanceled:editor.end()
         }
         Rectangle {
-            x:parent.width-6;y:parent.height-6;width:12;height:12;color:"#00e5a0"
+            objectName:"selectionResizeHandle"
+            x:parent.width-6;y:parent.height-6;width:12;height:12;color:canvas.selectionColor
             visible:selection.c && !selection.c.locked
             MouseArea {
                 anchors.fill:parent;cursorShape:Qt.SizeFDiagCursor
@@ -104,7 +116,8 @@ Item {
             }
         }
         Rectangle {
-            x:parent.width/2-6;y:-20;width:12;height:12;radius:6;color:"#00e5a0"
+            objectName:"selectionRotateHandle"
+            x:parent.width/2-6;y:-20;width:12;height:12;radius:6;color:canvas.selectionColor
             visible:selection.c && !selection.c.locked
             MouseArea {
                 anchors.fill:parent;cursorShape:Qt.CrossCursor

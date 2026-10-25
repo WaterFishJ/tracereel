@@ -40,7 +40,16 @@ jobs:
             tag="$(basename "$file" .md)"
             [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid release tag: $tag" >&2; exit 1; }
             [[ -s "$file" ]] || { echo "Missing release notes: $file" >&2; exit 1; }
-            gh release view "$tag" >/dev/null
+            # A new version's notes arrive on main before its tag build has published it.
+            # Only update existing releases; release.yml reads these notes on creation.
+            if ! gh api "repos/$GH_REPO/releases/tags/$tag" > release.json 2> release-error.txt; then
+              if grep -q 'HTTP 404' release-error.txt; then
+                echo "Release $tag is not published yet; release.yml will use $file."
+                continue
+              fi
+              cat release-error.txt >&2
+              exit 1
+            fi
             gh release edit "$tag" --notes-file "$file"
             echo "Updated $tag from $file" >> "$GITHUB_STEP_SUMMARY"
           done

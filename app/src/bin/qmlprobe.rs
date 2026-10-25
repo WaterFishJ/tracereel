@@ -8,6 +8,8 @@
 //!
 //! Usage: qmlprobe [script.json]
 //!   without an argument it runs the built-in reproduction script.
+//!   Set QMLPROBE_SCREENSHOT to a PNG path to grab the visible main window instead;
+//!   QMLPROBE_ORV can select a dark/light project for the same visual smoke test.
 
 use std::ffi::CString;
 
@@ -117,18 +119,32 @@ fn main() {
         QString::from("orvPath"),
         QString::from(std::env::var("QMLPROBE_ORV").unwrap_or_default()).into(),
     );
+    engine.set_property(
+        QString::from("appVersion"),
+        QString::from(env!("CARGO_PKG_VERSION")).into(),
+    );
     engine.set_property(QString::from("ocrTestImage"), QString::from(std::env::var("OCR_TEST_IMAGE").unwrap_or_default()).into());
 
-    let qml_file = match std::env::var("QMLPROBE_FILE") {
-        Ok(p) => std::path::PathBuf::from(p),
-        Err(_) => std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/gui.qml"),
+    let qml_file = match std::env::var("QMLPROBE_FILE").ok().filter(|p| !p.is_empty()) {
+        Some(p) => std::path::PathBuf::from(p),
+        None => std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/gui.qml"),
     };
     println!("loading {}", qml_file.display());
     eprintln!("[marker] before load_file");
     engine.load_file(QString::from(qml_file.to_string_lossy().as_ref()));
     eprintln!("[marker] after load_file");
+    // Visual smoke test: grab the real ApplicationWindow after the first frames are rendered.
+    if let Some(path) = std::env::var("QMLPROBE_SCREENSHOT").ok().filter(|p| !p.is_empty()) {
+        qmetaobject::single_shot(std::time::Duration::from_millis(1200), move || {
+            let ok = tracereel::qtwrap::save_quick_window_screenshot(&path);
+            println!("[screenshot] saved={ok} path={path}");
+            qmetaobject::qtcore::core_application::QCoreApplication::quit();
+        });
+        engine.exec();
+        std::process::exit(0);
+    }
     // Allow a supplied QML harness to drive asynchronous export/restart checks.
-    if std::env::var_os("QMLPROBE_RUN_LOOP").is_some() {
+    if std::env::var("QMLPROBE_RUN_LOOP").is_ok_and(|value| !value.is_empty()) {
         if let Ok(ms) = std::env::var("QMLPROBE_TIMEOUT_MS") {
             if let Ok(ms) = ms.parse::<u64>() {
                 qmetaobject::single_shot(std::time::Duration::from_millis(ms), || {
@@ -140,7 +156,7 @@ fn main() {
         println!("[loop final] {}", invoke(&mut engine, "debugState", vec![]));
         std::process::exit(0);
     }
-    if std::env::var_os("QMLPROBE_LOAD_ONLY").is_some() {
+    if std::env::var("QMLPROBE_LOAD_ONLY").is_ok_and(|value| !value.is_empty()) {
         eprintln!("[marker] load-only mode, exiting");
         std::process::exit(0);
     }

@@ -1,4 +1,4 @@
-﻿# 统一测试入口：一次跑完仓库里的自动化测试（纯逻辑单测 + 无头 QML / 导出端到端回归）。
+# 统一测试入口：一次跑完仓库里的自动化测试（纯逻辑单测 + 无头 QML / 导出端到端回归）。
 #
 # 用法:
 #   .\app\tests\run-all.ps1                      # 默认：三个 crate 的 cargo test + 全部无头回归
@@ -24,7 +24,11 @@ function Invoke-Case {
     Write-Host "===== $Name ====="
     $sw = [Diagnostics.Stopwatch]::StartNew()
     try {
+        # 子脚本用 exit <code> 报告失败时，`& $Run` 本身不会抛异常 —— 必须显式看退出码，
+        # 否则 qmltestrunner 报 FAIL 的用例也会被算成 PASS。
+        $global:LASTEXITCODE = 0
         & $Run
+        if ($LASTEXITCODE -ne 0) { throw "退出码 $LASTEXITCODE" }
         $script:results += [pscustomobject]@{ Name = $Name; Ok = $true; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1) }
         Write-Host "PASS  $Name（$([math]::Round($sw.Elapsed.TotalSeconds, 1)) 秒）"
     } catch {
@@ -43,13 +47,24 @@ if (-not $SkipCargo) {
 
 $cases = @(
     'test_split_input.ps1',
+    'test_split_markers.ps1',
+    'test_preview_seek.ps1',
     'test_qrt_splits.ps1',
-    'test_route_rows.ps1',
+    # 说明：test_route_rows.ps1 是历史文件名，现在只是 `tst_map_layout.qml` 的薄包装
+    # （四组轨迹样式已搬进 MapEditor 的逐框子面板）。`test_map_layout.ps1` 末尾本身就会跑
+    # 同一份 tst_map_layout.qml，所以这里不再重复执行；单独跑旧脚本仍然可用。
     'test_receipt_zoom.ps1',
     'test_export_resolution.ps1',
     'test_export_range.ps1',
     'test_export_progress.ps1',
-    'test_hud_scope.ps1'
+    'test_source_free_export.ps1',
+    'test_hud_scope.ps1',
+    'test_hudcheck.ps1',
+    # 地图布局导出像素（单框 8 组 + 多框 4 组）+ 末尾的 tst_map_layout.qml（编辑器交互）。
+    'test_map_layout.ps1',
+    'test_multibox_preview.ps1',
+    # 逐框轨迹样式 + 框标签溢出（真实 gui.qml + MapEditor 的 setStyle/8 框按钮回归）。
+    'test_map_editor_style.ps1'
 )
 foreach ($case in $cases) {
     $path = Join-Path $PSScriptRoot $case
@@ -68,7 +83,13 @@ if (Get-Command node -ErrorAction SilentlyContinue) {
 
 if ($IncludeDemo) {
     $demoProject = Join-Path $projectRoot 'demo/20261011孝德湖/孝德湖上午.trr'
+    if (-not (Test-Path -LiteralPath $demoProject)) {
+        $demoProject = Join-Path $projectRoot '../demo/20261011孝德湖/孝德湖上午.trr'
+    }
     if (Test-Path -LiteralPath $demoProject) {
+        Invoke-Case 'test_gyro_reenable.ps1（demo 工程）' {
+            & (Join-Path $PSScriptRoot 'test_gyro_reenable.ps1') -Project $demoProject
+        }
         Invoke-Case 'test_export_decode_size_gyro.ps1（demo 工程）' {
             & (Join-Path $PSScriptRoot 'test_export_decode_size_gyro.ps1') -Project $demoProject
         }

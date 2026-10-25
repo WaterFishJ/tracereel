@@ -80,7 +80,7 @@ pub fn outputs(s: &Settings, out: &str) -> Result<Vec<String>, String> {
 }
 /// Frame-rounded output lengths, using the same clock/range/fps rules as the encoder.
 pub fn durations(mut s: Settings) -> Result<Vec<f64>, String> {
-    s.encode.map_only = !s.encode.include_video;
+    s.prepare_export_layers();
     let (duration_ms, fps) = if s.encode.map_only {
         let prep = EncodePrep::build(&s, 2, 2)?;
         let route_ms = prep
@@ -306,10 +306,7 @@ pub fn check_conflicts(
 pub fn run(mut s: Settings, out: String, handle: Arc<EncodeHandle>) {
     let result =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
-            s.encode.map_only = !s.encode.include_video;
-            if s.encode.map_only {
-                s.encode.audio_codec = "none".into();
-            }
+            s.prepare_export_layers();
             s.resolve_encode_clip_ms();
             let paths = outputs(&s, &out)?;
             let mut info = crate::probe::VideoInfo {

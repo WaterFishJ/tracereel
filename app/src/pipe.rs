@@ -103,6 +103,15 @@ impl PipeDecoder {
         !self.alive.load(Ordering::SeqCst)
     }
 
+    /// An alive hardware process can also stall before producing its first frame.
+    /// Preview callers may fall back to software after a bounded cold-start wait.
+    /// Buffered pre-warmed chains are healthy even before their first delivery.
+    pub fn cold_stalled(&self) -> bool {
+        !self.started
+            && self.spawned_at.is_some_and(|t| t.elapsed().as_millis() > 2500)
+            && self.ring.lock().map(|r| r.is_empty()).unwrap_or(false)
+    }
+
     /// (Re)spawn the decoder at t_ms. NON-BLOCKING: only launches the process.
     pub fn spawn_at(&mut self, t_ms: f64) -> bool {
         self.kill();

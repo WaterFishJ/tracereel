@@ -2911,7 +2911,7 @@ checksum = "03251193000f4bd3b042892be858ee50e8b3719f2b08e5833ac4353724632430"
 
 [[package]]
 name = "receipt-ocr"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "image",
  "imageproc",
@@ -3567,7 +3567,7 @@ dependencies = [
 
 [[package]]
 name = "tracereel"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cpp",
  "cpp_build",
@@ -3587,7 +3587,7 @@ dependencies = [
 
 [[package]]
 name = "tracereel-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "nalgebra 0.34.2",
  "roxmltree",

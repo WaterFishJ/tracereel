@@ -42,8 +42,10 @@ try {
     & $ffmpeg -y -loglevel error -f lavfi -i 'color=c=0x2f6b3f:s=800x600' -frames:v 1 $map
     if ($LASTEXITCODE -ne 0) { throw 'ffmpeg 生成地图失败' }
     # 带音轨（440 Hz 正弦）：「没勾视频就不出声 / 勾了视频就有声」要靠它断言。
-    & $ffmpeg -y -loglevel error -f lavfi -i 'testsrc=size=320x240:rate=24:duration=3' `
-        -f lavfi -i 'sine=frequency=440:duration=3' -c:v libx264 -pix_fmt yuv420p `
+    # Leave enough content for the 2x playback check (over 2 seconds of wall time),
+    # so its audio assertion runs before EOF/loop teardown rather than racing it.
+    & $ffmpeg -y -loglevel error -f lavfi -i 'testsrc=size=320x240:rate=24:duration=12' `
+        -f lavfi -i 'sine=frequency=440:duration=12' -c:v libx264 -pix_fmt yuv420p `
         -c:a aac -b:a 96k -shortest $clip
     if ($LASTEXITCODE -ne 0) { throw 'ffmpeg 生成测试视频失败' }
 

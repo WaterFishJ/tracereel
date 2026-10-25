@@ -1,4 +1,4 @@
-﻿param([string]$QtRoot = 'C:\Qt\6.8.2\msvc2022_64')
+param([string]$QtRoot = 'C:\Qt\6.8.2\msvc2022_64')
 $ErrorActionPreference = 'Stop'
 $source = Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot '../src/bin/gui.qml')
 $start = $source.IndexOf('    component SplitList: Column {')
@@ -23,6 +23,7 @@ Item {
     function jumpToSplit(index) {}
     QtObject { id: settings; property string split_times: ""; property string split_point_codes: "" }
     component TButton: Button { property bool small: false }
+    component TTextField: TextField {}
 __COMPONENT__
     SplitList { id: splits }
 }
